@@ -324,6 +324,15 @@ def test_prune_logs_ignores_other_files(tmp_path: Path) -> None:
     assert other.exists() and notes.exists()
 
 
+def test_prune_logs_never_deletes_excluded_log(tmp_path: Path) -> None:
+    now = time.time()
+    current = _log(tmp_path, "run-current.log", 100, 40, now)
+    old = _log(tmp_path, "run-old.log", 100, 40, now)
+    removed = prune_logs(tmp_path, keep_days=30, max_bytes=1, now=now, exclude=current)
+    assert removed == [old]
+    assert current.exists()
+
+
 def test_prune_logs_missing_dir(tmp_path: Path) -> None:
     assert prune_logs(tmp_path / "nope") == []
 

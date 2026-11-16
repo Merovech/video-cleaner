@@ -324,16 +324,22 @@ def prune_logs(
     keep_days: int = 30,
     max_bytes: int = 200 * 10**6,
     now: float | None = None,
+    exclude: Path | None = None,
 ) -> list[Path]:
     """Delete ``run-*.log`` files older than *keep_days*, then the oldest until the total
-    size is at most *max_bytes*. Other files are never touched. Files that cannot be deleted
-    (for example a log still open) are skipped. Returns the deleted paths; never raises for
-    a missing directory.
+    size is at most *max_bytes*. Other files are never touched, nor is *exclude* (the current
+    run's log). Files that cannot be deleted (for example a log still open) are skipped.
+    Returns the deleted paths; never raises for a missing directory.
     """
     current = time.time() if now is None else now
     cutoff = current - keep_days * 86_400
     try:
-        candidates = [p for p in log_dir.glob(LOG_GLOB) if p.is_file()]
+        skip = None if exclude is None else os.path.normcase(os.path.abspath(exclude))
+        candidates = [
+            p
+            for p in log_dir.glob(LOG_GLOB)
+            if p.is_file() and os.path.normcase(os.path.abspath(p)) != skip
+        ]
         logs = sorted((p.stat().st_mtime, p.stat().st_size, p) for p in candidates)
     except OSError:
         return []

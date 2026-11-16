@@ -1,0 +1,805 @@
+"""The resumable run queue: copy, encode or remux, guard, verify and deliver, file by file.
+
+Files are taken PENDING first, then RETRY, biggest estimated saving first. For each one the
+sources are copied to scratch (the next file is prefetched in the background meanwhile), the
+original is re-checked against its state record, and then:
+
+* encode: CRF search, a projected saving under ``min_saving`` leaves the file alone; otherwise
+  full encode, mux of the new video with the source's untouched streams, the VMAF window guard
+  and `verify_output`;
+* remux only: mkvmerge with the sources and no new video (every source video stream survives);
+* multi-part (Ruling R11): the parts are appended into one combined file first, which is then
+  decided, encoded or delivered like a single file.
+
+A verified output is moved to the completed folder and recorded in ``manifest.csv``; scratch is
+released after every file, whatever happened. The library is never written: every output path
+lives under ``scratch_dir`` or ``completed_dir``, and a run refuses to start if any of them is
+under ``library_root``.
+
+The stages are injectable through `Pipeline`. Its defaults are the real implementations; the
+encode, CRF search and VMAF scoring defaults are still held (Task 10b) and raise
+``NotImplementedError("held: Task 10b")``, which stops the run and puts the file back to
+PENDING.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import logging
+import math
+import os
+import re
+import shutil
+import subprocess
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from video_cleaner import doctor, encode, quality
+from video_cleaner.config import Settings
+from video_cleaner.decide import Action, decide
+from video_cleaner.encode import CrfSearchResult
+from video_cleaner.logging_setup import redact
+from video_cleaner.manifest import (
+    ManifestEntry,
+    check_unchanged,
+    completed_path_for,
+    read_manifest,
+    write_manifest,
+)
+from video_cleaner.multipart import find_part_groups
+from video_cleaner.mux import build_mux_cmd
+from video_cleaner.probe import MediaInfo, ProbeError, probe
+from video_cleaner.progress import Progress, Reporter
+from video_cleaner.scratch import (
+    CopyResult,
+    Prefetcher,
+    ScratchFull,
+    ScratchManager,
+    SourceChanged,
+    copy_with_progress,
+)
+from video_cleaner.state import FileRecord, StaleRecord, State, Status
+from video_cleaner.tools import (
+    ToolFailed,
+    ToolNotFound,
+    ToolOutputError,
+    Tools,
+    mkvmerge_parser,
+    run_tool,
+)
+from video_cleaner.verify import VerifyResult, verify_output
+
+_log = logging.getLogger(__name__)
+
+HELD_REASON = "held: Task 10b"
+STOP_SCRATCH_FULL = "scratch full"
+STOP_LIBRARY_UNREACHABLE = "library unreachable"
+STALE_NOTE = "source changed"
+MANIFEST_NAME = "manifest.csv"
+# mkvmerge exits 1 for warnings (the output is fine) and 2 for errors.
+MKVMERGE_ERROR_EXIT = 2
+
+_WORK_DECISIONS = frozenset({Action.ENCODE.value, Action.REMUX.value})
+_HHMM = re.compile(r"(\d{1,2}):(\d{2})")
+# Names this module (and the Prefetcher) create in scratch; the startup sweep touches no others.
+_COPY_NAME = re.compile(r"[0-9a-f]{8}-.+")
+_WORK_NAME = re.compile(r"work-[0-9a-f]{12}")
+
+
+class PlanNotAcknowledged(Exception):
+    """`run` was asked for before the plan was acknowledged."""
+
+
+class RunRefused(Exception):
+    """The configuration would make the run write under the library root."""
+
+
+class _SourceStale(Exception):
+    """The original changed (or vanished from a reachable library) since it was planned."""
+
+
+class _Refused(Exception):
+    """The file cannot be delivered safely; it is flagged with this reason."""
+
+
+# --- pipeline ------------------------------------------------------------------------------
+
+
+def _run_mkvmerge(tools: Tools, cmd: Sequence[str], output: Path, reporter: Reporter) -> None:
+    log = output.with_name(output.name + ".stderr.log")
+    result = run_tool(
+        cmd,
+        label=f"mkvmerge {output.name}",
+        reporter=reporter,
+        parser=mkvmerge_parser,
+        stderr_log=log,
+        check=False,
+    )
+    if result.returncode >= MKVMERGE_ERROR_EXIT:
+        cmd_text = redact(subprocess.list2cmdline([str(part) for part in cmd]))
+        raise ToolFailed(result.returncode, cmd_text, log)
+    if result.returncode != 0:
+        _log.info("mkvmerge finished with warnings (exit %d) for %s", result.returncode, output)
+
+
+def append_parts(tools: Tools, parts: Sequence[Path], output: Path, reporter: Reporter) -> None:
+    """mkvmerge-append *parts* into *output* (no new video: every stream is kept)."""
+    _run_mkvmerge(tools, build_mux_cmd(tools, output, parts, None), output, reporter)
+
+
+def mux(
+    tools: Tools,
+    sources: Sequence[Path],
+    new_video: Path | None,
+    output: Path,
+    reporter: Reporter,
+) -> None:
+    """mkvmerge *sources* (with *new_video* swapped in, when given) into *output*."""
+    _run_mkvmerge(tools, build_mux_cmd(tools, output, sources, new_video), output, reporter)
+
+
+def held_window_scores(
+    tools: Tools,
+    source: MediaInfo,
+    output: Path,
+    settings: Settings,
+    workdir: Path,
+    reporter: Reporter,
+) -> Sequence[float]:
+    """VMAF of each post-encode window of *output* against *source*. HELD until Task 10b."""
+    raise NotImplementedError(HELD_REASON)
+
+
+@dataclass
+class Pipeline:
+    """The stages `run_queue` calls; tests replace them with fakes."""
+
+    copy: Callable[[Path, Path, Reporter], CopyResult] = copy_with_progress
+    search_crf: Callable[[MediaInfo, Tools, Settings, Path, Reporter], CrfSearchResult] = (
+        encode.search_crf
+    )
+    encode_full: Callable[[MediaInfo, Tools, Settings, int, Path, Reporter], None] = (
+        encode.encode_full
+    )
+    append_parts: Callable[[Tools, Sequence[Path], Path, Reporter], None] = append_parts
+    mux: Callable[[Tools, Sequence[Path], Path | None, Path, Reporter], None] = mux
+    window_scores: Callable[[Tools, MediaInfo, Path, Settings, Path, Reporter], Sequence[float]] = (
+        held_window_scores
+    )
+    verify: Callable[..., VerifyResult] = verify_output
+    probe: Callable[[Path, Tools, Reporter], MediaInfo] = probe
+
+
+# --- deadline and summary ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    completed: int
+    left_alone: int
+    flagged: int
+    retry: int
+    bytes_saved: int
+    stopped_by_deadline: bool
+    stop_reason: str = ""
+
+
+def deadline_from(until: str | None, max_hours: float | None, now: datetime) -> datetime | None:
+    """When the run must stop starting new files; None for no limit.
+
+    *until* is a wall-clock ``HH:MM`` that rolls to the next day when it is not after *now*;
+    *max_hours* counts from *now*. With both, the earlier wins. Raises ValueError for a
+    malformed time or a non-positive or non-finite number of hours.
+    """
+    candidates: list[datetime] = []
+    if until is not None:
+        match = _HHMM.fullmatch(until)
+        hour, minute = (int(match.group(1)), int(match.group(2))) if match else (-1, -1)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"--until must be HH:MM between 00:00 and 23:59, got {until!r}")
+        at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if at <= now:
+            at += timedelta(days=1)
+        candidates.append(at)
+    if max_hours is not None:
+        if not (math.isfinite(max_hours) and max_hours > 0):
+            raise ValueError(f"--max-hours must be a positive number of hours, got {max_hours!r}")
+        candidates.append(now + timedelta(hours=max_hours))
+    return min(candidates) if candidates else None
+
+
+# --- helpers -------------------------------------------------------------------------------
+
+
+def _norm(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    inner, outer = _norm(path), _norm(root).rstrip("\\/")
+    return inner == outer or inner.startswith(outer + os.sep)
+
+
+def _clean(note: str) -> str:
+    """A note SQLite can store even if a file name carries undecodable bytes."""
+    return note.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+class _BackgroundReporter:
+    """Reporter for the background prefetch: never touches the console, logs at DEBUG."""
+
+    def stage(self, label: str) -> None:
+        _log.debug("prefetch: %s", label)
+
+    def update(self, p: Progress) -> None:
+        pass
+
+    def heartbeat(self, label: str, elapsed_s: float) -> None:
+        pass
+
+    def file_done(self, summary: str) -> None:
+        _log.debug("prefetch: %s", summary)
+
+
+@dataclass
+class _Outcome:
+    status: Status
+    note: str
+    bytes_saved: int = 0
+
+
+@dataclass
+class _Work:
+    """Scratch owned by the file in progress, released whatever happens."""
+
+    workdir: Path
+    reserved: list[Path] = field(default_factory=list)
+
+
+def _refuse_outputs_in_library(settings: Settings) -> None:
+    for label, path in (
+        ("scratch folder", settings.scratch_dir),
+        ("completed folder", settings.completed_dir),
+        ("state database", settings.state_db),
+        ("log folder", settings.log_dir),
+    ):
+        if _is_under(path, settings.library_root):
+            raise RunRefused(
+                f"{label} {path} is under the library root {settings.library_root}; "
+                "a run never writes to the library"
+            )
+
+
+# --- the run -------------------------------------------------------------------------------
+
+
+class _Runner:
+    def __init__(
+        self,
+        settings: Settings,
+        tools: Tools,
+        state: State,
+        reporter: Reporter,
+        pipeline: Pipeline,
+        deadline: datetime | None,
+        only: Path | None,
+        now: Callable[[], datetime],
+    ) -> None:
+        self.settings = settings
+        self.tools = tools
+        self.state = state
+        self.reporter = reporter
+        self.pipeline = pipeline
+        self.deadline = deadline
+        self.only = None if only is None else _norm(only)
+        self.now = now
+        self.scratch = ScratchManager(settings.scratch_dir, settings.scratch_cap_bytes)
+        self.prefetcher = Prefetcher(self.scratch, _BackgroundReporter())
+        self.prefetched: Path | None = None
+        self.attempted: set[tuple[str, int, float]] = set()
+        self.claims: dict[str, list[Path]] = {}
+        self.counts = dict.fromkeys(
+            (Status.COMPLETED, Status.LEFT_ALONE, Status.FLAGGED, Status.RETRY), 0
+        )
+        self.bytes_saved = 0
+
+    # -- selection ------------------------------------------------------------------------
+
+    def _in_scope(self, rec: FileRecord) -> bool:
+        if self.only is None:
+            return True
+        prefix = self.only.rstrip("\\/") + os.sep
+        return any(
+            _norm(p) == self.only or _norm(p).startswith(prefix) for p in (rec.path, *rec.parts)
+        )
+
+    def _wanted(self, rec: FileRecord) -> bool:
+        return (
+            rec.decision in _WORK_DECISIONS
+            and (_norm(rec.path), rec.size, rec.mtime) not in self.attempted
+            and self._in_scope(rec)
+        )
+
+    def _next(self) -> FileRecord | None:
+        for status in (Status.PENDING, Status.RETRY):
+            records = [r for r in self.state.records(status) if self._wanted(r)]
+            if records:
+                # records() is ordered by path, so equal savings keep a stable order
+                return max(records, key=lambda r: r.est_saving_bytes)
+        return None
+
+    # -- targets and collisions -----------------------------------------------------------
+
+    def _target(self, rec: FileRecord) -> Path:
+        if not rec.parts:
+            return completed_path_for(self.settings, rec.path)
+        groups = find_part_groups(list(rec.parts))
+        if len(groups) != 1 or len(groups[0].parts) != len(rec.parts):
+            raise _Refused(f"the parts of {rec.path} no longer form one multi-part group")
+        return completed_path_for(self.settings, rec.parts[0], new_name=groups[0].output_name)
+
+    def claim_targets(self) -> None:
+        """Map every planned output name to the records that would write it."""
+        for rec in self.state.records(Status.PENDING, Status.RETRY, Status.COMPLETED):
+            if rec.decision not in _WORK_DECISIONS:
+                continue
+            try:
+                target = self._target(rec)
+            except (ValueError, _Refused):
+                continue  # flagged with the reason when the record comes up
+            self.claims.setdefault(str(target).casefold(), []).append(rec.path)
+
+    def _precheck(self, rec: FileRecord) -> Path:
+        """The completed path for *rec*; raises `_Refused` if delivering there is unsafe."""
+        try:
+            target = self._target(rec)
+        except ValueError as exc:
+            raise _Refused(str(exc)) from None
+        others = [
+            p for p in self.claims.get(str(target).casefold(), []) if _norm(p) != _norm(rec.path)
+        ]
+        if others:
+            raise _Refused(f"output name collides with {', '.join(str(p) for p in others)}")
+        if target.exists():
+            raise _Refused(f"output {target} already exists in the completed folder")
+        return target
+
+    # -- status ---------------------------------------------------------------------------
+
+    def _set(self, rec: FileRecord, status: Status, note: str = "") -> None:
+        """Advance *rec*; raises `StaleRecord` if it is no longer the live record."""
+        self.state.set_status(rec.path, status, _clean(note), size=rec.size, mtime=rec.mtime)
+        self.reporter.stage(f"{status.value}: {rec.path.name}")
+
+    def _finish(self, rec: FileRecord, outcome: _Outcome) -> None:
+        try:
+            self.state.set_status(
+                rec.path, outcome.status, _clean(outcome.note), size=rec.size, mtime=rec.mtime
+            )
+        except StaleRecord:
+            _log.warning("%s: record superseded; outcome %s dropped", rec.path, outcome.status)
+            return
+        if outcome.status in self.counts:
+            self.counts[outcome.status] += 1
+        self.bytes_saved += outcome.bytes_saved
+        detail = f" ({outcome.note})" if outcome.note else ""
+        _log.info("%s: %s%s", rec.path, outcome.status.value, detail)
+        self.reporter.file_done(f"{rec.path.name}: {outcome.status.value}{detail}")
+
+    # -- scratch --------------------------------------------------------------------------
+
+    def _library_reachable(self) -> bool:
+        return os.path.isdir(self.settings.library_root)
+
+    def _reserve(self, size: int, path: Path, work: _Work) -> None:
+        if not self.scratch.reserve(size, path):
+            raise ScratchFull(
+                f"no room in scratch for {path.name} ({size} bytes, cap "
+                f"{self.settings.scratch_cap_bytes} bytes)"
+            )
+        work.reserved.append(path)
+
+    def _copy(self, src: Path, size: int, work: _Work) -> Path:
+        if self.prefetched is not None and _norm(self.prefetched) == _norm(src):
+            self.prefetched = None
+            self.reporter.stage(f"waiting for prefetch: {src.name}")
+            result = self.prefetcher.result()
+            work.reserved.append(result.dest)
+            return result.dest
+        dest = self.prefetcher.dest_for(src)
+        self._reserve(size, dest, work)
+        self.reporter.stage(f"copy: {src.name}")
+        self.pipeline.copy(src, dest, self.reporter)
+        return dest
+
+    def _start_prefetch(self) -> None:
+        if self.prefetched is not None:
+            return
+        if self.deadline is not None and self.now() >= self.deadline:
+            return  # nothing more will start
+        nxt = self._next()
+        if nxt is None:
+            return
+        try:
+            self._precheck(nxt)
+        except _Refused:
+            return
+        src = (nxt.parts or (nxt.path,))[0]
+        self.prefetcher.start(src)
+        self.prefetched = src
+
+    def drop_prefetch(self) -> None:
+        if self.prefetched is not None:
+            self.prefetched = None
+            self.prefetcher.cancel()
+
+    def _release(self, work: _Work) -> None:
+        for path in work.reserved:
+            try:
+                self.scratch.release(path)
+            except OSError as exc:
+                _log.warning("could not remove scratch file %s: %s", path, exc)
+        try:
+            shutil.rmtree(work.workdir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _log.warning("could not remove scratch folder %s: %s", work.workdir, exc)
+
+    def sweep(self) -> None:
+        """Remove what a killed run left in scratch: partial copies, work folders, orphans."""
+        keep: set[str] = set()
+        for rec in self.state.records(Status.PENDING, Status.RETRY):
+            keep.update(_norm(self.prefetcher.dest_for(p)) for p in (rec.parts or (rec.path,)))
+        for entry in os.scandir(self.settings.scratch_dir):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if _WORK_NAME.fullmatch(entry.name):
+                        shutil.rmtree(entry.path)
+                        _log.info("removed leftover scratch folder %s", entry.path)
+                elif _COPY_NAME.fullmatch(entry.name) and (
+                    entry.name.endswith(".part") or _norm(entry.path) not in keep
+                ):
+                    os.unlink(entry.path)
+                    _log.info("removed leftover scratch file %s", entry.path)
+            except OSError as exc:
+                _log.warning("could not remove leftover %s: %s", entry.path, exc)
+
+    def _keep_tool_log(self, log: Path | None) -> Path | None:
+        """Copy a failed tool's stderr log out of scratch (which is about to be released)."""
+        if log is None or not log.is_file() or not _is_under(log, self.settings.scratch_dir):
+            return log
+        stamp = f"{self.now():%Y%m%d-%H%M%S}"
+        tag = hashlib.sha1(str(log).encode("utf-8", "surrogatepass"), usedforsecurity=False)
+        name = log.name if log.name.endswith(".log") else log.name + ".log"
+        kept = self.settings.log_dir / f"run-{stamp}-{tag.hexdigest()[:8]}-{name}"
+        try:
+            self.settings.log_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(log, kept)
+        except OSError as exc:
+            _log.warning("could not keep tool log %s: %s", log, exc)
+            return None
+        return kept
+
+    # -- one file -------------------------------------------------------------------------
+
+    def _expected(self, rec: FileRecord, sources: Sequence[Path]) -> list[tuple[int, float]]:
+        """The (size, mtime) each source had when it was planned."""
+        out: list[tuple[int, float]] = []
+        for src in sources:
+            if _norm(src) == _norm(rec.path):
+                out.append((rec.size, rec.mtime))
+                continue
+            member = self.state.get(src)
+            if member is not None and member.status is not Status.STALE:
+                out.append((member.size, member.mtime))
+            else:
+                st = os.stat(src)
+                out.append((st.st_size, st.st_mtime))
+        return out
+
+    def _assert_unchanged(
+        self, sources: Sequence[Path], expected: Sequence[tuple[int, float]]
+    ) -> None:
+        for src, (size, mtime) in zip(sources, expected, strict=True):
+            try:
+                st = os.stat(src)
+            except (FileNotFoundError, NotADirectoryError):
+                if not self._library_reachable():
+                    raise
+                raise _SourceStale(f"{src} is gone") from None
+            if (st.st_size, st.st_mtime) != (size, mtime):
+                raise _SourceStale(
+                    f"{src}: size {size} -> {st.st_size}, mtime {mtime} -> {st.st_mtime}"
+                )
+
+    def _still_live(self, rec: FileRecord) -> None:
+        live = self.state.get(rec.path)
+        same = live is not None and (live.size, live.mtime) == (rec.size, rec.mtime)
+        if live is None or live.status is Status.STALE or not same:
+            raise StaleRecord(f"{rec.path} was re-planned during the run")
+
+    def _deliver(
+        self,
+        rec: FileRecord,
+        sources: Sequence[Path],
+        expected: Sequence[tuple[int, float]],
+        output: Path,
+        target: Path,
+        *,
+        action: str,
+        crf: int | None,
+        vmaf: tuple[float, float] | None,
+    ) -> _Outcome:
+        completed_size = output.stat().st_size
+        entry = ManifestEntry(
+            original=tuple(sources),
+            original_sizes=tuple(size for size, _ in expected),
+            original_mtimes=tuple(mtime for _, mtime in expected),
+            completed=target,
+            completed_size=completed_size,
+            vmaf_mean=None if vmaf is None else vmaf[0],
+            vmaf_worst=None if vmaf is None else vmaf[1],
+            crf=crf,
+            verified=True,
+            action=action,
+        )
+        # Second line of defence: the original may have changed during the encode.
+        if not check_unchanged(entry):
+            if not self._library_reachable():
+                raise OSError(f"library root {self.settings.library_root} is unreachable")
+            raise _SourceStale(f"{rec.path} changed during processing")
+        self._still_live(rec)
+
+        manifest_path = self.settings.completed_dir / MANIFEST_NAME
+        try:
+            entries = read_manifest(manifest_path)
+        except FileNotFoundError:
+            entries = []
+        key = str(target).casefold()
+        if any(str(e.completed).casefold() == key for e in entries):
+            raise _Refused(f"output {target} is already in the manifest")
+        if target.exists():
+            raise _Refused(f"output {target} already exists in the completed folder")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".part")
+        try:
+            shutil.move(output, tmp)  # a rename on one volume, copy and delete across volumes
+            os.replace(tmp, target)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        try:
+            write_manifest(manifest_path, [*entries, entry])
+        except BaseException:
+            target.unlink(missing_ok=True)  # no output without its manifest row
+            raise
+        saved = sum(entry.original_sizes) - completed_size
+        return _Outcome(Status.COMPLETED, f"{action}: saved {saved} bytes", saved)
+
+    def _work(self, rec: FileRecord, target: Path, work: _Work) -> _Outcome:
+        s, tools, rep, pipe = self.settings, self.tools, self.reporter, self.pipeline
+        self._set(rec, Status.QUEUED)
+        self._set(rec, Status.COPYING)
+        sources = list(rec.parts) or [rec.path]
+        expected = self._expected(rec, sources)
+        copies = [
+            self._copy(src, size, work) for src, (size, _) in zip(sources, expected, strict=True)
+        ]
+        self._assert_unchanged(sources, expected)
+        self._start_prefetch()
+        work.workdir.mkdir(parents=True, exist_ok=True)
+
+        duration_s: float | None = None
+        original_size: int | None = None
+        if rec.parts:
+            combined = work.workdir / "combined.mkv"
+            original_size = sum(size for size, _ in expected)
+            self._reserve(original_size, combined, work)
+            rep.stage(f"append parts: {rec.path.name}")
+            pipe.append_parts(tools, copies, combined, rep)
+            duration_s = sum(pipe.probe(c, tools, rep).duration_s for c in copies)
+            info = pipe.probe(combined, tools, rep)
+            decision = decide(info, s, multipart=True)
+            if decision.action is Action.FLAG:
+                return _Outcome(Status.FLAGGED, "; ".join(decision.reasons))
+            source = combined
+            action = Action.ENCODE if decision.encode else Action.REMUX
+        else:
+            info = pipe.probe(copies[0], tools, rep)
+            source = copies[0]
+            action = Action(rec.decision)
+
+        verify_args = {
+            "min_saving": s.min_saving,
+            "original_duration_s": duration_s,
+            "original_size": original_size,
+        }
+        if action is Action.REMUX:
+            if rec.parts:
+                output = source  # the append already is the remux
+            else:
+                self._set(rec, Status.MUXING)
+                output = work.workdir / target.name
+                self._reserve(rec.size, output, work)
+                pipe.mux(tools, [source], None, output, rep)
+            self._set(rec, Status.VERIFYING)
+            verdict = pipe.verify(tools, info, output, rep, encoded=False, **verify_args)
+            if not verdict.ok:
+                return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
+            return self._deliver(
+                rec, sources, expected, output, target, action="remux", crf=None, vmaf=None
+            )
+
+        self._set(rec, Status.ENCODING)
+        search = pipe.search_crf(info, tools, s, work.workdir, rep)
+        if search.projected_saving < s.min_saving:
+            return _Outcome(
+                Status.LEFT_ALONE,
+                f"projected saving {search.projected_saving:.1%} at CRF {search.crf} is below "
+                f"the minimum {s.min_saving:.0%}",
+            )
+        encoded = work.workdir / "video.mkv"
+        pipe.encode_full(info, tools, s, search.crf, encoded, rep)
+        self._set(rec, Status.MUXING)
+        output = work.workdir / target.name
+        pipe.mux(tools, [source], encoded, output, rep)
+        self._set(rec, Status.VERIFYING)
+        scores = pipe.window_scores(tools, info, output, s, work.workdir, rep)
+        guard = quality.evaluate_guard(scores, s.guard_mean_floor, s.guard_worst_floor)
+        if not guard.ok:
+            return _Outcome(Status.LEFT_ALONE, f"quality guard failed: {guard.reason}")
+        verdict = pipe.verify(tools, info, output, rep, encoded=True, **verify_args)
+        if not verdict.ok:
+            if verdict.too_large:
+                return _Outcome(Status.LEFT_ALONE, f"output not kept: {verdict.reason}")
+            return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
+        return self._deliver(
+            rec,
+            sources,
+            expected,
+            output,
+            target,
+            action="encode",
+            crf=search.crf,
+            vmaf=(guard.mean, guard.worst),
+        )
+
+    def process(self, rec: FileRecord) -> str:
+        """Handle one record; returns a stop reason, or "" to carry on with the next file."""
+        self.attempted.add((_norm(rec.path), rec.size, rec.mtime))
+        sources = rec.parts or (rec.path,)
+        if self.prefetched is not None and _norm(self.prefetched) not in {
+            _norm(p) for p in sources
+        }:
+            self.drop_prefetch()
+        try:
+            target = self._precheck(rec)
+        except _Refused as exc:
+            self._finish(rec, _Outcome(Status.FLAGGED, str(exc)))
+            return ""
+        digest = hashlib.sha1(
+            f"{rec.path}|{rec.size}|{rec.mtime}".encode("utf-8", "surrogatepass"),
+            usedforsecurity=False,
+        ).hexdigest()[:12]
+        work = _Work(workdir=self.settings.scratch_dir / f"work-{digest}")
+        try:
+            outcome = self._work(rec, target, work)
+        except (_SourceStale, SourceChanged) as exc:
+            _log.warning("%s: %s; result discarded", rec.path, exc)
+            outcome = _Outcome(Status.STALE, STALE_NOTE)
+        except StaleRecord as exc:
+            _log.warning("%s; result discarded", exc)
+            return ""
+        except _Refused as exc:
+            outcome = _Outcome(Status.FLAGGED, str(exc))
+        except ScratchFull as exc:
+            self._finish(rec, _Outcome(Status.RETRY, f"scratch full: {exc}"))
+            return STOP_SCRATCH_FULL
+        except ToolNotFound as exc:
+            self._finish(rec, _Outcome(Status.RETRY, str(exc)))
+            return f"tool not found: {exc.name}"
+        except ToolOutputError as exc:
+            outcome = _Outcome(Status.RETRY, f"tool output handling failed: {exc}")
+        except ToolFailed as exc:
+            kept = self._keep_tool_log(exc.log_path)
+            where = f"; log {kept}" if kept is not None else ""
+            outcome = _Outcome(Status.RETRY, f"tool failed with exit code {exc.returncode}{where}")
+        except NotImplementedError as exc:
+            if str(exc) != HELD_REASON:
+                outcome = _Outcome(Status.FLAGGED, f"NotImplementedError: {exc}")
+            else:
+                with contextlib.suppress(StaleRecord):
+                    self.state.set_status(
+                        rec.path, Status.PENDING, "", size=rec.size, mtime=rec.mtime
+                    )
+                return HELD_REASON
+        except ProbeError as exc:
+            outcome = _Outcome(Status.FLAGGED, str(exc))
+        except OSError as exc:
+            if not self._library_reachable():
+                self._finish(rec, _Outcome(Status.RETRY, f"library unreachable: {exc}"))
+                return STOP_LIBRARY_UNREACHABLE
+            outcome = _Outcome(Status.RETRY, f"I/O error: {exc}")
+        except Exception as exc:
+            _log.exception("%s: unexpected error", rec.path)
+            outcome = _Outcome(Status.FLAGGED, f"{type(exc).__name__}: {exc}")
+        finally:
+            self._release(work)
+        self._finish(rec, outcome)
+        return ""
+
+    def summary(self, stopped_by_deadline: bool, stop_reason: str) -> RunSummary:
+        return RunSummary(
+            completed=self.counts[Status.COMPLETED],
+            left_alone=self.counts[Status.LEFT_ALONE],
+            flagged=self.counts[Status.FLAGGED],
+            retry=self.counts[Status.RETRY],
+            bytes_saved=self.bytes_saved,
+            stopped_by_deadline=stopped_by_deadline,
+            stop_reason=stop_reason,
+        )
+
+    def records(self) -> Iterator[FileRecord]:
+        while (rec := self._next()) is not None:
+            yield rec
+
+
+def run_queue(
+    settings: Settings,
+    tools: Tools,
+    state: State,
+    reporter: Reporter,
+    *,
+    deadline: datetime | None,
+    only: Path | None = None,
+    now: Callable[[], datetime] = datetime.now,
+    pipeline: Pipeline | None = None,
+    current_log: Path | None = None,
+) -> RunSummary:
+    """Work through the queue until it is empty, the deadline passes or a stop condition hits.
+
+    Raises `PlanNotAcknowledged` before touching anything if the plan was not acknowledged and
+    `RunRefused` if an output location is under the library root. The deadline is checked
+    before each file; the file in progress always finishes. KeyboardInterrupt leaves the
+    current record in its in-progress status (the next run retries it), cleans its scratch and
+    propagates.
+    """
+    if not state.plan_acknowledged():
+        raise PlanNotAcknowledged(
+            "the plan has not been acknowledged: review and acknowledge it with `plan` first"
+        )
+    _refuse_outputs_in_library(settings)
+    reset = state.reset_in_progress()
+    if reset:
+        _log.info("%d file(s) left in progress by an earlier run were reset to retry", reset)
+    removed = doctor.prune_logs(settings.log_dir, exclude=current_log)
+    if removed:
+        _log.info("pruned %d old log file(s)", len(removed))
+
+    runner = _Runner(settings, tools, state, reporter, pipeline or Pipeline(), deadline, only, now)
+    runner.sweep()
+    if not os.path.isdir(settings.library_root):
+        _log.error("library root %s is unreachable; nothing started", settings.library_root)
+        return runner.summary(False, STOP_LIBRARY_UNREACHABLE)
+    runner.claim_targets()
+
+    stopped_by_deadline = False
+    stop_reason = ""
+    try:
+        for rec in runner.records():
+            if deadline is not None and now() >= deadline:
+                stopped_by_deadline = True
+                _log.info("deadline %s reached; stopping before %s", deadline, rec.path)
+                break
+            stop_reason = runner.process(rec)
+            if stop_reason:
+                _log.warning("run stopped: %s", stop_reason)
+                break
+    finally:
+        runner.drop_prefetch()
+    return runner.summary(stopped_by_deadline, stop_reason)
