@@ -8,7 +8,6 @@ result and the survey carries on.
 
 from __future__ import annotations
 
-import csv
 import logging
 import os
 import tempfile
@@ -18,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from video_cleaner.atomicio import write_csv_atomic
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.multipart import PartGroup, find_part_groups, parts_compatible
@@ -255,11 +255,6 @@ def _csv_error(path: Path, exc: OSError) -> SurveyError:
     return SurveyError(f"cannot write the survey CSV in {path.parent}: {exc}")
 
 
-def _temp_beside(path: Path) -> tuple[int, Path]:
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    return fd, Path(name)
-
-
 def check_csv_writable(path: Path) -> None:
     """Fail fast, before a long probe pass, if the CSV folder cannot be written.
 
@@ -269,7 +264,8 @@ def check_csv_writable(path: Path) -> None:
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, probe_file = _temp_beside(path)
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        probe_file = Path(name)
         os.close(fd)
         probe_file.unlink()
     except OSError as exc:
@@ -283,35 +279,28 @@ def check_csv_writable(path: Path) -> None:
 
 
 def _write_csv(path: Path, rows: Sequence[_Row]) -> Path:
-    """Write the CSV to a temporary file beside *path*, then move it into place atomically.
+    """Write the CSV atomically (`atomicio`) and return the path written.
 
-    If *path* is locked, the file goes to ``survey-<timestamp>.csv`` in the same folder.
-    Returns the path written; any other failure raises `SurveyError`.
+    If *path* is locked, the file goes to ``survey-<timestamp>.csv`` in the same folder. Any
+    other failure raises `SurveyError`; the previous CSV and no temporary file stay behind.
     """
-    try:
-        fd, tmp = _temp_beside(path)
-    except OSError as exc:
-        raise _csv_error(path, exc) from exc
-    try:
+    lines = [_csv_line(r) for r in rows]
+
+    def write(target: Path) -> None:
         # backslashreplace: an undecodable file name (lone surrogate) still yields valid UTF-8.
-        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(CSV_COLUMNS)
-            writer.writerows(_csv_line(r) for r in rows)
+        write_csv_atomic(target, CSV_COLUMNS, lines, errors="backslashreplace")
+
+    try:
         try:
-            os.replace(tmp, path)
+            write(path)
             return path
         except PermissionError as exc:
             fallback = path.with_name(FALLBACK_CSV_PATTERN.format(datetime.now()))
             _log.warning("cannot replace %s (%s); writing %s instead", path, exc, fallback)
-            os.replace(tmp, fallback)
+            write(fallback)
             return fallback
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
         raise _csv_error(path, exc) from exc
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
 
 
 def run_survey(

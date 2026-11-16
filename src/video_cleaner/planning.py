@@ -15,17 +15,14 @@ CLI checks that before calling), always via a temporary file moved into place.
 
 from __future__ import annotations
 
-import contextlib
-import csv
 import hashlib
-import io
 import json
-import os
-import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from video_cleaner.atomicio import write_csv_atomic, write_text_atomic
 from video_cleaner.decide import Action
 from video_cleaner.manifest import ManifestEntry
 from video_cleaner.multipart import find_part_groups
@@ -225,45 +222,23 @@ def plan_hash(report: PlanReport) -> str:
 # --- files ---------------------------------------------------------------------------------
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    """Write *text* (UTF-8, no BOM) to a temporary file beside *path*, then move it into place.
-
-    Raises `PlanError` when the folder cannot be written or *path* is locked (open in Excel);
-    the previous file is then left as it was and no temporary file stays behind.
-    """
+@contextmanager
+def _writing(path: Path) -> Iterator[None]:
+    """Turn a failed write of *path* into `PlanError`; the old file is left as it was."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    except OSError as exc:
-        raise PlanError(f"cannot write {path}: {exc}") from exc
-    try:
-        # backslashreplace: an undecodable file name still yields valid UTF-8.
-        with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
+        yield
     except PermissionError as exc:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
         raise PlanError(
-            f"cannot replace {path}: {exc}; close it if it is open in another program"
+            f"cannot write {path}: {exc}; close it if it is open in another program"
         ) from exc
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
         raise PlanError(f"cannot write {path}: {exc}") from exc
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
 
 
-def write_csv_atomic(path: Path, header: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
-    """Write a CSV (csv module quoting, UTF-8) atomically; see `write_text_atomic`."""
-    buffer = io.StringIO()
-    writer = csv.writer(buffer)
-    writer.writerow(header)
-    writer.writerows(rows)
-    write_text_atomic(path, buffer.getvalue())
+def _write_csv(path: Path, header: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
+    # backslashreplace: an undecodable file name still yields valid UTF-8.
+    with _writing(path):
+        write_csv_atomic(path, header, rows, errors="backslashreplace")
 
 
 def _plan_line(row: PlanRow, group_names: dict[Path, str]) -> list[object]:
@@ -282,12 +257,13 @@ def _plan_line(row: PlanRow, group_names: dict[Path, str]) -> list[object]:
 def write_plan_report(report: PlanReport, path: Path) -> str:
     """Write *report* as a CSV at *path* and return its `plan_hash`. Stores nothing in State."""
     group_names = {g.parts[0]: g.output_name for g in report.groups if g.parts}
-    write_csv_atomic(path, PLAN_COLUMNS, (_plan_line(r, group_names) for r in report.rows))
+    _write_csv(path, PLAN_COLUMNS, (_plan_line(r, group_names) for r in report.rows))
     return plan_hash(report)
 
 
 def write_plan_hash(path: Path, digest: str) -> None:
-    write_text_atomic(path, digest + "\n")
+    with _writing(path):
+        write_text_atomic(path, digest + "\n")
 
 
 def read_plan_hash(path: Path) -> str | None:
@@ -358,7 +334,7 @@ def _optional(value: float | int | None) -> object:
 
 def write_results_csv(results: ResultsReport, path: Path) -> None:
     """One row per completed file: sizes, saving %, VMAF, CRF and action."""
-    write_csv_atomic(
+    _write_csv(
         path,
         REPORT_COLUMNS,
         (

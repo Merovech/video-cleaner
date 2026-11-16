@@ -20,9 +20,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action
-from video_cleaner.planning import write_text_atomic
 from video_cleaner.progress import Reporter
 from video_cleaner.runner import HELD_REASON, refuse_outputs_in_library
 from video_cleaner.state import FileRecord, State, Status
@@ -286,6 +286,10 @@ def run_calibration(
                 engine.make_sidebyside(tools, sample, encoded, clip, reporter)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
-    write_text_atomic(settings.state_db.parent / CALIBRATION_TXT, format_calibration_table(rows))
+    table = settings.state_db.parent / CALIBRATION_TXT
+    try:
+        write_text_atomic(table, format_calibration_table(rows))
+    except OSError as exc:
+        raise CalibrationError(f"cannot write {table}: {exc}") from exc
     _log.info("calibration of %d sample(s) written", len(picked))
     return rows

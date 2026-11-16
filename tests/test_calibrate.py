@@ -441,3 +441,17 @@ def test_cli_calibrate_without_state_exits_2(
     assert result.exit_code == 2
     assert "survey" in result.output
     assert not (tmp_path / "appdata").exists()
+
+
+def test_unwritable_table_is_a_calibration_error(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with State.open(settings.state_db) as state:
+        _populate(settings, state)
+    (settings.state_db.parent / "calibration.txt").mkdir()  # a folder in the way
+    with (
+        State.open(settings.state_db) as state,
+        pytest.raises(CalibrationError, match="cannot write"),
+    ):
+        run_calibration(
+            settings, TOOLS, state, NullReporter(), samples=1, engine=FakeEngine().engine()
+        )

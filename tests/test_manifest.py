@@ -737,3 +737,18 @@ def test_read_manifest_rejects_non_utf8_file(tmp_path: Path) -> None:
 
     with pytest.raises(ManifestError, match="UTF-8"):
         read_manifest(manifest)
+
+
+def test_write_manifest_flushes_to_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    synced: list[int] = []
+    real = os.fsync
+
+    def spy(fd: int) -> None:
+        synced.append(fd)
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    write_manifest(
+        tmp_path / "manifest.csv", [make_entry((tmp_path / "a.avi",), tmp_path / "a.mkv")]
+    )
+    assert len(synced) == 1

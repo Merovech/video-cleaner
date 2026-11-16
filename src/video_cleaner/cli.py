@@ -313,7 +313,7 @@ def calibrate(
             rows = _calibrate.run_calibration(
                 settings, tools, state, reporter, samples=samples, engine=engine
             )
-    except (_calibrate.CalibrationError, _runner.RunRefused, planning.PlanError, StateError) as exc:
+    except (_calibrate.CalibrationError, _runner.RunRefused, StateError) as exc:
         _fail(str(exc))
     except KeyboardInterrupt:
         _err.print("calibration interrupted; nothing was approved", highlight=False)

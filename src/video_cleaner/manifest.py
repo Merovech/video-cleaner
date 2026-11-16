@@ -11,16 +11,15 @@ which only stats the originals.
 
 from __future__ import annotations
 
-import contextlib
 import csv
 import math
 import os
 import stat
-import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
+from video_cleaner.atomicio import write_csv_atomic
 from video_cleaner.config import Settings
 
 COMPLETED_SUFFIX = ".mkv"
@@ -192,24 +191,11 @@ def write_manifest(path: Path, entries: Sequence[ManifestEntry]) -> None:
     """Write the manifest CSV (UTF-8, no BOM), one row per original, replacing *path* atomically.
 
     A multi-part entry yields one row per original with the completed columns repeated. The file
-    is written beside *path* and moved over it with `os.replace`, so a crash or a full disk
-    leaves the previous manifest intact.
+    is written beside *path*, flushed to disk and moved over it (`atomicio`), so a crash or a
+    full disk leaves the previous manifest intact.
     """
     rows = _rows(entries)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(MANIFEST_COLUMNS)
-            writer.writerows(rows)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    write_csv_atomic(path, MANIFEST_COLUMNS, rows, fsync=True)
 
 
 def _parse_int(column: str, text: str) -> int:
