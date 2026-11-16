@@ -116,15 +116,18 @@ def _locate(name: str, env: Mapping[str, str]) -> Path:
     if explicit:
         path = Path(explicit)
         if path.is_file():
-            return path
+            return path.absolute()
         # An explicit override that points nowhere is a configuration error, not a hint.
         raise ToolNotFound(name, f"{var}={explicit} is not a file")
     for entry in env.get("PATH", "").split(os.pathsep):
-        if entry and (found := _in_dir(Path(entry), name)) is not None:
-            return found
+        # A relative entry ("." or "bin") would depend on the current folder, where a planted
+        # executable could be picked up: only absolute entries are searched.
+        absolute = bool(entry) and Path(entry).is_absolute()
+        if absolute and (found := _in_dir(Path(entry), name)) is not None:
+            return found.absolute()
     for directory in _fallback_dirs(name, env):
         if (found := _in_dir(directory, name)) is not None:
-            return found
+            return found.absolute()
     raise ToolNotFound(name, f"not on PATH or in the default install locations; set {var}")
 
 

@@ -513,3 +513,29 @@ def test_integration_locate_and_run_real_tools() -> None:
     assert out.stdout.startswith("ffmpeg version")
     out = run_tool([str(found.mkvmerge), "--version"], label="mkvmerge", reporter=reporter)
     assert "mkvmerge" in out.stdout
+
+
+def test_locate_tools_skips_relative_path_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A relative PATH entry ("." or "bin") would resolve against whatever folder the command
+    # runs in: a planted ffmpeg.exe there must never be picked.
+    monkeypatch.chdir(tmp_path)
+    for n in ("ffmpeg", "ffprobe", "mkvmerge"):
+        _touch(tmp_path / "bin" / f"{n}.exe")
+    with pytest.raises(ToolNotFound):
+        locate_tools(_fake_env(tmp_path, PATH=os.pathsep.join(["bin", "."])))
+
+
+def test_located_tools_are_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    for n in ("ffmpeg", "ffprobe", "mkvmerge"):
+        _touch(tmp_path / "x" / f"{n}.exe")
+    env = _fake_env(
+        tmp_path,
+        VC_FFMPEG=os.path.join("x", "ffmpeg.exe"),  # relative override: made absolute
+        PATH=str(tmp_path / "x"),
+    )
+    found = locate_tools(env)
+    assert all(p.is_absolute() for p in (found.ffmpeg, found.ffprobe, found.mkvmerge))
+    assert found.ffmpeg == tmp_path / "x" / "ffmpeg.exe"
