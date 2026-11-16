@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from video_cleaner.paths import path_key as _key
 from video_cleaner.progress import Progress, Reporter
 
 _log = logging.getLogger(__name__)
@@ -152,10 +153,6 @@ def copy_with_progress(
     KeyboardInterrupt) the partial file is removed and *dest* is never created or replaced.
     """
     return _copy(src, dest, reporter, chunk, None)
-
-
-def _key(path: Path | str) -> str:
-    return os.path.normcase(os.path.abspath(path))
 
 
 class ScratchManager:

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.config import Settings, default_config_path
+from video_cleaner.paths import is_under, path_key
 from video_cleaner.tools import ToolNotFound, _locate
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
@@ -107,14 +108,6 @@ def loose_acl_entries(icacls_output: str) -> list[str]:
         if tokens & _READ_RIGHTS:
             loose.append(f"{match['who']}:{match['rights']}")
     return loose
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except (ValueError, OSError):
-        return False
-    return True
 
 
 def _existing_ancestor(path: Path) -> Path:
@@ -229,7 +222,7 @@ class _Doctor:
             yield self._writable(name, directory)
 
     def _writable(self, name: str, directory: Path) -> Check:
-        if _is_within(directory, self.settings.library_root):
+        if is_under(directory, self.settings.library_root):
             return Check(name, False, f"{directory} is inside library_root; it must be local")
         try:
             directory.mkdir(parents=True, exist_ok=True)
@@ -334,12 +327,8 @@ def prune_logs(
     current = time.time() if now is None else now
     cutoff = current - keep_days * 86_400
     try:
-        skip = None if exclude is None else os.path.normcase(os.path.abspath(exclude))
-        candidates = [
-            p
-            for p in log_dir.glob(LOG_GLOB)
-            if p.is_file() and os.path.normcase(os.path.abspath(p)) != skip
-        ]
+        skip = None if exclude is None else path_key(exclude)
+        candidates = [p for p in log_dir.glob(LOG_GLOB) if p.is_file() and path_key(p) != skip]
         logs = sorted((p.stat().st_mtime, p.stat().st_size, p) for p in candidates)
     except OSError:
         return []

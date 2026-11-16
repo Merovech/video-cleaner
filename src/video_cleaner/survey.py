@@ -21,6 +21,7 @@ from pathlib import Path
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.multipart import PartGroup, find_part_groups, parts_compatible
+from video_cleaner.paths import is_under
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.state import State, UnrepresentablePath
@@ -106,10 +107,6 @@ def discover_files(root: Path) -> list[Path]:
     return sorted(found)
 
 
-def _is_under(path: Path, root: Path) -> bool:
-    return path.resolve().is_relative_to(root.resolve())
-
-
 def check_outputs_outside(settings: Settings, root: Path) -> Path:
     """Raise `SurveyError` if anything the survey writes would land under *root*.
 
@@ -124,7 +121,7 @@ def check_outputs_outside(settings: Settings, root: Path) -> Path:
     )
     for base in dict.fromkeys((root, settings.library_root)):
         for label, target in targets:
-            if _is_under(target, base):
+            if is_under(target, base):
                 raise SurveyError(
                     f"{label} {target} is under the library root {base}; "
                     "the survey never writes to the library"
