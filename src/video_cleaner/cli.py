@@ -252,6 +252,11 @@ def _approve_calibration(
     low, high = _calibrate.VMAF_TARGET_RANGE
     if not low <= vmaf_target <= high:
         _fail(f"--vmaf-target must be between {low:g} and {high:g}, got {vmaf_target}")
+    if vmaf_target < settings.guard_mean_floor:
+        _fail(
+            f"--vmaf-target {vmaf_target:g} is below guard_mean_floor "
+            f"{settings.guard_mean_floor:g}: the quality guard would reject every encode"
+        )
     if not settings.crf_min <= crf_max <= X265_CRF_MAX:
         _fail(
             f"--crf-max must be between crf_min ({settings.crf_min}) and "
@@ -275,7 +280,10 @@ def calibrate(
         bool, typer.Option("--approve", help="Approve a VMAF target and CRF ceiling for runs.")
     ] = False,
     vmaf_target: Annotated[
-        float | None, typer.Option("--vmaf-target", help="With --approve: VMAF target (50-100).")
+        float | None,
+        typer.Option(
+            "--vmaf-target", help="With --approve: VMAF target (guard_mean_floor to 100)."
+        ),
     ] = None,
     crf_max: Annotated[
         int | None, typer.Option("--crf-max", help="With --approve: highest CRF a run may use.")

@@ -351,7 +351,8 @@ def test_cli_calibrate_approve_validates(tmp_path: Path, vmaf: str, crf: str) ->
     assert not (tmp_path / "appdata" / "state.db").exists()
 
 
-@pytest.mark.parametrize("vmaf", ["50", "100"])
+# The lower bound is the guard's mean floor (default 93), not 50, while the guard is above 50.
+@pytest.mark.parametrize("vmaf", ["93", "100"])
 def test_cli_calibrate_approve_accepts_bounds(tmp_path: Path, vmaf: str) -> None:
     cfg = write_config(tmp_path)
     for crf in ("16", "51"):
@@ -455,3 +456,13 @@ def test_unwritable_table_is_a_calibration_error(tmp_path: Path) -> None:
         run_calibration(
             settings, TOOLS, state, NullReporter(), samples=1, engine=FakeEngine().engine()
         )
+
+
+def test_cli_calibrate_approve_refuses_target_below_guard_floor(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)  # guard_mean_floor is the default 93.0
+    result = _invoke(
+        "calibrate", "--approve", "--vmaf-target", "92.5", "--crf-max", "23", "--config", str(cfg)
+    )
+    assert result.exit_code == 2
+    assert "guard_mean_floor" in result.output
+    assert not (tmp_path / "appdata" / "state.db").exists()

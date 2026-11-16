@@ -307,8 +307,10 @@ def refuse_outputs_in_library(settings: Settings) -> None:
 def apply_calibration(settings: Settings, state: State) -> Settings:
     """*settings* with the approved ``vmaf_target`` and ``crf_max`` (ruling R3).
 
-    Raises `CalibrationNotApproved` when nothing was approved, or when the approved ceiling is
-    below the configured ``crf_min`` (the config changed after the approval).
+    Raises `CalibrationNotApproved` when nothing was approved, when the approved ceiling is
+    below the configured ``crf_min``, or when the approved VMAF target is below
+    ``guard_mean_floor`` (the guard would reject every encode); the last two mean the config
+    changed after the approval.
     """
     approved = state.calibration()
     if approved is None:
@@ -321,6 +323,12 @@ def apply_calibration(settings: Settings, state: State) -> Settings:
         raise CalibrationNotApproved(
             f"the approved crf_max {crf_max} is below the configured crf_min "
             f"{settings.crf_min}: approve the calibration again with `calibrate --approve`"
+        )
+    if vmaf_target < settings.guard_mean_floor:
+        raise CalibrationNotApproved(
+            f"the approved vmaf_target {vmaf_target:g} is below the configured guard_mean_floor "
+            f"{settings.guard_mean_floor:g}: the quality guard would reject every encode; "
+            "approve the calibration again with `calibrate --approve`"
         )
     return dataclasses.replace(settings, vmaf_target=vmaf_target, crf_max=crf_max)
 

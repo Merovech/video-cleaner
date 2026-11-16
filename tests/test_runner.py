@@ -1759,3 +1759,18 @@ def test_run_progress_keeps_the_ack_valid(settings: Settings, state: State) -> N
         pipeline=Fakes().pipeline(),
     )
     assert second.stop_reason == ""
+
+
+def test_approved_vmaf_target_below_guard_mean_floor_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_tools(monkeypatch)
+    settings = _settings(tmp_path, guard_mean_floor=95.0, guard_worst_floor=90.0)
+    with State.open(settings.state_db) as state:
+        state.approve_calibration(94.0, 23)  # approved before the guard floor was raised
+        _plan(state, _source(settings, "a.avi"))
+        fakes = Fakes()
+        with pytest.raises(CalibrationNotApproved, match="guard_mean_floor"):
+            _run(settings, state, fakes)
+        assert fakes.calls == []
+    assert not settings.scratch_dir.exists()
