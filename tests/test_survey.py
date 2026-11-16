@@ -134,8 +134,10 @@ def _run(
     reporter: RecordingReporter | None = None,
     root: Path | None = None,
     workers: int = 4,
+    hash_fn: Callable[[Path], str | None] | None = None,
 ) -> tuple[SurveyResult, State]:
     state = State.open(settings.state_db)
+    extra = {} if hash_fn is None else {"hash_fn": hash_fn}
     result = run_survey(
         settings,
         FAKE_TOOLS,
@@ -144,6 +146,7 @@ def _run(
         root=root,
         workers=workers,
         probe_fn=probe_fn,
+        **extra,
     )
     return result, state
 
@@ -498,6 +501,60 @@ def test_survey_compatible_multipart_group_is_one_record(tmp_path: Path) -> None
     assert rows["Dr. Mabuse pt1.mkv"]["action"] == "encode"
     assert rows["Dr. Mabuse pt2.mkv"]["action"] == "leave_alone"
     assert rows["Dr. Mabuse pt2.mkv"]["reasons"] == "part of group Dr. Mabuse.mkv"
+
+
+def _name_hash(path: Path) -> str:
+    return f"{sum(path.name.encode()):016x}"
+
+
+def test_survey_stores_movie_hash_per_file_and_per_part(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    lib = settings.library_root
+    single = _touch(lib / "Heat (1995).mkv")
+    pt1 = _touch(lib / "Mabuse" / "Dr. Mabuse pt1.mkv")
+    pt2 = _touch(lib / "Mabuse" / "Dr. Mabuse pt2.mkv")
+    result, state = _run(settings, _fake_probe({}), hash_fn=_name_hash)
+    try:
+        for path in (single, pt1, pt2):
+            rec = state.get(path)
+            assert rec is not None and rec.movie_hash == _name_hash(path)
+    finally:
+        state.close()
+    rows = _by_name(_csv_rows(result.csv_path))
+    assert rows["Heat (1995).mkv"]["movie_hash"] == _name_hash(single)
+
+
+def test_survey_default_hash_reads_the_real_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Big.mkv", b"\x00" * (128 * 1024))
+    _result, state = _run(settings, _fake_probe({}))
+    try:
+        rec = state.get(film)
+        assert rec is not None and rec.movie_hash == "0000000000020000"
+    finally:
+        state.close()
+
+
+def test_survey_hash_failure_never_stops_the_survey(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    lib = settings.library_root
+    bad = _touch(lib / "Bad.mkv")
+    good = _touch(lib / "Good.mkv")
+
+    def hash_fn(path: Path) -> str | None:
+        if path.name == "Bad.mkv":
+            raise RuntimeError("boom")
+        return "abcdefabcdefabcd"
+
+    result, state = _run(settings, _fake_probe({}), hash_fn=hash_fn)
+    try:
+        bad_rec, good_rec = state.get(bad), state.get(good)
+        assert bad_rec is not None and bad_rec.movie_hash is None
+        assert bad_rec.decision == "encode"  # the file is still surveyed normally
+        assert good_rec is not None and good_rec.movie_hash == "abcdefabcdefabcd"
+    finally:
+        state.close()
+    assert result.unprobeable == ()
 
 
 def test_survey_compatible_hevc_multipart_group_is_remuxed(tmp_path: Path) -> None:

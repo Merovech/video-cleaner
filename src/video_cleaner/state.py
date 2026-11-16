@@ -24,7 +24,7 @@ from typing import Any
 
 from video_cleaner.probe import MediaInfo
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_S = 30.0
 
 
@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS files (
     parts TEXT NOT NULL,
     note TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
+    movie_hash TEXT,
     UNIQUE (path, size, mtime)
 );
 CREATE INDEX IF NOT EXISTS files_status_saving ON files (status, est_saving_bytes DESC);
@@ -115,7 +116,11 @@ _PLAN_HASH_KEY = "plan_ack_hash"
 _CALIBRATION_KEY = "calibration"
 # The only text interpolated into SQL (the `nosec B608` lines) is this constant and runs of
 # "?" placeholders; every value is bound as a parameter.
-_COLUMNS = "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note"
+_COLUMNS = "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note, movie_hash"
+# Schema upgrades, applied in order to a database at the version before each key.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: ("ALTER TABLE files ADD COLUMN movie_hash TEXT",),
+}
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,9 @@ class FileRecord:
     est_saving_bytes: int
     parts: tuple[Path, ...]
     note: str
+    # OpenSubtitles hash of this record's file (for a multi-part group: of its first part; each
+    # member part has its own record and hash). None when not computed or not computable.
+    movie_hash: str | None = None
 
 
 def _now() -> str:
@@ -158,6 +166,7 @@ def _record(row: Sequence[Any]) -> FileRecord:
         est_saving_bytes=int(row[6]),
         parts=tuple(Path(p) for p in json.loads(row[7])),
         note=str(row[8]),
+        movie_hash=None if row[9] is None else str(row[9]),
     )
 
 
@@ -201,6 +210,11 @@ class State:
                     f"state database schema version {current} is newer than "
                     f"supported version {SCHEMA_VERSION}"
                 )
+            else:
+                for version in range(current + 1, SCHEMA_VERSION + 1):
+                    for statement in _MIGRATIONS[version]:
+                        conn.execute(statement)
+                    conn.execute("UPDATE schema_version SET version = ?", (version,))
         except BaseException:
             conn.execute("ROLLBACK")
             raise
@@ -256,13 +270,16 @@ class State:
         reasons: Sequence[str],
         est_saving_bytes: int,
         parts: Sequence[Path] = (),
+        movie_hash: str | None = None,
     ) -> None:
         """Record the plan for *info*, keyed on path + size + mtime.
 
         A new key creates a record (initial status from *decision*) and marks any other live
         record for the path ``stale``. Re-planning an unchanged key refreshes the plan only while
         the record is untouched since survey (see `_unstarted`); a record a run has advanced or
-        decided on (including a run-set LEFT_ALONE/FLAGGED) is left alone.
+        decided on (including a run-set LEFT_ALONE/FLAGGED) is left alone. A *movie_hash* is
+        stored on the record for that key whenever given, even on an advanced record that
+        lacks one (a database surveyed before hashes existed); None never clears a stored hash.
         """
         initial = _INITIAL_STATUS.get(decision)
         if initial is None:
@@ -278,6 +295,10 @@ class State:
                 "WHERE path = ? AND size = ? AND mtime = ?",
                 (path, info.size, info.mtime),
             ).fetchone()
+            if existing is not None and movie_hash is not None:
+                conn.execute(
+                    "UPDATE files SET movie_hash = ? WHERE id = ?", (movie_hash, existing[0])
+                )
             if existing is not None and not _unstarted(
                 Status(existing[1]), str(existing[2]), str(existing[3])
             ):
@@ -290,8 +311,8 @@ class State:
             if existing is None:
                 conn.execute(
                     "INSERT INTO files (path, size, mtime, status, decision, reasons, "
-                    "est_saving_bytes, parts, note, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?)",
+                    "est_saving_bytes, parts, note, updated_at, movie_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)",
                     (
                         path,
                         info.size,
@@ -302,6 +323,7 @@ class State:
                         est_saving_bytes,
                         parts_json,
                         _now(),
+                        movie_hash,
                     ),
                 )
                 suffix = f"; superseded {superseded} stale record(s)" if superseded else ""

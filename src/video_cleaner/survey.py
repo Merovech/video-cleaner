@@ -20,6 +20,7 @@ from pathlib import Path
 from video_cleaner.atomicio import write_csv_atomic
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
+from video_cleaner.moviehash import movie_hash
 from video_cleaner.multipart import PartGroup, find_part_groups, parts_compatible
 from video_cleaner.paths import is_under
 from video_cleaner.probe import MediaInfo, ProbeError, probe
@@ -47,6 +48,7 @@ CSV_COLUMNS = (
     "reasons",
     "est_saving_bytes",
     "parts",
+    "movie_hash",
 )
 LIST_SEPARATOR = "; "
 # Placeholder until calibration: an encode is assumed to save half of the source size.
@@ -55,6 +57,7 @@ EST_SAVING_FRACTION = 0.5
 INCOMPATIBLE_PARTS_REASON = "multi-part parts have different stream layouts"
 
 ProbeFn = Callable[[Path, Tools, Reporter], MediaInfo]
+HashFn = Callable[[Path], str | None]
 
 
 class SurveyError(Exception):
@@ -84,6 +87,7 @@ class _Row:
     est_saving_bytes: int = 0
     parts: tuple[Path, ...] = ()
     unrepresentable: bool = False
+    movie_hash: str | None = None
 
 
 def discover_files(root: Path) -> list[Path]:
@@ -129,25 +133,41 @@ def check_outputs_outside(settings: Settings, root: Path) -> Path:
     return csv_path
 
 
+def _safe_hash(path: Path, hash_fn: HashFn) -> str | None:
+    """The movie hash of *path*; any failure is a warning and None, never a survey stop."""
+    try:
+        return hash_fn(path)
+    except Exception as exc:  # a hash is a bonus: the file is still surveyed without it
+        _log.warning("no movie hash for %s: %s: %s", path, type(exc).__name__, exc)
+        return None
+
+
 def _probe_all(
     paths: Sequence[Path],
     tools: Tools,
     reporter: Reporter,
     workers: int,
     probe_fn: ProbeFn,
-) -> tuple[dict[Path, MediaInfo], dict[Path, str]]:
+    hash_fn: HashFn,
+) -> tuple[dict[Path, MediaInfo], dict[Path, str], dict[Path, str | None]]:
     infos: dict[Path, MediaInfo] = {}
     failures: dict[Path, str] = {}
+    hashes: dict[Path, str | None] = {}
     total = len(paths)
+
+    def work(path: Path) -> tuple[MediaInfo, str | None]:
+        info = probe_fn(path, tools, reporter)
+        return info, _safe_hash(path, hash_fn)
+
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="survey")
     try:
-        futures: dict[Future[MediaInfo], Path] = {
-            pool.submit(probe_fn, path, tools, reporter): path for path in paths
+        futures: dict[Future[tuple[MediaInfo, str | None]], Path] = {
+            pool.submit(work, path): path for path in paths
         }
         for done, future in enumerate(as_completed(futures), start=1):
             path = futures[future]
             try:
-                infos[path] = future.result()
+                infos[path], hashes[path] = future.result()
             except ProbeError as exc:
                 failures[path] = exc.reason
             except ToolNotFound:
@@ -170,21 +190,32 @@ def _probe_all(
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     pool.shutdown(wait=True)
-    return infos, failures
+    return infos, failures, hashes
 
 
 def _encode_saving(action: Action, size: int) -> int:
     return int(size * EST_SAVING_FRACTION) if action is Action.ENCODE else 0
 
 
-def _plan_group(group: PartGroup, infos: dict[Path, MediaInfo], settings: Settings) -> list[_Row]:
+def _plan_group(
+    group: PartGroup,
+    infos: dict[Path, MediaInfo],
+    hashes: dict[Path, str | None],
+    settings: Settings,
+) -> list[_Row]:
     probed = [infos[p] for p in group.parts if p in infos]
+
+    def flag_all(reason: str) -> list[_Row]:
+        return [
+            _Row(i.path, i.size, i, Action.FLAG, (reason,), movie_hash=hashes.get(i.path))
+            for i in probed
+        ]
+
     if len(probed) < len(group.parts):
-        reason = f"multi-part group {group.output_name} has unprobeable parts"
-        return [_Row(i.path, i.size, i, Action.FLAG, (reason,)) for i in probed]
+        return flag_all(f"multi-part group {group.output_name} has unprobeable parts")
     first, *others = probed
     if not all(parts_compatible(first, other) for other in others):
-        return [_Row(i.path, i.size, i, Action.FLAG, (INCOMPATIBLE_PARTS_REASON,)) for i in probed]
+        return flag_all(INCOMPATIBLE_PARTS_REASON)
     decision = decide(first, settings, multipart=True)
     group_size = sum(i.size for i in probed)
     rows = [
@@ -196,10 +227,14 @@ def _plan_group(group: PartGroup, infos: dict[Path, MediaInfo], settings: Settin
             decision.reasons,
             _encode_saving(decision.action, group_size),
             group.parts,
+            movie_hash=hashes.get(first.path),
         )
     ]
     member = (f"part of group {group.output_name}",)
-    rows.extend(_Row(i.path, i.size, i, Action.LEAVE_ALONE, member) for i in others)
+    rows.extend(
+        _Row(i.path, i.size, i, Action.LEAVE_ALONE, member, movie_hash=hashes.get(i.path))
+        for i in others
+    )
     return rows
 
 
@@ -214,10 +249,19 @@ def _record(row: _Row, state: State) -> _Row:
             reasons=row.reasons,
             est_saving_bytes=row.est_saving_bytes,
             parts=row.parts,
+            movie_hash=row.movie_hash,
         )
     except UnrepresentablePath as exc:
         _log.warning("%s", exc)
-        return _Row(row.path, row.size, row.info, Action.FLAG, (str(exc),), unrepresentable=True)
+        return _Row(
+            row.path,
+            row.size,
+            row.info,
+            Action.FLAG,
+            (str(exc),),
+            unrepresentable=True,
+            movie_hash=row.movie_hash,
+        )
     return row
 
 
@@ -248,6 +292,7 @@ def _csv_line(row: _Row) -> list[str]:
         LIST_SEPARATOR.join(row.reasons),
         str(row.est_saving_bytes),
         LIST_SEPARATOR.join(str(p) for p in row.parts),
+        _cell(row.movie_hash),
     ]
 
 
@@ -312,6 +357,7 @@ def run_survey(
     root: Path | None = None,
     workers: int = 4,
     probe_fn: ProbeFn = probe,
+    hash_fn: HashFn = movie_hash,
 ) -> SurveyResult:
     """Probe every video file under *root* (default ``settings.library_root``), read-only.
 
@@ -320,7 +366,9 @@ def run_survey(
     `SurveyError` (before probing) if an output would lie under the library or the CSV
     folder is not writable, and if the CSV cannot be written at all. `ToolNotFound` from the
     probe and `KeyboardInterrupt` abort the survey; queued probes are cancelled and records
-    already upserted stay.
+    already upserted stay. Every probed file also gets its OpenSubtitles movie hash
+    (`moviehash`, read-only, 128 KiB per file), stored on its record; a file whose hash cannot
+    be computed is surveyed without one.
     """
     if workers < 1:
         raise ValueError(f"workers must be at least 1, got {workers}")
@@ -331,14 +379,14 @@ def run_survey(
     reporter.stage("survey")
     paths = discover_files(root)
     _log.info("survey of %s: %d video files", root, len(paths))
-    infos, failures = _probe_all(paths, tools, reporter, workers, probe_fn)
+    infos, failures, hashes = _probe_all(paths, tools, reporter, workers, probe_fn, hash_fn)
 
     groups = tuple(find_part_groups(paths))
     rows: list[_Row] = []
     grouped: set[Path] = set()
     for group in groups:
         grouped.update(group.parts)
-        rows.extend(_record(r, state) for r in _plan_group(group, infos, settings))
+        rows.extend(_record(r, state) for r in _plan_group(group, infos, hashes, settings))
     for path in paths:
         if path in failures:
             reason = f"unprobeable: {failures[path]}"
@@ -347,7 +395,8 @@ def run_survey(
             info = infos[path]
             d = decide(info, settings)
             saving = _encode_saving(d.action, info.size)
-            rows.append(_record(_Row(path, info.size, info, d.action, d.reasons, saving), state))
+            row = _Row(path, info.size, info, d.action, d.reasons, saving, movie_hash=hashes[path])
+            rows.append(_record(row, state))
     rows.sort(key=lambda r: r.path)
 
     csv_path = _write_csv(csv_path, rows)

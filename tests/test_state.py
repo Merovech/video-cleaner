@@ -332,9 +332,74 @@ def test_wal_mode_and_schema_version(tmp_path: Path) -> None:
     raw = sqlite3.connect(db)
     try:
         assert raw.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(1,)]
+        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
     finally:
         raw.close()
+
+
+_V1_FILES = """
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version (version) VALUES (1);
+CREATE TABLE files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL, size INTEGER NOT NULL, mtime REAL NOT NULL, status TEXT NOT NULL,
+    decision TEXT NOT NULL, reasons TEXT NOT NULL, est_saving_bytes INTEGER NOT NULL,
+    parts TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+    UNIQUE (path, size, mtime)
+);
+INSERT INTO files (path, size, mtime, status, decision, reasons, est_saving_bytes, parts,
+    note, updated_at)
+VALUES ('/media/movies/a.mkv', 8000000000, 1700000000.5, 'completed', 'encode', '[]', 5, '[]',
+    'done', '2026-11-01T00:00:00+00:00');
+"""
+
+
+def test_version_1_database_is_migrated(tmp_path: Path) -> None:
+    db = tmp_path / "v1.db"
+    raw = sqlite3.connect(db)
+    raw.executescript(_V1_FILES)
+    raw.close()
+    with State.open(db) as s:
+        rec = s.get(make_info().path)
+        assert rec is not None
+        assert (rec.status, rec.movie_hash) == (Status.COMPLETED, None)
+        upsert_hash(s, make_info(), "8e245d9679d31e12")
+        rec = s.get(make_info().path)
+        assert rec is not None and rec.movie_hash == "8e245d9679d31e12"
+    raw = sqlite3.connect(db)
+    try:
+        assert raw.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 2
+    finally:
+        raw.close()
+    with State.open(db) as s:  # reopening a migrated database is a no-op
+        assert s.get(make_info().path) is not None
+
+
+def upsert_hash(s: State, info: MediaInfo, movie_hash: str | None) -> None:
+    s.upsert_file(info, decision="encode", reasons=(), est_saving_bytes=1, movie_hash=movie_hash)
+
+
+def test_movie_hash_is_stored_and_returned(state: State) -> None:
+    upsert_hash(state, make_info(), "00000000000abcde")
+    rec = state.get(make_info().path)
+    assert rec is not None and rec.movie_hash == "00000000000abcde"
+
+
+def test_movie_hash_defaults_to_none(state: State) -> None:
+    upsert(state, make_info())
+    rec = state.get(make_info().path)
+    assert rec is not None and rec.movie_hash is None
+
+
+def test_movie_hash_filled_in_on_advanced_record_but_never_cleared(state: State) -> None:
+    info = make_info()
+    upsert(state, info)
+    state.set_status(info.path, Status.COMPLETED, "done")
+    upsert_hash(state, info, "1111111111111111")
+    upsert_hash(state, info, None)
+    rec = state.get(info.path)
+    assert rec is not None
+    assert (rec.status, rec.movie_hash) == (Status.COMPLETED, "1111111111111111")
 
 
 def test_newer_schema_version_refused(tmp_path: Path) -> None:
