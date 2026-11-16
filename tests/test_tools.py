@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -16,6 +19,7 @@ from video_cleaner.progress import Progress, parse_ffmpeg_progress
 from video_cleaner.tools import (
     ToolFailed,
     ToolNotFound,
+    ToolOutputError,
     ToolResult,
     Tools,
     locate_tools,
@@ -168,16 +172,109 @@ def test_run_tool_with_mkvmerge_parser() -> None:
     assert [p.percent for p in reporter.updates] == [10.0, 90.0]
 
 
-def test_run_tool_parser_error_does_not_deadlock_or_fail_run() -> None:
-    def bad_parser(lines: Iterable[str]) -> Iterator[Progress]:
-        for _ in lines:
-            raise ValueError("parser bug")
-        yield from ()  # pragma: no cover
+_BIG_STDOUT = "for _ in range(20000): print('y' * 100)\n"  # far more than a pipe buffer
 
-    code = "print('x' * 100, flush=True)\n" * 1
-    big = "import sys\nfor _ in range(20000): print('y' * 100)\n"
-    result = run_tool(_py(big or code), label="p", reporter=FakeReporter(), parser=bad_parser)
-    assert result.returncode == 0
+
+def _bad_parser(lines: Iterable[str]) -> Iterator[Progress]:
+    for _ in lines:
+        raise ValueError("parser bug")
+    yield from ()  # pragma: no cover
+
+
+def test_run_tool_parser_error_is_surfaced_after_child_finishes() -> None:
+    # The child writes far more than a pipe buffer: if the reader stopped draining after the
+    # parser failed, the child would block forever and this test would hang.
+    with pytest.raises(ToolOutputError) as excinfo:
+        run_tool(_py(_BIG_STDOUT), label="p", reporter=FakeReporter(), parser=_bad_parser)
+    assert excinfo.value.label == "p"
+    assert excinfo.value.stream == "stdout"
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    assert "parser bug" in str(excinfo.value.__cause__)
+
+
+def test_run_tool_reporter_update_error_is_surfaced() -> None:
+    class BrokenReporter(FakeReporter):
+        def update(self, p: Progress) -> None:
+            raise RuntimeError("reporter bug")
+
+    code = "print('#GUI#progress 10%'); print('#GUI#progress 20%')\n" + _BIG_STDOUT
+    with pytest.raises(ToolOutputError) as excinfo:
+        run_tool(_py(code), label="mux", reporter=BrokenReporter(), parser=mkvmerge_parser)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_run_tool_parser_error_is_chained_onto_tool_failed() -> None:
+    code = _BIG_STDOUT + "import sys; sys.exit(4)\n"
+    with pytest.raises(ToolOutputError) as excinfo:
+        run_tool(_py(code), label="p", reporter=FakeReporter(), parser=_bad_parser)
+    failed = excinfo.value.__cause__
+    assert isinstance(failed, ToolFailed)
+    assert failed.returncode == 4
+    assert isinstance(failed.__cause__, ValueError)
+
+
+def test_run_tool_parser_error_surfaces_even_with_check_false() -> None:
+    with pytest.raises(ToolOutputError):
+        run_tool(
+            _py("print('x')"),
+            label="p",
+            reporter=FakeReporter(),
+            parser=_bad_parser,
+            check=False,
+        )
+
+
+def test_run_tool_reader_thread_crash_is_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_read(self: object) -> None:
+        raise RuntimeError("reader bug")
+
+    monkeypatch.setattr(tools._StderrCapture, "_read", broken_read)
+    code = "import sys\nfor _ in range(20000): sys.stderr.write('e' * 99 + '\\n')\n"
+    with pytest.raises(ToolOutputError) as excinfo:
+        run_tool(_py(code), label="enc", reporter=FakeReporter())
+    assert excinfo.value.stream == "stderr"
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_run_tool_reader_that_outlives_the_process_is_an_error(tmp_path: Path) -> None:
+    # The child exits at once but leaves a long-lived grandchild that inherits its stdout and
+    # stderr, so the pipes never reach EOF and the reader threads cannot finish.
+    pid_file = tmp_path / "grandchild.pid"
+    code = (
+        "import subprocess, sys\n"
+        "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(g.pid))\n"
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(ToolOutputError) as excinfo:
+            run_tool(
+                _py(code),
+                label="leaky",
+                reporter=FakeReporter(),
+                heartbeat_s=0.2,
+                join_timeout_s=1.0,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        pid = int(pid_file.read_text()) if pid_file.exists() else None
+        if pid is not None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+        _wait_for_reader_threads()
+    assert elapsed < 4.0  # one shared deadline, not one timeout per thread
+    assert excinfo.value.label == "leaky"
+    assert excinfo.value.stream in {"stdout", "stderr"}
+    assert "still open" in str(excinfo.value)
+
+
+def _wait_for_reader_threads(timeout_s: float = 10.0) -> None:
+    """Let reader threads and the pipe-closing reaper finish once the grandchild is gone."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not [t for t in threading.enumerate() if t.name.startswith("vc-")]:
+            return
+        time.sleep(0.05)
 
 
 def test_run_tool_drains_large_stdout_and_stderr_without_deadlock(tmp_path: Path) -> None:

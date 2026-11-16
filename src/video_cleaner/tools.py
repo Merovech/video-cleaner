@@ -27,7 +27,7 @@ _log = logging.getLogger("video_cleaner.tools")
 STDOUT_CAP_CHARS = 1_000_000
 STDERR_TAIL_CHARS = 4_096
 _TERMINATE_GRACE_S = 5.0
-_THREAD_JOIN_S = 5.0
+_DEFAULT_JOIN_TIMEOUT_S = 5.0
 _EXECUTABLE_SUFFIXES = ("", ".exe")
 
 _ENV_VARS = {"ffmpeg": "VC_FFMPEG", "ffprobe": "VC_FFPROBE", "mkvmerge": "VC_MKVMERGE"}
@@ -52,6 +52,22 @@ class ToolFailed(Exception):
         self.log_path = log_path
         where = f"; stderr in {log_path}" if log_path is not None else ""
         super().__init__(f"command exited with code {returncode}: {cmd_text}{where}")
+
+
+class ToolOutputError(Exception):
+    """Output handling for a tool run broke.
+
+    Raised when the progress parser or reporter raised, a reader thread crashed, or a pipe
+    stayed open after the process exited (a grandchild holding it). `__cause__` is the
+    underlying exception; if the tool also exited non-zero it is the `ToolFailed`, whose own
+    `__cause__` is the underlying exception.
+    """
+
+    def __init__(self, label: str, stream: str, detail: str) -> None:
+        self.label = label
+        self.stream = stream
+        self.detail = detail
+        super().__init__(f"{label}: {stream}: {detail}")
 
 
 @dataclass(frozen=True)
@@ -134,8 +150,47 @@ def mkvmerge_parser(lines: Iterable[str]) -> Iterator[Progress]:
             yield Progress(percent=percent, fps=None, speed=None, eta_s=None)
 
 
-class _StdoutCapture:
+class _Capture:
+    """Base for a thread that drains one pipe to EOF no matter what goes wrong.
+
+    The child must never block on a full pipe, so after any failure the stream is still
+    drained. The first failure is recorded in `error` / `error_what` for `run_tool` to raise
+    once the process has exited and the thread has finished. Buffer access is lock-protected,
+    so a snapshot taken while the thread is still running is consistent.
+    """
+
+    stream_name = ""
+
+    def __init__(self, stream: IO[str]) -> None:
+        self._stream = stream
+        self._lock = threading.Lock()
+        self.error: Exception | None = None
+        self.error_what = ""
+
+    def _fail(self, what: str, exc: Exception) -> None:
+        if self.error is None:
+            self.error, self.error_what = exc, what
+        _log.error("%s: %s", self.stream_name, what, exc_info=exc)
+
+    def _read(self) -> None:
+        raise NotImplementedError
+
+    def run(self) -> None:
+        try:
+            self._read()
+        except Exception as exc:  # a reader thread must never die silently
+            self._fail("reader thread crashed", exc)
+            try:
+                for _ in self._stream:
+                    pass
+            except Exception:  # pragma: no cover - the stream itself is broken
+                _log.exception("%s: draining after a crash failed", self.stream_name)
+
+
+class _StdoutCapture(_Capture):
     """Reads stdout line by line, keeps the last ~1 MB, optionally feeds a progress parser."""
+
+    stream_name = "stdout"
 
     def __init__(
         self,
@@ -143,7 +198,7 @@ class _StdoutCapture:
         parser: Callable[[Iterable[str]], Iterator[Progress]] | None,
         reporter: Reporter,
     ) -> None:
-        self._stream = stream
+        super().__init__(stream)
         self._parser = parser
         self._reporter = reporter
         self._lines: deque[str] = deque()
@@ -151,35 +206,37 @@ class _StdoutCapture:
 
     def _tee(self) -> Iterator[str]:
         for line in self._stream:
-            self._lines.append(line)
-            self._size += len(line)
-            while self._size > STDOUT_CAP_CHARS and len(self._lines) > 1:
-                self._size -= len(self._lines.popleft())
+            with self._lock:
+                self._lines.append(line)
+                self._size += len(line)
+                while self._size > STDOUT_CAP_CHARS and len(self._lines) > 1:
+                    self._size -= len(self._lines.popleft())
             yield line
 
-    def run(self) -> None:
+    def _read(self) -> None:
         lines = self._tee()
         if self._parser is not None:
             try:
                 for progress in self._parser(lines):
                     self._reporter.update(progress)
-            except Exception:
-                # A parser or reporter bug must not stop the pipe being drained (the child
-                # would block on a full pipe); the run itself is judged by the exit code.
-                _log.exception("progress handling failed; continuing to drain output")
+            except Exception as exc:
+                self._fail("progress parser or reporter failed", exc)
         for _ in lines:  # drain whatever the parser did not consume
             pass
 
     @property
     def text(self) -> str:
-        return "".join(self._lines)
+        with self._lock:
+            return "".join(self._lines)
 
 
-class _StderrCapture:
+class _StderrCapture(_Capture):
     """Drains stderr: keeps the last ~4 KB and streams every line to *log_path* if given."""
 
+    stream_name = "stderr"
+
     def __init__(self, stream: IO[str], log_path: Path | None) -> None:
-        self._stream = stream
+        super().__init__(stream)
         self._log_path = log_path
         self._tail: deque[str] = deque()
         self._size = 0
@@ -194,14 +251,15 @@ class _StderrCapture:
             _log.exception("cannot write stderr log %s", self._log_path)
             return None
 
-    def run(self) -> None:
+    def _read(self) -> None:
         sink = self._open_log()
         try:
             for line in self._stream:
-                self._tail.append(line)
-                self._size += len(line)
-                while self._size > STDERR_TAIL_CHARS and len(self._tail) > 1:
-                    self._size -= len(self._tail.popleft())
+                with self._lock:
+                    self._tail.append(line)
+                    self._size += len(line)
+                    while self._size > STDERR_TAIL_CHARS and len(self._tail) > 1:
+                        self._size -= len(self._tail.popleft())
                 if sink is not None:
                     try:
                         sink.write(line)
@@ -214,7 +272,8 @@ class _StderrCapture:
 
     @property
     def text(self) -> str:
-        return "".join(self._tail)[-STDERR_TAIL_CHARS:]
+        with self._lock:
+            return "".join(self._tail)[-STDERR_TAIL_CHARS:]
 
 
 def _heartbeat_loop(
@@ -240,6 +299,52 @@ def _stop_process(proc: subprocess.Popen[str]) -> None:
         proc.wait()
 
 
+def _close_pipes_when_readers_finish(
+    proc: subprocess.Popen[str], readers: Sequence[threading.Thread]
+) -> None:
+    """Close the pipes once the stuck readers see EOF.
+
+    Closing a pipe another thread is blocked reading can itself block, so it is deferred to
+    a daemon thread that waits for the readers; nothing leaks once the holder of the pipe exits.
+    """
+
+    def reap() -> None:
+        for thread in readers:
+            thread.join()
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+
+    threading.Thread(target=reap, name="vc-reaper", daemon=True).start()
+
+
+def _surface_output_errors(
+    label: str,
+    captures: Sequence[_Capture],
+    stuck: Sequence[str],
+    join_timeout_s: float,
+    failed: ToolFailed | None,
+) -> None:
+    """Raise `ToolOutputError` for the first reader problem, chained as documented there."""
+    problem: tuple[str, str, Exception | None] | None = None
+    for capture in captures:
+        if capture.error is not None:
+            problem = (capture.stream_name, capture.error_what, capture.error)
+            break
+    if problem is None and stuck:
+        detail = (
+            f"pipe still open {join_timeout_s:g}s after the process exited "
+            "(a child process may still hold it)"
+        )
+        problem = (stuck[0], detail, None)
+    if problem is None:
+        return
+    stream, detail, cause = problem
+    if cause is not None and failed is not None:
+        failed.__cause__ = cause
+    raise ToolOutputError(label, stream, detail) from (failed or cause)
+
+
 def run_tool(
     cmd: Sequence[str],
     *,
@@ -250,6 +355,7 @@ def run_tool(
     stderr_log: Path | None = None,
     cwd: Path | None = None,
     check: bool = True,
+    join_timeout_s: float = _DEFAULT_JOIN_TIMEOUT_S,
 ) -> ToolResult:
     """Run *cmd* (an argument list, never a shell) and return its result.
 
@@ -257,8 +363,13 @@ def run_tool(
     ``reporter.update``; the last ~1 MB is returned), stderr by another (last ~4 KB returned,
     everything written to *stderr_log*), and a third calls ``reporter.heartbeat(label, elapsed)``
     every *heartbeat_s* seconds. The child is terminated, then killed, if this call is
-    interrupted or fails. Raises `ToolFailed` on a non-zero exit when *check* is true and
-    `ToolNotFound` if the executable does not exist.
+    interrupted or fails.
+
+    Raises `ToolFailed` on a non-zero exit when *check* is true, `ToolNotFound` if the
+    executable does not exist, and `ToolOutputError` if the parser, the reporter or a reader
+    thread failed, or a reader had not finished *join_timeout_s* after the process exited
+    (typically a grandchild holding the pipe). Output errors are raised after the process has
+    exited and the readers are done; the pipes are always drained meanwhile.
     """
     cmd_text = redact(subprocess.list2cmdline([str(part) for part in cmd]))
     _log.debug("run [%s]: %s", label, cmd_text)
@@ -282,18 +393,19 @@ def run_tool(
     out = _StdoutCapture(proc.stdout, parser, reporter)
     err = _StderrCapture(proc.stderr, stderr_log)
     stop = threading.Event()
-    threads = [
+    readers = [
         threading.Thread(target=out.run, name="vc-stdout", daemon=True),
         threading.Thread(target=err.run, name="vc-stderr", daemon=True),
-        threading.Thread(
-            target=_heartbeat_loop,
-            args=(stop, reporter, label, heartbeat_s, started),
-            name="vc-heartbeat",
-            daemon=True,
-        ),
     ]
+    beat = threading.Thread(
+        target=_heartbeat_loop,
+        args=(stop, reporter, label, heartbeat_s, started),
+        name="vc-heartbeat",
+        daemon=True,
+    )
+    stuck: list[str] = []
     try:
-        for thread in threads:
+        for thread in (*readers, beat):
             thread.start()
         returncode = proc.wait()
     except BaseException:
@@ -301,13 +413,23 @@ def run_tool(
         raise
     finally:
         stop.set()
-        for thread in threads:
-            thread.join(timeout=_THREAD_JOIN_S)
-        proc.stdout.close()
-        proc.stderr.close()
+        # One shared deadline, so two stuck readers cost one timeout, not two.
+        deadline = time.monotonic() + join_timeout_s
+        beat.join(timeout=max(0.0, deadline - time.monotonic()))
+        for thread, capture in zip(readers, (out, err), strict=True):
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                stuck.append(capture.stream_name)
+        if stuck:
+            _close_pipes_when_readers_finish(proc, readers)
+        else:
+            proc.stdout.close()
+            proc.stderr.close()
 
     duration = time.monotonic() - started
     _log.debug("exit [%s]: code %d after %.1fs", label, returncode, duration)
-    if check and returncode != 0:
-        raise ToolFailed(returncode, cmd_text, stderr_log)
+    failed = ToolFailed(returncode, cmd_text, stderr_log) if check and returncode != 0 else None
+    _surface_output_errors(label, (out, err), stuck, join_timeout_s, failed)
+    if failed is not None:
+        raise failed
     return ToolResult(returncode=returncode, stdout=out.text, stderr_tail=err.text)
