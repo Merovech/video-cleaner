@@ -34,7 +34,12 @@ class VerifyResult:
 
 
 def decode_errors(tools: Tools, output: Path, reporter: Reporter) -> str:
-    """Decode every stream of *output* to nowhere (``-f null``); return the errors, "" if none."""
+    """Decode the video and audio of *output* to nowhere (``-f null``); "" if clean.
+
+    Only what has to play to the end is decoded: real video streams (``0:V``, not cover art)
+    and any audio. Subtitles, data and attachments are left out (``-sn -dn``): the null muxer
+    has no subtitle codec, so mapping them would fail every file that has subtitles or fonts.
+    """
     cmd = [
         str(tools.ffmpeg),
         "-nostdin",
@@ -43,7 +48,11 @@ def decode_errors(tools: Tools, output: Path, reporter: Reporter) -> str:
         "-i",
         str(output),
         "-map",
-        "0",
+        "0:V",
+        "-map",
+        "0:a?",
+        "-sn",
+        "-dn",
         "-f",
         "null",
         "-",
