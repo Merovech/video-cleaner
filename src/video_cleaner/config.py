@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any
 
 ENV_PREFIX = "VC_"
+
+
+def env_var(setting: str) -> str:
+    """The environment variable that overrides *setting* (``vmaf_target`` -> ``VC_VMAF_TARGET``)."""
+    return ENV_PREFIX + setting.upper()
+
+
 APP_DIR_NAME = "video-cleaner"
 X265_PRESETS = frozenset(
     {
@@ -206,7 +213,7 @@ def load_settings(
             raw[key] = (f"{file_path}", value)
 
     for name in converters:
-        env_name = ENV_PREFIX + name.upper()
+        env_name = env_var(name)
         if env_name in environ:
             raw[name] = (f"environment variable {env_name}", environ[env_name])
 
@@ -226,15 +233,14 @@ def load_settings(
             if base is None:
                 raise ConfigError(
                     f"{name} is not set and LOCALAPPDATA is unavailable to derive a default; "
-                    f"set it in the config file or as {ENV_PREFIX}{name.upper()}"
+                    f"set it in the config file or as {env_var(name)}"
                 )
             values[name] = base / leaf
 
     for f in fields(Settings):
         if f.name not in values:
             raise ConfigError(
-                f"{f.name} is required: set it in the config file or as "
-                f"{ENV_PREFIX}{f.name.upper()}"
+                f"{f.name} is required: set it in the config file or as {env_var(f.name)}"
             )
 
     _validate(values)

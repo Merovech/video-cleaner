@@ -2,6 +2,8 @@
 
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -22,9 +24,9 @@ from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
-from video_cleaner.progress import RichReporter, _encodable, make_reporter
+from video_cleaner.progress import Reporter, RichReporter, _encodable, make_reporter
 from video_cleaner.state import State, StateError
-from video_cleaner.tools import ToolNotFound, locate_tools
+from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
 app = typer.Typer(
     name="video-cleaner",
@@ -71,11 +73,7 @@ def doctor(
     # Resolve once with config's own rule, so the permission check covers the loaded file.
     # The explicit/default distinction is kept: a missing default file is not an error.
     config_path = config if config is not None else default_config_path(os.environ)
-    try:
-        settings = load_settings(config, os.environ)
-    except ConfigError as exc:
-        _err.print(f"config error: {exc}", markup=False, highlight=False)
-        raise typer.Exit(code=2) from None
+    settings = _load(config)
     checks = doctor_mod.run_doctor(settings, config_path=config_path)
     for check in checks:
         typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")
@@ -88,6 +86,38 @@ def doctor(
 def _fail(message: str) -> NoReturn:
     _err.print(message, markup=False, highlight=False)
     raise typer.Exit(code=2)
+
+
+def _load(config: Path | None) -> Settings:
+    """Settings from *config*, or exit 2 with the configuration error."""
+    try:
+        return load_settings(config)
+    except ConfigError as exc:
+        _fail(f"config error: {exc}")
+
+
+def _logging(settings: Settings, verbose: int, quiet: bool) -> Path:
+    """Start the run log; ``--quiet`` wins over ``-v``. Returns the log file."""
+    return setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
+
+
+def _tools() -> Tools:
+    """The located ffmpeg, ffprobe and mkvmerge, or exit 2 naming the missing one."""
+    try:
+        return locate_tools()
+    except ToolNotFound as exc:
+        _fail(str(exc))
+
+
+@contextmanager
+def _open_reporter(settings: Settings) -> Iterator[Reporter]:
+    """The console reporter for a long command, closed (live display stopped) on the way out."""
+    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
+    try:
+        yield reporter
+    finally:
+        if isinstance(reporter, RichReporter):
+            reporter.close()
 
 
 def _say(text: str = "") -> None:
@@ -130,34 +160,23 @@ def survey(
     quiet: QuietOption = False,
 ) -> None:
     """Scan the library and probe every file (read-only)."""
-    try:
-        settings = load_settings(config)
-    except ConfigError as exc:
-        _fail(f"config error: {exc}")
+    settings = _load(config)
     surveyed = settings.library_root if root is None else root
     try:
         _survey.check_outputs_outside(settings, surveyed)
     except _survey.SurveyError as exc:
         _fail(str(exc))
-    setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
-    try:
-        tools = locate_tools()
-    except ToolNotFound as exc:
-        _fail(str(exc))
-    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
-    try:
-        with State.open(settings.state_db) as state:
-            result = _survey.run_survey(settings, tools, state, reporter, root=root)
-    except _survey.SurveyError as exc:
-        _fail(str(exc))
-    except ToolNotFound as exc:
-        _fail(str(exc))
-    except KeyboardInterrupt:
-        _err.print("survey interrupted; files already surveyed stay recorded", highlight=False)
-        raise typer.Exit(code=EXIT_INTERRUPTED) from None
-    finally:
-        if isinstance(reporter, RichReporter):
-            reporter.close()
+    _logging(settings, verbose, quiet)
+    tools = _tools()
+    with _open_reporter(settings) as reporter:
+        try:
+            with State.open(settings.state_db) as state:
+                result = _survey.run_survey(settings, tools, state, reporter, root=root)
+        except (_survey.SurveyError, ToolNotFound) as exc:
+            _fail(str(exc))
+        except KeyboardInterrupt:
+            _err.print("survey interrupted; files already surveyed stay recorded", highlight=False)
+            raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_survey_summary(surveyed, result)
 
 
@@ -166,10 +185,7 @@ def _load_outside_library(config: Path | None) -> Settings:
 
     Called by every command before it creates a log file, the state database or any output.
     """
-    try:
-        settings = load_settings(config)
-    except ConfigError as exc:
-        _fail(f"config error: {exc}")
+    settings = _load(config)
     try:
         _runner.refuse_outputs_in_library(settings)
     except _runner.RunRefused as exc:
@@ -226,7 +242,7 @@ def plan(
     """Write the plan (what happens to each file, and why) or acknowledge it."""
     settings = _load_outside_library(config)
     _require_state(settings)
-    setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
+    _logging(settings, verbose, quiet)
     if retry is not None:
         if ack:
             _fail("give either --ack or --retry, not both")
@@ -331,25 +347,24 @@ def calibrate(
         typer.echo(CALIBRATION_HELD_MESSAGE, err=True)
         raise typer.Exit(code=1)
     _require_state(settings)
-    setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
-    try:
-        tools = locate_tools()
-    except ToolNotFound as exc:
-        _fail(str(exc))
-    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
-    try:
-        with State.open(settings.state_db) as state:
-            rows = _calibrate.run_calibration(
-                settings, tools, state, reporter, samples=samples, engine=engine
-            )
-    except (_calibrate.CalibrationError, _runner.RunRefused, AlreadyRunning, StateError) as exc:
-        _fail(str(exc))
-    except KeyboardInterrupt:
-        _err.print("calibration interrupted; nothing was approved", highlight=False)
-        raise typer.Exit(code=EXIT_INTERRUPTED) from None
-    finally:
-        if isinstance(reporter, RichReporter):
-            reporter.close()
+    _logging(settings, verbose, quiet)
+    tools = _tools()
+    with _open_reporter(settings) as reporter:
+        try:
+            with State.open(settings.state_db) as state:
+                rows = _calibrate.run_calibration(
+                    settings, tools, state, reporter, samples=samples, engine=engine
+                )
+        except (
+            _calibrate.CalibrationError,
+            _runner.RunRefused,
+            AlreadyRunning,
+            StateError,
+        ) as exc:
+            _fail(str(exc))
+        except KeyboardInterrupt:
+            _err.print("calibration interrupted; nothing was approved", highlight=False)
+            raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _say(_calibrate.format_calibration_table(rows))
     _say(f"Table: {settings.state_db.parent / _calibrate.CALIBRATION_TXT}")
     _say(f"Side-by-side clips: {settings.completed_dir / _calibrate.CLIPS_FOLDER}")
@@ -386,52 +401,39 @@ def run(
     quiet: QuietOption = False,
 ) -> None:
     """Execute the acknowledged plan."""
-    try:
-        settings = load_settings(config)
-    except ConfigError as exc:
-        _fail(f"config error: {exc}")
+    settings = _load_outside_library(config)
     try:
         deadline = _runner.deadline_from(until, max_hours, datetime.now())
     except ValueError as exc:
         _fail(str(exc))
-    try:
-        # Before the log file and the state database are created, exactly like survey.
-        _runner.refuse_outputs_in_library(settings)
-    except _runner.RunRefused as exc:
-        _fail(str(exc))
-    log_path = setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
-    try:
-        tools = locate_tools()
-    except ToolNotFound as exc:
-        _fail(str(exc))
-    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
-    try:
-        with State.open(settings.state_db) as state:
-            summary = _runner.run_queue(
-                settings,
-                tools,
-                state,
-                reporter,
-                deadline=deadline,
-                only=path,
-                current_log=log_path,
+    log_path = _logging(settings, verbose, quiet)
+    tools = _tools()
+    with _open_reporter(settings) as reporter:
+        try:
+            with State.open(settings.state_db) as state:
+                summary = _runner.run_queue(
+                    settings,
+                    tools,
+                    state,
+                    reporter,
+                    deadline=deadline,
+                    only=path,
+                    current_log=log_path,
+                )
+        except (
+            _runner.PlanNotAcknowledged,
+            _runner.CalibrationNotApproved,
+            _runner.RunRefused,
+            AlreadyRunning,
+            StateError,
+        ) as exc:
+            _fail(str(exc))
+        except KeyboardInterrupt:
+            _err.print(
+                "run interrupted; the file in progress is retried on the next run",
+                highlight=False,
             )
-    except (
-        _runner.PlanNotAcknowledged,
-        _runner.CalibrationNotApproved,
-        _runner.RunRefused,
-        AlreadyRunning,
-        StateError,
-    ) as exc:
-        _fail(str(exc))
-    except KeyboardInterrupt:
-        _err.print(
-            "run interrupted; the file in progress is retried on the next run", highlight=False
-        )
-        raise typer.Exit(code=EXIT_INTERRUPTED) from None
-    finally:
-        if isinstance(reporter, RichReporter):
-            reporter.close()
+            raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_run_summary(summary)
     _say(f"Log: {log_path}")
     if summary.stop_reason:

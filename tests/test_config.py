@@ -239,3 +239,9 @@ def test_example_config_loads(tmp_path: Path) -> None:
     assert s.crf_min == 16
     assert "nas" in str(s.library_root)
     assert "\\\\" not in str(s.library_root).lstrip("\\")  # no doubled separators from escaping
+
+
+def test_env_var_name_for_a_setting() -> None:
+    from video_cleaner.config import env_var
+
+    assert env_var("vmaf_target") == "VC_VMAF_TARGET"
