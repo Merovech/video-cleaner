@@ -25,6 +25,7 @@ PENDING.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import logging
 import math
@@ -97,6 +98,10 @@ _WORK_NAME = re.compile(r"work-[0-9a-f]{12}")
 
 class PlanNotAcknowledged(Exception):
     """`run` was asked for before the plan was acknowledged."""
+
+
+class CalibrationNotApproved(Exception):
+    """`run` was asked for before a calibration was approved (or the approval no longer fits)."""
 
 
 class RunRefused(Exception):
@@ -297,6 +302,27 @@ def refuse_outputs_in_library(settings: Settings) -> None:
                 f"{label} {path} is under the library root {settings.library_root}; "
                 "a run never writes to the library"
             )
+
+
+def apply_calibration(settings: Settings, state: State) -> Settings:
+    """*settings* with the approved ``vmaf_target`` and ``crf_max`` (ruling R3).
+
+    Raises `CalibrationNotApproved` when nothing was approved, or when the approved ceiling is
+    below the configured ``crf_min`` (the config changed after the approval).
+    """
+    approved = state.calibration()
+    if approved is None:
+        raise CalibrationNotApproved(
+            "no calibration has been approved: run `calibrate --samples N`, review the table "
+            "and approve it with `calibrate --approve --vmaf-target X --crf-max Y`"
+        )
+    vmaf_target, crf_max = approved
+    if crf_max < settings.crf_min:
+        raise CalibrationNotApproved(
+            f"the approved crf_max {crf_max} is below the configured crf_min "
+            f"{settings.crf_min}: approve the calibration again with `calibrate --approve`"
+        )
+    return dataclasses.replace(settings, vmaf_target=vmaf_target, crf_max=crf_max)
 
 
 # --- the run -------------------------------------------------------------------------------
@@ -849,8 +875,11 @@ def run_queue(
 ) -> RunSummary:
     """Work through the queue until it is empty, the deadline passes or a stop condition hits.
 
-    Raises `PlanNotAcknowledged` before touching anything if the plan was not acknowledged and
-    `RunRefused` if an output location is under the library root. The deadline is checked
+    Raises `PlanNotAcknowledged` before touching anything if the plan was not acknowledged,
+    `CalibrationNotApproved` if no calibration was approved (or the approved CRF ceiling is now
+    below the configured ``crf_min``) and `RunRefused` if an output location is under the
+    library root. The approved VMAF target and CRF ceiling replace the configured ones for the
+    whole run. The deadline is checked
     before each file; the file in progress always finishes. KeyboardInterrupt leaves the
     current record in its in-progress status (the next run retries it), cleans its scratch and
     propagates.
@@ -859,6 +888,7 @@ def run_queue(
         raise PlanNotAcknowledged(
             "the plan has not been acknowledged: review and acknowledge it with `plan` first"
         )
+    settings = apply_calibration(settings, state)
     refuse_outputs_in_library(settings)
     pipeline = pipeline or Pipeline()
     held = pipeline.held_stages()

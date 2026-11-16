@@ -32,6 +32,7 @@ from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.runner import (
     HELD_REASON,
+    CalibrationNotApproved,
     Pipeline,
     PlanNotAcknowledged,
     RunRefused,
@@ -46,6 +47,9 @@ from video_cleaner.verify import VerifyResult, verify_output
 
 TOOLS = Tools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"), mkvmerge=Path("mkvmerge"))
 START = datetime(2026, 11, 15, 22, 0, 0)
+# Calibration every run fixture approves; distinct from the Settings defaults (95.0, 24).
+APPROVED_VMAF = 94.5
+APPROVED_CRF_MAX = 23
 
 
 # --- helpers -------------------------------------------------------------------------------
@@ -151,6 +155,7 @@ def _plan(
 def _open_state(settings: Settings) -> State:
     state = State.open(settings.state_db)
     state.acknowledge_plan("plan-hash")
+    state.approve_calibration(APPROVED_VMAF, APPROVED_CRF_MAX)
     return state
 
 
@@ -1322,7 +1327,11 @@ def test_cli_run_stop_reason_exits_1(
 
 @pytest.mark.parametrize(
     "error",
-    [PlanNotAcknowledged("the plan has not been acknowledged"), RunRefused("under the library")],
+    [
+        PlanNotAcknowledged("the plan has not been acknowledged"),
+        RunRefused("under the library"),
+        CalibrationNotApproved("calibration has not been approved: run `calibrate`"),
+    ],
 )
 def test_cli_run_refusals_exit_2(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
@@ -1552,3 +1561,81 @@ def test_delivering_beside_its_own_source_is_fine(settings: Settings, state: Sta
     _plan(state, mkv, decision="remux", est=0)  # Show.mkv -> completed Show.mkv: itself
     summary = _run(settings, state, Fakes())
     assert summary.completed == 2
+
+
+# --- calibration approval (Task 14, ruling R3) ---------------------------------------------
+
+
+def test_run_refused_without_calibration_approval(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_tools(monkeypatch)
+    with State.open(settings.state_db) as state:
+        src = _source(settings, "a.avi")
+        _plan(state, src)
+        state.acknowledge_plan("plan-hash")
+        events = len(state.events(10_000))
+        fakes = Fakes()
+        with pytest.raises(CalibrationNotApproved, match="calibrate"):
+            _run(settings, state, fakes)
+        # Raised before the held check too: the default (held) pipeline gets the same answer.
+        with pytest.raises(CalibrationNotApproved):
+            run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
+        assert fakes.calls == []
+        assert _status(state, src).status is Status.PENDING
+        assert len(state.events(10_000)) == events
+    assert not settings.scratch_dir.exists()
+    assert not settings.completed_dir.exists()
+
+
+def test_plan_ack_is_checked_before_calibration(settings: Settings) -> None:
+    with State.open(settings.state_db) as state:
+        state.approve_calibration(APPROVED_VMAF, APPROVED_CRF_MAX)
+        with pytest.raises(PlanNotAcknowledged):
+            _run(settings, state, Fakes())
+        state.acknowledge_plan("plan-hash")
+        summary = _run(settings, state, Fakes())  # both given: no refusal
+        assert summary.stop_reason == ""
+
+
+def test_run_uses_the_approved_calibration(settings: Settings, state: State) -> None:
+    assert (settings.vmaf_target, settings.crf_max) != (APPROVED_VMAF, APPROVED_CRF_MAX)
+    src = _source(settings, "a.avi", size=4000)
+    _plan(state, src)
+    seen: list[Settings] = []
+    fakes = Fakes()
+    original_search = fakes.search_crf
+
+    def search(
+        info: MediaInfo, tools: Tools, s: Settings, workdir: Path, rep: Reporter
+    ) -> CrfSearchResult:
+        seen.append(s)
+        return original_search(info, tools, s, workdir, rep)
+
+    pipeline = fakes.pipeline()
+    pipeline.search_crf = search
+    summary = run_queue(
+        settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
+    )
+    assert summary.completed == 1
+    (used,) = seen
+    assert (used.vmaf_target, used.crf_max) == (APPROVED_VMAF, APPROVED_CRF_MAX)
+    # everything else is the configuration as given
+    assert used.crf_min == settings.crf_min and used.completed_dir == settings.completed_dir
+    encode_calls = [c for c in fakes.calls if c[0] == "encode_full"]
+    assert len(encode_calls) == 1
+
+
+def test_approved_crf_max_below_configured_crf_min_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_tools(monkeypatch)
+    settings = _settings(tmp_path, crf_min=20)
+    with State.open(settings.state_db) as state:
+        state.acknowledge_plan("plan-hash")
+        state.approve_calibration(95.0, 18)  # approved before crf_min was raised in the config
+        _plan(state, _source(settings, "a.avi"))
+        fakes = Fakes()
+        with pytest.raises(CalibrationNotApproved, match="crf_min"):
+            _run(settings, state, fakes)
+        assert fakes.calls == []

@@ -499,3 +499,41 @@ def test_unrepresentable_path_raises_before_any_write(state: State) -> None:
     with pytest.raises(UnrepresentablePath):
         upsert(state, good, parts=(good.path, bad))
     assert sum(state.counts().values()) == 0
+
+
+# --- calibration approval (Task 14, ruling R3) ---------------------------------------------
+
+
+def test_calibration_is_none_until_approved(state: State) -> None:
+    assert state.calibration() is None
+
+
+def test_approve_calibration_stores_values_and_one_event(state: State) -> None:
+    state.approve_calibration(95.5, 23)
+    assert state.calibration() == (95.5, 23)
+    events = state.events()
+    assert len(events) == 1
+    assert "calibration approved" in events[0]
+    assert "95.5" in events[0] and "23" in events[0]
+    state.approve_calibration(94.0, 22)
+    assert state.calibration() == (94.0, 22)
+
+
+def test_calibration_survives_reopen(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with State.open(db) as s:
+        s.approve_calibration(96.0, 24)
+    with State.open(db) as s2:
+        assert s2.calibration() == (96.0, 24)
+        assert s2.plan_acknowledged() is None  # separate from the plan acknowledgement
+
+
+@pytest.mark.parametrize(
+    ("vmaf", "crf"),
+    [(float("nan"), 23), (float("inf"), 23), (95.0, 23.5), (95.0, True)],
+)
+def test_approve_calibration_rejects_non_values(state: State, vmaf: float, crf: int) -> None:
+    with pytest.raises(ValueError):
+        state.approve_calibration(vmaf, crf)
+    assert state.calibration() is None
+    assert state.events() == []

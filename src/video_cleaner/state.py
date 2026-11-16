@@ -10,6 +10,7 @@ as `Path`.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 _PLAN_HASH_KEY = "plan_ack_hash"
+_CALIBRATION_KEY = "calibration"
 _COLUMNS = "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note"
 
 
@@ -427,17 +429,51 @@ class State:
 
     def acknowledge_plan(self, plan_hash: str) -> None:
         with self._tx(write=True) as conn:
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (_PLAN_HASH_KEY, plan_hash),
-            )
+            self._set_meta(conn, _PLAN_HASH_KEY, plan_hash)
             self._event(conn, f"plan acknowledged: {plan_hash}")
 
     def plan_acknowledged(self) -> str | None:
+        return self._meta(_PLAN_HASH_KEY)
+
+    def _meta(self, key: str) -> str | None:
         with self._tx() as conn:
-            row = conn.execute("SELECT value FROM meta WHERE key = ?", (_PLAN_HASH_KEY,)).fetchone()
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else str(row[0])
+
+    def _set_meta(self, conn: sqlite3.Connection, key: str, value: str) -> None:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def approve_calibration(self, vmaf_target: float, crf_max: int) -> None:
+        """Record the calibration Ari approved: the VMAF target and CRF ceiling a run uses.
+
+        Stored like the plan acknowledgement (one meta value, one event line). Range checks
+        against the configuration are the caller's job; this only refuses values that are not
+        a finite number and an integer.
+        """
+        if isinstance(vmaf_target, bool) or not isinstance(vmaf_target, int | float):
+            raise ValueError(f"vmaf_target must be a number, got {vmaf_target!r}")
+        if not math.isfinite(vmaf_target):
+            raise ValueError(f"vmaf_target must be a finite number, got {vmaf_target!r}")
+        if type(crf_max) is not int:
+            raise ValueError(f"crf_max must be an int, got {crf_max!r}")
+        value = json.dumps({"vmaf_target": float(vmaf_target), "crf_max": crf_max})
+        with self._tx(write=True) as conn:
+            self._set_meta(conn, _CALIBRATION_KEY, value)
+            self._event(
+                conn, f"calibration approved: vmaf_target={float(vmaf_target)} crf_max={crf_max}"
+            )
+
+    def calibration(self) -> tuple[float, int] | None:
+        """The approved ``(vmaf_target, crf_max)``, or None before `approve_calibration`."""
+        raw = self._meta(_CALIBRATION_KEY)
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return float(data["vmaf_target"]), int(data["crf_max"])
 
     def events(self, limit: int = 100) -> list[str]:
         """The most recent event lines, newest first, each prefixed with an ISO timestamp."""
