@@ -398,7 +398,7 @@ class _Runner:
             return root if relative == os.curdir else root / relative
         return only
 
-    def _in_scope(self, rec: FileRecord) -> bool:
+    def in_scope(self, rec: FileRecord) -> bool:
         if self.scope is None:
             return True
         return any(name_under(p, self.scope) for p in (rec.path, *rec.parts))
@@ -407,7 +407,7 @@ class _Runner:
         return (
             rec.decision in _WORK_DECISIONS
             and (name_key(rec.path), rec.size, rec.mtime) not in self.attempted
-            and self._in_scope(rec)
+            and self.in_scope(rec)
         )
 
     def _next(self) -> FileRecord | None:
@@ -1055,6 +1055,10 @@ def _run_locked(
         _log.info("pruned %d old log file(s)", len(removed))
 
     runner = _Runner(settings, tools, state, reporter, pipeline, deadline, only, now)
+    if only is not None and not any(runner.in_scope(r) for r in state.records()):
+        reason = f"no surveyed files under {only}: run `survey --root {only}`, `plan`, `plan --ack`"
+        _log.error("run stopped before any file: %s", reason)
+        return runner.summary(False, reason)
     runner.sweep()
     if not os.path.isdir(settings.library_root):
         _log.error("library root %s is unreachable; nothing started", settings.library_root)

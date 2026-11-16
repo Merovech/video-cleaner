@@ -2059,3 +2059,26 @@ def test_scope_selection_does_no_path_resolution_per_record(
     summary = _run(settings, state, Fakes(), only=settings.library_root / "Films")
     assert summary.completed == 1
     assert not any("Other" in c for c in calls)
+
+
+def test_only_with_nothing_surveyed_in_scope_says_survey_first(
+    settings: Settings, state: State
+) -> None:
+    _plan(state, _source(settings, "Films/a.avi"))
+    unsurveyed = settings.library_root / "New"
+    unsurveyed.mkdir()
+    fakes = Fakes()
+    summary = _run(settings, state, fakes, only=unsurveyed)
+    assert summary.stop_reason.startswith(f"no surveyed files under {unsurveyed}")
+    assert "survey --root" in summary.stop_reason and "plan --ack" in summary.stop_reason
+    assert fakes.calls == []
+
+
+def test_only_with_finished_files_in_scope_is_not_an_error(
+    settings: Settings, state: State
+) -> None:
+    a = _source(settings, "Films/a.avi")
+    _plan(state, a)
+    state.set_status(a, Status.COMPLETED, "done")
+    summary = _run(settings, state, Fakes(), only=settings.library_root / "Films")
+    assert summary.stop_reason == ""
