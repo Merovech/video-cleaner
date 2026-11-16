@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-import subprocess
+import subprocess  # nosec B404
 import threading
 import time
 from collections import deque
@@ -375,7 +375,8 @@ def run_tool(
     _log.debug("run [%s]: %s", label, cmd_text)
     started = time.monotonic()
     try:
-        proc = subprocess.Popen(  # noqa: S603 - argument list, shell=False, by design
+        # Argument list, shell=False.
+        proc = subprocess.Popen(  # noqa: S603  # nosec B603
             [str(part) for part in cmd],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,

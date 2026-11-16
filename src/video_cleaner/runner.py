@@ -32,7 +32,7 @@ import math
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field

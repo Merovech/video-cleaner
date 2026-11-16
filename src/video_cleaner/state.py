@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 _PLAN_HASH_KEY = "plan_ack_hash"
 _CALIBRATION_KEY = "calibration"
+# The only text interpolated into SQL (the `nosec B608` lines) is this constant and runs of
+# "?" placeholders; every value is bound as a parameter.
 _COLUMNS = "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note"
 
 
@@ -357,13 +359,13 @@ class State:
             if statuses:
                 marks = ", ".join("?" for _ in statuses)
                 rows = conn.execute(
-                    f"SELECT {_COLUMNS} FROM files WHERE status IN ({marks}) "  # noqa: S608
+                    f"SELECT {_COLUMNS} FROM files WHERE status IN ({marks}) "  # noqa: S608  # nosec B608
                     "ORDER BY path, id",
                     tuple(s.value for s in statuses),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    f"SELECT {_COLUMNS} FROM files WHERE status != ? "  # noqa: S608
+                    f"SELECT {_COLUMNS} FROM files WHERE status != ? "  # noqa: S608  # nosec B608
                     "ORDER BY path, id",
                     (Status.STALE.value,),
                 ).fetchall()
@@ -377,7 +379,7 @@ class State:
         marks = ", ".join("?" for _ in IN_PROGRESS)
         with self._tx(write=True) as conn:
             rows = conn.execute(
-                f"SELECT id, path, status FROM files WHERE status IN ({marks}) "  # noqa: S608
+                f"SELECT id, path, status FROM files WHERE status IN ({marks}) "  # noqa: S608  # nosec B608
                 "ORDER BY path, id",
                 tuple(s.value for s in IN_PROGRESS),
             ).fetchall()
@@ -393,7 +395,7 @@ class State:
         """The live record for *path*, or the most recent stale one if none is live."""
         with self._tx() as conn:
             row = conn.execute(
-                f"SELECT {_COLUMNS} FROM files WHERE path = ? "  # noqa: S608 - constant columns
+                f"SELECT {_COLUMNS} FROM files WHERE path = ? "  # noqa: S608  # nosec B608
                 "ORDER BY (status = ?), id DESC LIMIT 1",
                 (_key(path), Status.STALE.value),
             ).fetchone()
@@ -402,7 +404,7 @@ class State:
     def _next_with_status(self, status: Status) -> FileRecord | None:
         with self._tx() as conn:
             row = conn.execute(
-                f"SELECT {_COLUMNS} FROM files WHERE status = ? "  # noqa: S608 - constant columns
+                f"SELECT {_COLUMNS} FROM files WHERE status = ? "  # noqa: S608  # nosec B608
                 "ORDER BY est_saving_bytes DESC, id ASC LIMIT 1",
                 (status.value,),
             ).fetchone()

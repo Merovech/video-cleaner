@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 import stat
-import subprocess
+import subprocess  # nosec B404
 import sys
 import tempfile
 import time
@@ -57,7 +57,8 @@ class Check:
 
 def default_runner(cmd: Sequence[str]) -> tuple[int, str]:
     """Run *cmd* (argument list, no shell) and return (exit code, stdout + stderr)."""
-    proc = subprocess.run(  # noqa: S603 - argument list, shell=False, by design
+    # Fixed argument list, shell=False.
+    proc = subprocess.run(  # noqa: S603  # nosec B603
         [str(part) for part in cmd],
         stdin=subprocess.DEVNULL,
         capture_output=True,
