@@ -1,0 +1,137 @@
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from video_cleaner.logging_setup import LOGGER_NAME, redact, setup_logging
+
+
+@pytest.fixture(autouse=True)
+def _reset_logging() -> Iterator[None]:
+    yield
+    pkg = logging.getLogger(LOGGER_NAME)
+    for handler in list(pkg.handlers):
+        if type(handler) in (logging.FileHandler, logging.StreamHandler):
+            pkg.removeHandler(handler)
+            handler.close()
+
+
+def test_redact_masks_explicit_secret_and_api_key_header() -> None:
+    text = "login with hunter2-secret; headers: Api-Key: abc123XYZ; done"
+    out = redact(text, secrets=["hunter2-secret"])
+    assert "hunter2-secret" not in out
+    assert "abc123XYZ" not in out
+    assert "***" in out
+    assert out.startswith("login with ")
+    assert out.endswith("; done")
+
+
+@pytest.mark.parametrize(
+    ("text", "leaked"),
+    [
+        ("curl -H 'api-key: s3cr3t'", "s3cr3t"),
+        ("API-KEY: s3cr3t", "s3cr3t"),
+        ("url?password=p4ss&x=1", "p4ss"),
+        ("PASSWORD=p4ss", "p4ss"),
+        ("token=tok_123 next", "tok_123"),
+        ("Authorization: Bearer eyJhbGciOi.payload.sig", "eyJhbGciOi"),
+        ("authorization: bearer lowercase-token", "lowercase-token"),
+    ],
+)
+def test_redact_generic_patterns_case_insensitive(text: str, leaked: str) -> None:
+    out = redact(text)
+    assert leaked not in out
+    assert "***" in out
+
+
+def test_redact_leaves_ordinary_text_alone() -> None:
+    text = "ffmpeg -i in.mkv -c:v libx265 out.mkv (token budget unaffected)"
+    assert redact(text) == text
+
+
+def test_redact_ignores_empty_secrets_and_masks_longest_first() -> None:
+    out = redact("a=abc abcdef", secrets=["", "abc", "abcdef"])
+    assert "abc" not in out
+    assert out == "a=*** ***"
+
+
+def test_log_file_is_debug_even_when_quiet(tmp_path: Path) -> None:
+    path = setup_logging(tmp_path / "logs", verbosity=-1)
+    log = logging.getLogger(f"{LOGGER_NAME}.test")
+    log.debug("debug-line-marker")
+    log.info("info-line-marker")
+    for handler in logging.getLogger(LOGGER_NAME).handlers:
+        handler.flush()
+    content = path.read_text(encoding="utf-8")
+    assert "debug-line-marker" in content
+    assert "info-line-marker" in content
+    assert path.parent == tmp_path / "logs"
+    assert re.fullmatch(r"run-\d{8}-\d{6}\.log", path.name)
+
+
+@pytest.mark.parametrize(
+    ("verbosity", "debug_shown", "info_shown", "warning_shown"),
+    [(-1, False, False, True), (0, False, True, True), (1, True, True, True)],
+)
+def test_console_level_follows_verbosity(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verbosity: int,
+    debug_shown: bool,
+    info_shown: bool,
+    warning_shown: bool,
+) -> None:
+    setup_logging(tmp_path, verbosity=verbosity)
+    log = logging.getLogger(f"{LOGGER_NAME}.console")
+    log.debug("dbg-marker")
+    log.info("inf-marker")
+    log.warning("wrn-marker")
+    err = capsys.readouterr().err
+    assert ("dbg-marker" in err) is debug_shown
+    assert ("inf-marker" in err) is info_shown
+    assert ("wrn-marker" in err) is warning_shown
+
+
+def test_secrets_never_reach_console_or_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = setup_logging(tmp_path, verbosity=1, secrets=["topsecretvalue"])
+    log = logging.getLogger(f"{LOGGER_NAME}.sec")
+    log.info("using %s and Api-Key: header-secret", "topsecretvalue")
+    try:
+        raise RuntimeError("failed with token=traceback-secret")
+    except RuntimeError:
+        log.exception("boom topsecretvalue")
+    err = capsys.readouterr().err
+    content = path.read_text(encoding="utf-8")
+    for blob in (err, content):
+        assert "topsecretvalue" not in blob
+        assert "header-secret" not in blob
+        assert "traceback-secret" not in blob
+        assert "RuntimeError" in blob  # traceback still present, just masked
+
+
+def test_setup_logging_twice_does_not_duplicate_handlers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup_logging(tmp_path, verbosity=0)
+    path = setup_logging(tmp_path, verbosity=0)
+    ours = [
+        h
+        for h in logging.getLogger(LOGGER_NAME).handlers
+        if type(h) in (logging.FileHandler, logging.StreamHandler)
+    ]
+    assert len(ours) == 2  # one file + one console, not four
+    logging.getLogger(f"{LOGGER_NAME}.twice").info("only-once-marker")
+    assert capsys.readouterr().err.count("only-once-marker") == 1
+    assert path.read_text(encoding="utf-8").count("only-once-marker") == 1
+
+
+def test_setup_logging_creates_missing_log_dir(tmp_path: Path) -> None:
+    target = tmp_path / "a" / "b"
+    path = setup_logging(target, verbosity=0)
+    assert path.exists()
