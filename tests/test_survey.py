@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import csv
+import os
+import re
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -27,7 +30,7 @@ from video_cleaner.survey import (
     discover_files,
     run_survey,
 )
-from video_cleaner.tools import Tools, locate_tools
+from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
 GIB = 1024**3
 MKV = "matroska,webm"
@@ -588,7 +591,188 @@ def test_survey_records_unrepresentable_path_and_continues(
     assert flagged[0]["est_saving_bytes"] == "0"
 
 
+# --- robustness: locked CSV, unwritable output, interrupts, missing tools --------------------
+
+
+def test_survey_falls_back_to_timestamped_csv_when_target_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    _touch(settings.library_root / "a.mkv")
+    canonical = settings.state_db.parent / "survey.csv"
+    real_replace = os.replace
+
+    def locked_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst) == canonical:
+            raise PermissionError(13, "The process cannot access the file", str(dst))
+        real_replace(src, dst)
+
+    monkeypatch.setattr("video_cleaner.survey.os.replace", locked_replace)
+
+    result, state = _run(settings, _fake_probe({}))
+    state.close()
+
+    assert result.csv_path != canonical
+    assert result.csv_path.parent == canonical.parent
+    assert re.fullmatch(r"survey-\d{8}-\d{6}\.csv", result.csv_path.name)
+    assert [Path(r["path"]).name for r in _csv_rows(result.csv_path)] == ["a.mkv"]
+    assert not canonical.exists()
+    assert [p.name for p in canonical.parent.iterdir() if p.suffix == ".tmp"] == []
+    assert result.counts[Action.ENCODE] == 1
+
+
+def test_survey_unwritable_output_directory_fails_before_probing(tmp_path: Path) -> None:
+    lib = tmp_path / "library"
+    _touch(lib / "a.mkv")
+    blocker = _touch(tmp_path / "not-a-dir")  # the CSV folder is a regular file
+    settings = Settings(
+        library_root=lib,
+        scratch_dir=tmp_path / "s",
+        completed_dir=tmp_path / "c",
+        state_db=blocker / "state.db",
+        log_dir=tmp_path / "logs",
+    )
+    calls: list[Path] = []
+
+    def probe_fn(path: Path, tools: Tools, reporter: object) -> MediaInfo:
+        calls.append(path)
+        return _info(path)
+
+    state = State.open(tmp_path / "elsewhere.db")
+    with pytest.raises(SurveyError, match="cannot write the survey CSV"):
+        run_survey(settings, FAKE_TOOLS, state, RecordingReporter(), probe_fn=probe_fn)
+    state.close()
+    assert calls == []
+
+
+def test_survey_csv_write_failure_is_a_survey_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    _touch(settings.library_root / "a.mkv")
+
+    def no_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("video_cleaner.survey.os.replace", no_replace)
+    state = State.open(settings.state_db)
+    with pytest.raises(SurveyError, match="cannot write the survey CSV"):
+        run_survey(settings, FAKE_TOOLS, state, RecordingReporter(), probe_fn=_fake_probe({}))
+    state.close()
+    assert [p.name for p in settings.state_db.parent.iterdir() if "survey" in p.name] == []
+
+
+def test_survey_interrupt_cancels_queued_probes(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    for i in range(10):
+        _touch(settings.library_root / f"f{i}.mkv")
+    release = threading.Event()
+    started: list[str] = []
+    lock = threading.Lock()
+
+    def probe_fn(path: Path, tools: Tools, reporter: object) -> MediaInfo:
+        with lock:
+            started.append(path.name)
+        if path.name == "f0.mkv":
+            raise KeyboardInterrupt
+        release.wait(timeout=1)
+        return _info(path)
+
+    state = State.open(settings.state_db)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_survey(
+                settings, FAKE_TOOLS, state, RecordingReporter(), workers=1, probe_fn=probe_fn
+            )
+    finally:
+        release.set()
+    time.sleep(0.3)  # any probe still queued would start now
+    state.close()
+    assert started[0] == "f0.mkv"
+    assert len(started) <= 2  # at most the one the worker had already picked up
+
+
+def test_survey_tool_not_found_aborts(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    for name in ("a.mkv", "b.mkv"):
+        _touch(settings.library_root / name)
+
+    def probe_fn(path: Path, tools: Tools, reporter: object) -> MediaInfo:
+        raise ToolNotFound("ffprobe", "gone")
+
+    state = State.open(settings.state_db)
+    with pytest.raises(ToolNotFound):
+        run_survey(settings, FAKE_TOOLS, state, RecordingReporter(), probe_fn=probe_fn)
+    assert state.records() == []
+    state.close()
+    assert not (settings.state_db.parent / "survey.csv").exists()
+
+
 # --- CLI ------------------------------------------------------------------------------------
+
+
+def _cli_with_failing_survey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> tuple[int, str]:
+    lib = tmp_path / "library"
+    lib.mkdir()
+    cfg = _write_config(tmp_path, lib)
+    monkeypatch.setattr("video_cleaner.cli.locate_tools", lambda: FAKE_TOOLS)
+
+    def failing(*args: object, **kwargs: object) -> SurveyResult:
+        raise exc
+
+    monkeypatch.setattr("video_cleaner.survey.run_survey", failing)
+    result = CliRunner().invoke(app, ["survey", "--config", str(cfg), "-q"])
+    return result.exit_code, result.output
+
+
+def test_cli_survey_ctrl_c_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    code, output = _cli_with_failing_survey(tmp_path, monkeypatch, KeyboardInterrupt())
+    assert code == 130
+    assert "interrupted" in output
+    assert "Traceback" not in output
+
+
+def test_cli_survey_csv_error_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    code, output = _cli_with_failing_survey(
+        tmp_path, monkeypatch, SurveyError("cannot write the survey CSV in X: denied")
+    )
+    assert code == 2
+    assert "cannot write the survey CSV" in output
+
+
+def test_cli_survey_unwritable_csv_dir_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lib = tmp_path / "library"
+    lib.mkdir()
+    cfg = _write_config(tmp_path, lib)
+    monkeypatch.setattr("video_cleaner.cli.locate_tools", lambda: FAKE_TOOLS)
+
+    def denied(*args: object, **kwargs: object) -> tuple[int, str]:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr("video_cleaner.survey.tempfile.mkstemp", denied)
+    result = CliRunner().invoke(app, ["survey", "--config", str(cfg), "-q"])
+
+    assert result.exit_code == 2
+    assert "cannot write the survey CSV" in result.output
+
+
+def test_cli_survey_tool_lost_mid_run_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    code, output = _cli_with_failing_survey(tmp_path, monkeypatch, ToolNotFound("ffprobe", "gone"))
+    assert code == 2
+    assert "tool not found: ffprobe" in output
+
+
+def test_cli_survey_help_shows_config_default_path() -> None:
+    result = CliRunner().invoke(app, ["survey", "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    assert r"%APPDATA%\video-cleaner\config.toml" in result.stdout
+    assert "\v" not in result.stdout  # the old help string turned "\v" into a vertical tab
 
 
 def _write_config(tmp_path: Path, library: Path) -> Path:

@@ -28,12 +28,14 @@ _err = Console(stderr=True)
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
 MAX_LISTED_UNPROBEABLE = 20
+EXIT_INTERRUPTED = 130  # 128 + SIGINT, the shell convention for Ctrl+C
 
 RootOption = Annotated[
     Path | None, typer.Option("--root", help="Survey this folder instead of library_root.")
 ]
 ConfigOption = Annotated[
-    Path | None, typer.Option("--config", help="Config file (default %APPDATA%\video-cleaner).")
+    Path | None,
+    typer.Option("--config", help=r"Config file (default %APPDATA%\video-cleaner\config.toml)."),
 ]
 VerboseOption = Annotated[
     int, typer.Option("--verbose", "-v", count=True, help="More console logging.")
@@ -144,6 +146,11 @@ def survey(
             result = _survey.run_survey(settings, tools, state, reporter, root=root)
     except _survey.SurveyError as exc:
         _fail(str(exc))
+    except ToolNotFound as exc:
+        _fail(str(exc))
+    except KeyboardInterrupt:
+        _err.print("survey interrupted; files already surveyed stay recorded", highlight=False)
+        raise typer.Exit(code=EXIT_INTERRUPTED) from None
     finally:
         if isinstance(reporter, RichReporter):
             reporter.close()

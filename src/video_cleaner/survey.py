@@ -15,6 +15,7 @@ import tempfile
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from video_cleaner.config import Settings
@@ -23,13 +24,15 @@ from video_cleaner.multipart import PartGroup, find_part_groups, parts_compatibl
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.state import State, UnrepresentablePath
-from video_cleaner.tools import Tools
+from video_cleaner.tools import ToolNotFound, Tools
 
 _log = logging.getLogger("video_cleaner.survey")
 
 VIDEO_EXTENSIONS = frozenset({".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv", ".mov"})
 PARTIAL_SUFFIX = ".part"
 CSV_NAME = "survey.csv"
+# Used when survey.csv is locked (open in Excel, say): survey-YYYYmmdd-HHMMSS.csv beside it.
+FALLBACK_CSV_PATTERN = "survey-{:%Y%m%d-%H%M%S}.csv"
 CSV_COLUMNS = (
     "path",
     "size",
@@ -139,7 +142,8 @@ def _probe_all(
     infos: dict[Path, MediaInfo] = {}
     failures: dict[Path, str] = {}
     total = len(paths)
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="survey") as pool:
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="survey")
+    try:
         futures: dict[Future[MediaInfo], Path] = {
             pool.submit(probe_fn, path, tools, reporter): path for path in paths
         }
@@ -149,6 +153,8 @@ def _probe_all(
                 infos[path] = future.result()
             except ProbeError as exc:
                 failures[path] = exc.reason
+            except ToolNotFound:
+                raise  # a missing ffprobe is a setup problem, not a bad file
             except Exception as exc:  # one bad file must never stop the survey
                 failures[path] = f"{type(exc).__name__}: {exc}"
             if path in failures:
@@ -162,6 +168,11 @@ def _probe_all(
                     note=f"{done} of {total} files",
                 )
             )
+    except BaseException:
+        # Ctrl+C or an abort: start no more probes; the ones already running finish alone.
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)
     return infos, failures
 
 
@@ -243,18 +254,64 @@ def _csv_line(row: _Row) -> list[str]:
     ]
 
 
-def _write_csv(path: Path, rows: Sequence[_Row]) -> None:
-    """Write the CSV to a temporary file beside *path*, then replace *path* atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    tmp = Path(tmp_name)
+def _csv_error(path: Path, exc: OSError) -> SurveyError:
+    return SurveyError(f"cannot write the survey CSV in {path.parent}: {exc}")
+
+
+def _temp_beside(path: Path) -> tuple[int, Path]:
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    return fd, Path(name)
+
+
+def check_csv_writable(path: Path) -> None:
+    """Fail fast, before a long probe pass, if the CSV folder cannot be written.
+
+    Raises `SurveyError` when the folder cannot be created or a file cannot be created in it.
+    An existing *path* that is locked (open in Excel) only logs a warning: `_write_csv` then
+    falls back to a timestamped name.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, probe_file = _temp_beside(path)
+        os.close(fd)
+        probe_file.unlink()
+    except OSError as exc:
+        raise _csv_error(path, exc) from exc
+    if path.exists():
+        try:
+            with path.open("ab"):
+                pass
+        except OSError as exc:
+            _log.warning("%s is not writable (%s); a timestamped CSV will be written", path, exc)
+
+
+def _write_csv(path: Path, rows: Sequence[_Row]) -> Path:
+    """Write the CSV to a temporary file beside *path*, then move it into place atomically.
+
+    If *path* is locked, the file goes to ``survey-<timestamp>.csv`` in the same folder.
+    Returns the path written; any other failure raises `SurveyError`.
+    """
+    try:
+        fd, tmp = _temp_beside(path)
+    except OSError as exc:
+        raise _csv_error(path, exc) from exc
     try:
         # backslashreplace: an undecodable file name (lone surrogate) still yields valid UTF-8.
         with os.fdopen(fd, "w", encoding="utf-8", errors="backslashreplace", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(CSV_COLUMNS)
             writer.writerows(_csv_line(r) for r in rows)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+            return path
+        except PermissionError as exc:
+            fallback = path.with_name(FALLBACK_CSV_PATTERN.format(datetime.now()))
+            _log.warning("cannot replace %s (%s); writing %s instead", path, exc, fallback)
+            os.replace(tmp, fallback)
+            return fallback
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise _csv_error(path, exc) from exc
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -274,12 +331,16 @@ def run_survey(
 
     Each file is decided and upserted into *state*; a compatible multi-part group becomes one
     record on its first part. Writes ``survey.csv`` beside the state database. Raises
-    `SurveyError` (before touching anything) if an output would lie under the library.
+    `SurveyError` (before probing) if an output would lie under the library or the CSV
+    folder is not writable, and if the CSV cannot be written at all. `ToolNotFound` from the
+    probe and `KeyboardInterrupt` abort the survey; queued probes are cancelled and records
+    already upserted stay.
     """
     if workers < 1:
         raise ValueError(f"workers must be at least 1, got {workers}")
     root = settings.library_root if root is None else root
     csv_path = check_outputs_outside(settings, root)
+    check_csv_writable(csv_path)
 
     reporter.stage("survey")
     paths = discover_files(root)
@@ -303,7 +364,7 @@ def run_survey(
             rows.append(_record(_Row(path, info.size, info, d.action, d.reasons, saving), state))
     rows.sort(key=lambda r: r.path)
 
-    _write_csv(csv_path, rows)
+    csv_path = _write_csv(csv_path, rows)
     counts = dict.fromkeys(Action, 0)
     for row in rows:
         counts[row.action] += 1
