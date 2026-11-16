@@ -23,6 +23,7 @@ from pathlib import Path
 from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action
+from video_cleaner.instancelock import instance_lock, lock_path_for
 from video_cleaner.progress import Reporter
 from video_cleaner.runner import HELD_REASON, refuse_outputs_in_library
 from video_cleaner.state import FileRecord, State, Status
@@ -259,7 +260,8 @@ def run_calibration(
     """Sweep `CALIBRATION_CRFS` over `select_samples` and write the table and the clips.
 
     Raises `NotImplementedError` (held) before touching anything while a stage of *engine*
-    is still held, `RunRefused` if an output folder is under the library root, and
+    is still held, `RunRefused` if an output folder is under the library root, `AlreadyRunning`
+    while a run or another calibration holds the single-instance lock, and
     `CalibrationError` when there is nothing to sample or a score is unusable. Work files go to
     ``<scratch>/calibration`` and are removed after each sample; nothing is stored in *state*.
     """
@@ -267,6 +269,18 @@ def run_calibration(
     if held:
         raise NotImplementedError(HELD_REASON)
     refuse_outputs_in_library(settings)
+    with instance_lock(lock_path_for(settings.state_db)):
+        return _calibrate_locked(settings, tools, state, reporter, samples, engine)
+
+
+def _calibrate_locked(
+    settings: Settings,
+    tools: Tools,
+    state: State,
+    reporter: Reporter,
+    samples: int,
+    engine: CalibrationEngine,
+) -> list[CalibrationRow]:
     picked = select_samples(state.records(), samples)
     if not picked:
         raise CalibrationError("no encode candidates to sample: run `survey` first")

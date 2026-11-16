@@ -26,6 +26,7 @@ from video_cleaner.calibrate import (
 )
 from video_cleaner.cli import app
 from video_cleaner.config import Settings
+from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.state import FileRecord, State, Status
 from video_cleaner.tools import Tools
@@ -466,3 +467,29 @@ def test_cli_calibrate_approve_refuses_target_below_guard_floor(tmp_path: Path) 
     assert result.exit_code == 2
     assert "guard_mean_floor" in result.output
     assert not (tmp_path / "appdata" / "state.db").exists()
+
+
+def test_calibration_is_refused_while_a_run_holds_the_lock(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    fake = FakeEngine()
+    with State.open(settings.state_db) as state:
+        _populate(settings, state)
+        with instance_lock(lock_path_for(settings.state_db)), pytest.raises(AlreadyRunning):
+            run_calibration(settings, TOOLS, state, NullReporter(), samples=1, engine=fake.engine())
+    assert fake.calls == []
+    assert not settings.scratch_dir.exists()
+
+
+def test_cli_calibrate_already_running_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = write_config(tmp_path)
+    settings = tmp_settings(tmp_path)
+    with State.open(settings.state_db) as state:
+        _populate(settings, state)
+    monkeypatch.setattr(calibrate_mod, "default_engine", lambda: FakeEngine().engine())
+    monkeypatch.setattr("video_cleaner.cli.locate_tools", lambda: TOOLS)
+    with instance_lock(lock_path_for(settings.state_db)):
+        result = _invoke("calibrate", "--samples", "1", "--config", str(cfg), "-q")
+    assert result.exit_code == 2
+    assert str(os.getpid()) in result.output

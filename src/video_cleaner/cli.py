@@ -17,6 +17,7 @@ from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
+from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import is_under
@@ -340,7 +341,7 @@ def calibrate(
             rows = _calibrate.run_calibration(
                 settings, tools, state, reporter, samples=samples, engine=engine
             )
-    except (_calibrate.CalibrationError, _runner.RunRefused, StateError) as exc:
+    except (_calibrate.CalibrationError, _runner.RunRefused, AlreadyRunning, StateError) as exc:
         _fail(str(exc))
     except KeyboardInterrupt:
         _err.print("calibration interrupted; nothing was approved", highlight=False)
@@ -418,6 +419,7 @@ def run(
         _runner.PlanNotAcknowledged,
         _runner.CalibrationNotApproved,
         _runner.RunRefused,
+        AlreadyRunning,
         StateError,
     ) as exc:
         _fail(str(exc))

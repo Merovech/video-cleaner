@@ -43,6 +43,7 @@ from video_cleaner import doctor, encode, planning, quality
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.encode import CrfSearchResult
+from video_cleaner.instancelock import instance_lock, lock_path_for
 from video_cleaner.logging_setup import redact
 from video_cleaner.manifest import (
     ManifestEntry,
@@ -901,7 +902,8 @@ def run_queue(
     `CalibrationNotApproved` if no calibration was approved (or the approved CRF ceiling is now
     below the configured ``crf_min``) and `RunRefused` if an output location is under the
     library root. The approved VMAF target and CRF ceiling replace the configured ones for the
-    whole run. The deadline is checked
+    whole run. Raises `AlreadyRunning` (before resetting, sweeping or copying anything) while
+    another run or calibration holds the single-instance lock. The deadline is checked
     before each file; the file in progress always finishes. KeyboardInterrupt leaves the
     current record in its in-progress status (the next run retries it), cleans its scratch and
     propagates.
@@ -922,6 +924,24 @@ def run_queue(
     if held:
         _log.warning("run refused: %s (%s still held)", HELD_REASON, ", ".join(held))
         return RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
+    with instance_lock(lock_path_for(settings.state_db)):
+        return _run_locked(
+            settings, tools, state, reporter, pipeline, deadline, only, now, current_log
+        )
+
+
+def _run_locked(
+    settings: Settings,
+    tools: Tools,
+    state: State,
+    reporter: Reporter,
+    pipeline: Pipeline,
+    deadline: datetime | None,
+    only: Path | None,
+    now: Callable[[], datetime],
+    current_log: Path | None,
+) -> RunSummary:
+    """The body of `run_queue`, run while this process holds the single-instance lock."""
     reset = state.reset_in_progress()
     if reset:
         _log.info("%d file(s) left in progress by an earlier run were reset to retry", reset)

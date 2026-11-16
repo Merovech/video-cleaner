@@ -27,6 +27,7 @@ from video_cleaner import scratch as scratch_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.encode import CrfSearchResult
+from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.manifest import ManifestError, read_manifest, write_manifest
 from video_cleaner.planning import build_plan, plan_hash
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
@@ -475,6 +476,24 @@ def test_startup_resets_sweeps_and_prunes(
     assert summary.completed == 1  # the reset record was retried
     assert "retry" in _transitions(state, src)
     assert _scratch_files(settings) == ["notes.txt"]  # only our own leftovers are swept
+
+
+def test_second_run_is_refused_while_one_holds_the_lock(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    state.set_status(src, Status.ENCODING)  # the live run's file: must not be reset
+    settings.scratch_dir.mkdir(parents=True)
+    live = settings.scratch_dir / "deadbeef-a.avi.part"
+    live.write_bytes(b"p")  # the live run's copy: must not be swept
+    fakes = Fakes()
+    with instance_lock(lock_path_for(settings.state_db)), pytest.raises(AlreadyRunning) as info:
+        _run(settings, state, fakes)
+    assert info.value.pid == os.getpid()
+    assert fakes.calls == []
+    assert _status(state, src).status is Status.ENCODING
+    assert live.exists()
+    summary = _run(settings, state, Fakes())  # the lock is free again
+    assert summary.completed == 1
 
 
 # --- the happy paths -----------------------------------------------------------------------
@@ -1365,6 +1384,7 @@ def test_cli_run_stop_reason_exits_1(
         PlanNotAcknowledged("the plan has not been acknowledged"),
         RunRefused("under the library"),
         CalibrationNotApproved("calibration has not been approved: run `calibrate`"),
+        AlreadyRunning(Path("video-cleaner.lock"), 4242),
     ],
 )
 def test_cli_run_refusals_exit_2(
@@ -1372,7 +1392,7 @@ def test_cli_run_refusals_exit_2(
 ) -> None:
     result, _ = _invoke_run(tmp_path, monkeypatch, error)
     assert result.exit_code == 2
-    assert str(error) in result.output
+    assert " ".join(str(error).split()) in " ".join(result.output.split())
 
 
 def test_cli_run_bad_until_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
