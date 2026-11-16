@@ -3,8 +3,19 @@
 A Python command-line tool that re-encodes a video library to HEVC (x265) to reclaim disk space,
 without ever modifying the source library.
 
-Status: early development (Phase 1 foundation). The commands `doctor`, `survey`, `plan`,
-`calibrate`, `run`, `status` and `report` exist as stubs.
+Status: early development (Phase 1 foundation). `doctor` works; `survey`, `plan`, `calibrate`,
+`run`, `status` and `report` are being built. See [docs/usage.md](docs/usage.md) for the
+commands, the run model, all settings and where logs go.
+
+## Setup (Windows)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+Creates the Python 3.12 environment with `uv`, installs ffmpeg and MKVToolNix through winget,
+creates a private `%APPDATA%\video-cleaner\config.toml` from `config.example.toml` and runs
+`video-cleaner doctor`. Safe to rerun.
 
 ## Principles
 
@@ -18,6 +29,7 @@ Status: early development (Phase 1 foundation). The commands `doctor`, `survey`,
 - Python 3.11 or 3.12
 - [uv](https://docs.astral.sh/uv/)
 - ffmpeg and ffprobe built with `libx265` and `libvmaf`
+- MKVToolNix (`mkvmerge`)
 
 ## Development
 

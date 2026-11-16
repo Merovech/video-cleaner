@@ -1,9 +1,14 @@
 """Command-line interface for video-cleaner (Phase 1 command stubs)."""
 
-from typing import NoReturn
+import os
+from pathlib import Path
+from typing import Annotated, NoReturn
 
 import typer
 from rich.console import Console
+
+from video_cleaner import doctor as doctor_mod
+from video_cleaner.config import ConfigError, load_settings
 
 app = typer.Typer(
     name="video-cleaner",
@@ -20,10 +25,35 @@ def _not_implemented(command: str) -> NoReturn:
     raise typer.Exit(code=2)
 
 
+def _check_tag(check: doctor_mod.Check) -> str:
+    if check.ok:
+        return "[ OK ]"
+    return "[FAIL]" if check.required else "[WARN]"
+
+
 @app.command()
-def doctor() -> None:
+def doctor(
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "--config", help=r"Config file (default %APPDATA%\video-cleaner\config.toml)."
+        ),
+    ] = None,
+) -> None:
     """Check the environment (ffmpeg, libx265, libvmaf, paths)."""
-    _not_implemented("doctor")
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        _err.print(f"config error: {exc}", markup=False, highlight=False)
+        raise typer.Exit(code=2) from None
+    config_path = config if config is not None else doctor_mod.default_config_path(os.environ)
+    checks = doctor_mod.run_doctor(settings, config_path=config_path)
+    for check in checks:
+        typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")
+    removed = doctor_mod.prune_logs(settings.log_dir)
+    typer.echo(f"logs: removed {len(removed)} old log file(s) from {settings.log_dir}")
+    if any(c.required and not c.ok for c in checks):
+        raise typer.Exit(code=1)
 
 
 @app.command()
