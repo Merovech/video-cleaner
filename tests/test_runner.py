@@ -28,7 +28,7 @@ from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.encode import CrfSearchResult
 from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
-from video_cleaner.manifest import ManifestError, read_manifest, write_manifest
+from video_cleaner.manifest import ManifestEntry, ManifestError, read_manifest, write_manifest
 from video_cleaner.planning import build_plan, plan_hash
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress, Reporter
@@ -1570,7 +1570,7 @@ def test_manifest_turning_corrupt_mid_run_stops(
 
     def read(path: Path) -> Any:
         reads.append(path)
-        if len(reads) > 1:
+        if len(reads) > 2:  # fine for the startup check and reconcile, corrupt at delivery
             raise ManifestError("line 3: expected 10 fields")
         return real_read(path)
 
@@ -1812,3 +1812,174 @@ def test_approved_vmaf_target_below_guard_mean_floor_is_refused(
             _run(settings, state, fakes)
         assert fakes.calls == []
     assert not settings.scratch_dir.exists()
+
+
+# --- delivery order and crash recovery (plan section 6) ------------------------------------
+
+
+class _Kill(BaseException):
+    """Stands for the process being killed: no `except Exception` cleanup runs."""
+
+
+def _kill_after(monkeypatch: pytest.MonkeyPatch, point: str) -> None:
+    """Make delivery die right after *point*: 'move', 'manifest' or 'rename'."""
+    if point == "move":
+
+        def no_manifest(path: Path, entries: Any) -> None:
+            raise _Kill
+
+        monkeypatch.setattr(runner_module, "write_manifest", no_manifest)
+        return
+    if point == "manifest":
+        real_write = write_manifest
+
+        def write_then_die(path: Path, entries: Any) -> None:
+            real_write(path, entries)
+            raise _Kill
+
+        monkeypatch.setattr(runner_module, "write_manifest", write_then_die)
+        return
+    real_rename = os.rename
+
+    def rename_then_die(src: Any, dst: Any) -> None:
+        real_rename(src, dst)
+        if str(dst).endswith(".mkv"):
+            raise _Kill
+
+    monkeypatch.setattr(os, "rename", rename_then_die)
+
+
+def test_delivery_writes_manifest_row_before_the_final_rename(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    target = settings.completed_dir / "a.mkv"
+    part = settings.completed_dir / "a.mkv.part"
+    seen: list[tuple[bool, bool]] = []
+    real_write = write_manifest
+
+    def spy(path: Path, entries: Any) -> None:
+        seen.append((part.exists(), target.exists()))
+        real_write(path, entries)
+
+    monkeypatch.setattr(runner_module, "write_manifest", spy)
+    assert _run(settings, state, Fakes()).completed == 1
+    assert seen == [(True, False)]  # row written while the output is still `.part`
+    assert target.is_file() and not part.exists()
+
+
+def test_delivery_never_overwrites_a_target_that_appears_late(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """os.rename refuses an existing target, so a file placed meanwhile survives."""
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    target = settings.completed_dir / "a.mkv"
+    real_write = write_manifest
+
+    def write_then_someone_places_target(path: Path, entries: Any) -> None:
+        real_write(path, entries)
+        target.write_bytes(b"not ours")
+
+    monkeypatch.setattr(runner_module, "write_manifest", write_then_someone_places_target)
+    if os.name != "nt":  # POSIX rename overwrites; refuse the same way Windows does
+
+        def refusing_rename(src_: Any, dst: Any) -> None:
+            if Path(dst).exists():
+                raise FileExistsError(17, "exists", str(dst))
+            os.replace(src_, dst)
+
+        monkeypatch.setattr(os, "rename", refusing_rename)
+    summary = _run(settings, state, Fakes())
+    assert summary.completed == 0
+    assert target.read_bytes() == b"not ours"
+
+
+@pytest.mark.parametrize("point", ["move", "manifest", "rename"])
+def test_resume_after_a_crash_in_delivery(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch, point: str
+) -> None:
+    src = _source(settings, "Films/a.avi")
+    _plan(state, src)
+    target = settings.completed_dir / "Films" / "a.mkv"
+    with monkeypatch.context() as patch:
+        _kill_after(patch, point)
+        with pytest.raises(_Kill):
+            _run(settings, state, Fakes())
+    assert _status(state, src).status is Status.VERIFYING  # what a killed run leaves
+
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+
+    assert _status(state, src).status is Status.COMPLETED
+    assert target.is_file()
+    assert not list(settings.completed_dir.rglob("*.part"))  # no partial file left
+    entries = read_manifest(settings.completed_dir / "manifest.csv")
+    assert [e.completed for e in entries] == [target]
+    if point == "move":
+        assert "encode_full" in fakes.names() and summary.completed == 1  # redone
+    else:
+        assert fakes.calls == []  # the finished encode was recovered, not redone
+
+
+def test_startup_reconciles_manifest_and_completed_folder(settings: Settings, state: State) -> None:
+    gone = _source(settings, "gone.avi")
+    done = _source(settings, "done.avi")
+    _plan(state, gone)
+    _plan(state, done)
+    state.set_status(gone, Status.RETRY, "interrupted")
+    state.set_status(done, Status.COMPLETED, "encode: saved 1 bytes")
+    folder = settings.completed_dir
+    folder.mkdir(parents=True)
+
+    def entry(src: Path) -> Any:
+        st = src.stat()
+        return ManifestEntry(
+            original=(src,),
+            original_sizes=(st.st_size,),
+            original_mtimes=(st.st_mtime,),
+            completed=folder / (src.stem + ".mkv"),
+            completed_size=5,
+            vmaf_mean=None,
+            vmaf_worst=None,
+            crf=None,
+            verified=True,
+            action="remux",
+        )
+
+    # gone: a row with neither the file nor its .part, record not completed -> row dropped.
+    # done: delivered earlier and moved away by the owner -> row kept.
+    write_manifest(folder / "manifest.csv", [entry(gone), entry(done)])
+    orphan = folder / "sub" / "orphan.mkv.part"
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"o")
+    foreign = folder / "notes.part"
+    foreign.write_bytes(b"not ours")
+
+    fakes = Fakes()
+    fakes.fail["copy"] = lambda p: ToolNotFound("stop")  # stop before any real work
+    _run(settings, state, fakes)
+
+    kept = [e.completed.name for e in read_manifest(folder / "manifest.csv")]
+    assert kept == ["done.mkv"]
+    assert not orphan.exists()
+    assert foreign.exists()
+
+
+def test_failed_final_rename_leaves_no_row_and_no_part(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+
+    def denied(src_: Any, dst: Any) -> None:
+        raise PermissionError(13, "denied", str(dst))
+
+    monkeypatch.setattr(os, "rename", denied)
+    summary = _run(settings, state, Fakes())
+    assert summary.flagged == 1
+    assert "could not be put in place" in _status(state, src).note
+    assert read_manifest(settings.completed_dir / "manifest.csv") == []
+    assert not list(settings.completed_dir.rglob("*.part"))
+    assert not (settings.completed_dir / "a.mkv").exists()

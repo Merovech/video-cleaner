@@ -66,7 +66,7 @@ from video_cleaner.scratch import (
     SourceChanged,
     copy_with_progress,
 )
-from video_cleaner.state import FileRecord, StaleRecord, State, Status
+from video_cleaner.state import IN_PROGRESS, FileRecord, StaleRecord, State, Status
 from video_cleaner.tools import (
     ToolFailed,
     ToolNotFound,
@@ -87,6 +87,10 @@ STOP_MANIFEST_NOT_WRITABLE = "manifest not writable"
 STOP_COMPLETED_NOT_WRITABLE = "completed folder not writable"
 STALE_NOTE = "source changed"
 MANIFEST_NAME = "manifest.csv"
+# A delivery in flight: ``<target>.part`` in the completed folder (targets are always .mkv).
+DELIVERY_SUFFIX = ".part"
+_DELIVERY_GLOB = "*.mkv" + DELIVERY_SUFFIX
+RECOVERED_NOTE = "recovered after an interrupted delivery"
 # mkvmerge exits 1 for warnings (the output is fine) and 2 for errors.
 MKVMERGE_ERROR_EXIT = 2
 
@@ -288,6 +292,18 @@ class _Work:
 
     workdir: Path
     reserved: list[Path] = field(default_factory=list)
+
+
+def _delivery_part(target: Path) -> Path:
+    return target.with_name(target.name + DELIVERY_SUFFIX)
+
+
+def _file_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    return _file_key(a) == _file_key(b)
 
 
 def refuse_outputs_in_library(settings: Settings) -> None:
@@ -600,6 +616,82 @@ class _Runner:
                 return f"{STOP_MANIFEST_NOT_WRITABLE}: {exc}"
         return ""
 
+    def _drop_manifest_row(self, target: Path) -> None:
+        """Remove *target*'s row again after its delivery failed (best effort)."""
+        try:
+            entries = self._read_manifest()
+            write_manifest(
+                self._manifest_path, [e for e in entries if not _same_file(e.completed, target)]
+            )
+        except (_ManifestTrouble, ManifestError, OSError) as exc:
+            _log.warning("could not remove the manifest row of %s: %s", target, exc)
+
+    def _recover(self, entry: ManifestEntry) -> None:
+        """Mark the record of a delivered *entry* COMPLETED if a killed run left it unfinished."""
+        rec = self.state.get(entry.original[0])
+        if rec is None or rec.status not in (Status.RETRY, *IN_PROGRESS):
+            return
+        if (rec.size, rec.mtime) != (entry.original_sizes[0], entry.original_mtimes[0]):
+            return
+        try:
+            if entry.completed.stat().st_size != entry.completed_size:
+                return
+        except OSError:
+            return
+        saved = sum(entry.original_sizes) - entry.completed_size
+        note = f"{entry.action}: saved {saved} bytes ({RECOVERED_NOTE})"
+        self._finish(rec, _Outcome(Status.COMPLETED, note, saved))
+
+    def _delivered_earlier(self, entry: ManifestEntry) -> bool:
+        rec = self.state.get(entry.original[0])
+        return rec is not None and rec.status is Status.COMPLETED
+
+    def reconcile(self) -> str:
+        """Repair what a run killed during delivery left behind. Returns a stop reason or "".
+
+        A manifest row whose target is missing but whose ``.part`` exists gets the rename
+        finished; a row with neither file is dropped unless its record is already COMPLETED (a
+        delivery the owner has since moved away); a delivered target whose record a killed run
+        left in progress or RETRY is marked COMPLETED; and a ``*.mkv.part`` with no row is
+        removed. Nothing else in the completed folder is touched.
+        """
+        try:
+            entries = self._read_manifest()
+        except _ManifestTrouble as exc:
+            return str(exc)
+        kept: list[ManifestEntry] = []
+        for entry in entries:
+            target = entry.completed
+            part = _delivery_part(target)
+            if not target.exists() and part.exists():
+                try:
+                    os.rename(part, target)
+                    _log.info("finished the interrupted delivery of %s", target)
+                except OSError as exc:
+                    _log.warning("could not finish the delivery of %s: %s", target, exc)
+            if target.exists() or part.exists() or self._delivered_earlier(entry):
+                kept.append(entry)
+            else:
+                _log.warning("dropped the manifest row of %s: no output was delivered", target)
+        if len(kept) != len(entries):
+            try:
+                write_manifest(self._manifest_path, kept)
+            except (ManifestError, OSError) as exc:
+                return f"{STOP_MANIFEST_NOT_WRITABLE}: {exc}"
+        for entry in kept:
+            if entry.completed.exists():
+                self._recover(entry)
+        delivered = {_file_key(e.completed) for e in kept}
+        for part in self.settings.completed_dir.rglob(_DELIVERY_GLOB):
+            if _file_key(part.with_name(part.name[: -len(DELIVERY_SUFFIX)])) in delivered:
+                continue
+            try:
+                part.unlink()
+                _log.info("removed unfinished delivery %s", part)
+            except OSError as exc:
+                _log.warning("could not remove unfinished delivery %s: %s", part, exc)
+        return ""
+
     def _keep_tool_log(self, log: Path | None) -> Path | None:
         """Copy a failed tool's stderr log out of scratch (which is about to be released)."""
         if log is None or not log.is_file() or not is_under(log, self.settings.scratch_dir):
@@ -694,21 +786,33 @@ class _Runner:
         if target.exists():
             raise _Refused(f"output {target} already exists in the completed folder")
 
+        # Order (plan section 6, crash safety): output -> <target>.part, manifest row, then
+        # rename .part -> target. A kill at any point is repaired by `reconcile` at the next
+        # start: a .part without a row is removed, a row whose .part is still there is finished.
+        # Cleanup below runs for errors only; a kill leaves exactly that state behind.
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(target.name + ".part")
+        tmp = _delivery_part(target)
+        tmp.unlink(missing_ok=True)  # an orphan of ours (reconcile normally removed it)
         try:
             shutil.move(output, tmp)  # a rename on one volume, copy and delete across volumes
-            os.replace(tmp, target)
-        except BaseException:
+        except Exception:
             tmp.unlink(missing_ok=True)
             raise
         try:
             write_manifest(manifest_path, [*entries, entry])
-        except BaseException as exc:
-            target.unlink(missing_ok=True)  # no output without its manifest row
+        except Exception as exc:
+            tmp.unlink(missing_ok=True)  # no output without its manifest row
             if isinstance(exc, ManifestError | OSError):
                 raise _ManifestTrouble(f"{STOP_MANIFEST_NOT_WRITABLE}: {exc}") from exc
             raise
+        try:
+            # os.rename refuses an existing target on Windows: delivery never overwrites.
+            os.rename(tmp, target)
+        except OSError as exc:
+            _log.error("%s: delivered as %s but not renamed: %s", rec.path, tmp, exc)
+            self._drop_manifest_row(target)
+            tmp.unlink(missing_ok=True)
+            raise _Refused(f"output {target} could not be put in place: {exc}") from exc
         saved = sum(entry.original_sizes) - completed_size
         return _Outcome(Status.COMPLETED, f"{action}: saved {saved} bytes", saved)
 
@@ -954,7 +1058,7 @@ def _run_locked(
     if not os.path.isdir(settings.library_root):
         _log.error("library root %s is unreachable; nothing started", settings.library_root)
         return runner.summary(False, STOP_LIBRARY_UNREACHABLE)
-    problem = runner.check_delivery()
+    problem = runner.check_delivery() or runner.reconcile()
     if problem:
         _log.error("run stopped before any file: %s", problem)
         return runner.summary(False, problem)
