@@ -209,6 +209,11 @@ def run(
         deadline = _runner.deadline_from(until, max_hours, datetime.now())
     except ValueError as exc:
         _fail(str(exc))
+    try:
+        # Before the log file and the state database are created, exactly like survey.
+        _runner.refuse_outputs_in_library(settings)
+    except _runner.RunRefused as exc:
+        _fail(str(exc))
     log_path = setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
     try:
         tools = locate_tools()

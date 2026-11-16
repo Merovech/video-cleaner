@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -44,6 +45,7 @@ from video_cleaner.encode import CrfSearchResult
 from video_cleaner.logging_setup import redact
 from video_cleaner.manifest import (
     ManifestEntry,
+    ManifestError,
     check_unchanged,
     completed_path_for,
     read_manifest,
@@ -51,6 +53,7 @@ from video_cleaner.manifest import (
 )
 from video_cleaner.multipart import find_part_groups
 from video_cleaner.mux import build_mux_cmd
+from video_cleaner.paths import is_under, path_key
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.scratch import (
@@ -77,6 +80,9 @@ _log = logging.getLogger(__name__)
 HELD_REASON = "held: Task 10b"
 STOP_SCRATCH_FULL = "scratch full"
 STOP_LIBRARY_UNREACHABLE = "library unreachable"
+STOP_MANIFEST_UNREADABLE = "manifest unreadable"
+STOP_MANIFEST_NOT_WRITABLE = "manifest not writable"
+STOP_COMPLETED_NOT_WRITABLE = "completed folder not writable"
 STALE_NOTE = "source changed"
 MANIFEST_NAME = "manifest.csv"
 # mkvmerge exits 1 for warnings (the output is fine) and 2 for errors.
@@ -103,6 +109,10 @@ class _SourceStale(Exception):
 
 class _Refused(Exception):
     """The file cannot be delivered safely; it is flagged with this reason."""
+
+
+class _ManifestTrouble(Exception):
+    """The manifest cannot be read or written: no file can be delivered, so the run stops."""
 
 
 # --- pipeline ------------------------------------------------------------------------------
@@ -153,9 +163,19 @@ def held_window_scores(
     raise NotImplementedError(HELD_REASON)
 
 
+# The stages that are still signature stubs. A replacement can also declare itself held with
+# a truthy ``held`` attribute. `run_queue` refuses to start while any of them is in the pipeline.
+_HELD_STAGES: tuple[object, ...] = (encode.search_crf, encode.encode_full, held_window_scores)
+
+
 @dataclass
 class Pipeline:
-    """The stages `run_queue` calls; tests replace them with fakes."""
+    """The stages `run_queue` calls; tests replace them with fakes.
+
+    ``copy`` is the foreground copy. The background copy of the next file is done by the
+    Prefetcher that ``prefetcher`` builds (its own cancellable copy loop); tests that must not
+    copy for real inject a different ``prefetcher`` here.
+    """
 
     copy: Callable[[Path, Path, Reporter], CopyResult] = copy_with_progress
     search_crf: Callable[[MediaInfo, Tools, Settings, Path, Reporter], CrfSearchResult] = (
@@ -171,6 +191,20 @@ class Pipeline:
     )
     verify: Callable[..., VerifyResult] = verify_output
     probe: Callable[[Path, Tools, Reporter], MediaInfo] = probe
+    prefetcher: Callable[[ScratchManager, Reporter], Prefetcher] = Prefetcher
+
+    def held_stages(self) -> list[str]:
+        """Names of the stages that are still held stubs."""
+        stages = {
+            "search_crf": self.search_crf,
+            "encode_full": self.encode_full,
+            "window_scores": self.window_scores,
+        }
+        return [
+            name
+            for name, stage in stages.items()
+            if any(stage is held for held in _HELD_STAGES) or getattr(stage, "held", False)
+        ]
 
 
 # --- deadline and summary ------------------------------------------------------------------
@@ -214,15 +248,6 @@ def deadline_from(until: str | None, max_hours: float | None, now: datetime) -> 
 # --- helpers -------------------------------------------------------------------------------
 
 
-def _norm(path: Path | str) -> str:
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _is_under(path: Path, root: Path) -> bool:
-    inner, outer = _norm(path), _norm(root).rstrip("\\/")
-    return inner == outer or inner.startswith(outer + os.sep)
-
-
 def _clean(note: str) -> str:
     """A note SQLite can store even if a file name carries undecodable bytes."""
     return note.encode("utf-8", "backslashreplace").decode("utf-8")
@@ -259,14 +284,15 @@ class _Work:
     reserved: list[Path] = field(default_factory=list)
 
 
-def _refuse_outputs_in_library(settings: Settings) -> None:
+def refuse_outputs_in_library(settings: Settings) -> None:
+    """Raise `RunRefused` if anything a run writes would land under the library root."""
     for label, path in (
         ("scratch folder", settings.scratch_dir),
         ("completed folder", settings.completed_dir),
         ("state database", settings.state_db),
         ("log folder", settings.log_dir),
     ):
-        if _is_under(path, settings.library_root):
+        if is_under(path, settings.library_root):
             raise RunRefused(
                 f"{label} {path} is under the library root {settings.library_root}; "
                 "a run never writes to the library"
@@ -294,10 +320,10 @@ class _Runner:
         self.reporter = reporter
         self.pipeline = pipeline
         self.deadline = deadline
-        self.only = None if only is None else _norm(only)
+        self.only = only
         self.now = now
         self.scratch = ScratchManager(settings.scratch_dir, settings.scratch_cap_bytes)
-        self.prefetcher = Prefetcher(self.scratch, _BackgroundReporter())
+        self.prefetcher = pipeline.prefetcher(self.scratch, _BackgroundReporter())
         self.prefetched: Path | None = None
         self.attempted: set[tuple[str, int, float]] = set()
         self.claims: dict[str, list[Path]] = {}
@@ -311,15 +337,12 @@ class _Runner:
     def _in_scope(self, rec: FileRecord) -> bool:
         if self.only is None:
             return True
-        prefix = self.only.rstrip("\\/") + os.sep
-        return any(
-            _norm(p) == self.only or _norm(p).startswith(prefix) for p in (rec.path, *rec.parts)
-        )
+        return any(is_under(p, self.only) for p in (rec.path, *rec.parts))
 
     def _wanted(self, rec: FileRecord) -> bool:
         return (
             rec.decision in _WORK_DECISIONS
-            and (_norm(rec.path), rec.size, rec.mtime) not in self.attempted
+            and (path_key(rec.path), rec.size, rec.mtime) not in self.attempted
             and self._in_scope(rec)
         )
 
@@ -352,6 +375,27 @@ class _Runner:
                 continue  # flagged with the reason when the record comes up
             self.claims.setdefault(str(target).casefold(), []).append(rec.path)
 
+    def _library_twin(self, rec: FileRecord, target: Path) -> Path | None:
+        """The library file that *target* would later replace, unless it is one of *rec*'s own.
+
+        The completed folder mirrors the library, so ``completed/a/Film.mkv`` stands for
+        ``library/a/Film.mkv``; an unrelated file there must not be overwritten one day.
+        """
+        relative = target.relative_to(self.settings.completed_dir)
+        folder = self.settings.library_root / relative.parent
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return None
+        wanted = relative.name.casefold()
+        own = {path_key(p) for p in (rec.path, *rec.parts)}
+        for name in names:
+            if name.casefold() == wanted:
+                twin = folder / name
+                if path_key(twin) not in own:
+                    return twin
+        return None
+
     def _precheck(self, rec: FileRecord) -> Path:
         """The completed path for *rec*; raises `_Refused` if delivering there is unsafe."""
         try:
@@ -359,10 +403,15 @@ class _Runner:
         except ValueError as exc:
             raise _Refused(str(exc)) from None
         others = [
-            p for p in self.claims.get(str(target).casefold(), []) if _norm(p) != _norm(rec.path)
+            p
+            for p in self.claims.get(str(target).casefold(), [])
+            if path_key(p) != path_key(rec.path)
         ]
         if others:
             raise _Refused(f"output name collides with {', '.join(str(p) for p in others)}")
+        twin = self._library_twin(rec, target)
+        if twin is not None:
+            raise _Refused(f"output name collides with {twin}")
         if target.exists():
             raise _Refused(f"output {target} already exists in the completed folder")
         return target
@@ -403,7 +452,7 @@ class _Runner:
         work.reserved.append(path)
 
     def _copy(self, src: Path, size: int, work: _Work) -> Path:
-        if self.prefetched is not None and _norm(self.prefetched) == _norm(src):
+        if self.prefetched is not None and path_key(self.prefetched) == path_key(src):
             self.prefetched = None
             self.reporter.stage(f"waiting for prefetch: {src.name}")
             result = self.prefetcher.result()
@@ -453,7 +502,7 @@ class _Runner:
         """Remove what a killed run left in scratch: partial copies, work folders, orphans."""
         keep: set[str] = set()
         for rec in self.state.records(Status.PENDING, Status.RETRY):
-            keep.update(_norm(self.prefetcher.dest_for(p)) for p in (rec.parts or (rec.path,)))
+            keep.update(path_key(self.prefetcher.dest_for(p)) for p in (rec.parts or (rec.path,)))
         for entry in os.scandir(self.settings.scratch_dir):
             try:
                 if entry.is_dir(follow_symlinks=False):
@@ -461,16 +510,51 @@ class _Runner:
                         shutil.rmtree(entry.path)
                         _log.info("removed leftover scratch folder %s", entry.path)
                 elif _COPY_NAME.fullmatch(entry.name) and (
-                    entry.name.endswith(".part") or _norm(entry.path) not in keep
+                    entry.name.endswith(".part") or path_key(entry.path) not in keep
                 ):
                     os.unlink(entry.path)
                     _log.info("removed leftover scratch file %s", entry.path)
             except OSError as exc:
                 _log.warning("could not remove leftover %s: %s", entry.path, exc)
 
+    @property
+    def _manifest_path(self) -> Path:
+        return self.settings.completed_dir / MANIFEST_NAME
+
+    def _read_manifest(self) -> list[ManifestEntry]:
+        try:
+            return read_manifest(self._manifest_path)
+        except FileNotFoundError:
+            return []
+        except (ManifestError, OSError) as exc:
+            raise _ManifestTrouble(f"{STOP_MANIFEST_UNREADABLE}: {exc}") from exc
+
+    def check_delivery(self) -> str:
+        """Before any copy: can results be delivered at all? Returns a stop reason or ""."""
+        folder = self.settings.completed_dir
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            fd, probe_name = tempfile.mkstemp(dir=folder, prefix=".write-check-")
+            os.close(fd)
+            os.unlink(probe_name)
+        except OSError as exc:
+            return f"{STOP_COMPLETED_NOT_WRITABLE}: {exc}"
+        try:
+            self._read_manifest()
+        except _ManifestTrouble as exc:
+            return str(exc)
+        if self._manifest_path.exists():
+            try:
+                # Opening for append changes nothing but fails if the file is locked/read-only.
+                with open(self._manifest_path, "a", encoding="utf-8"):
+                    pass
+            except OSError as exc:
+                return f"{STOP_MANIFEST_NOT_WRITABLE}: {exc}"
+        return ""
+
     def _keep_tool_log(self, log: Path | None) -> Path | None:
         """Copy a failed tool's stderr log out of scratch (which is about to be released)."""
-        if log is None or not log.is_file() or not _is_under(log, self.settings.scratch_dir):
+        if log is None or not log.is_file() or not is_under(log, self.settings.scratch_dir):
             return log
         stamp = f"{self.now():%Y%m%d-%H%M%S}"
         tag = hashlib.sha1(str(log).encode("utf-8", "surrogatepass"), usedforsecurity=False)
@@ -490,7 +574,7 @@ class _Runner:
         """The (size, mtime) each source had when it was planned."""
         out: list[tuple[int, float]] = []
         for src in sources:
-            if _norm(src) == _norm(rec.path):
+            if path_key(src) == path_key(rec.path):
                 out.append((rec.size, rec.mtime))
                 continue
             member = self.state.get(src)
@@ -554,11 +638,8 @@ class _Runner:
             raise _SourceStale(f"{rec.path} changed during processing")
         self._still_live(rec)
 
-        manifest_path = self.settings.completed_dir / MANIFEST_NAME
-        try:
-            entries = read_manifest(manifest_path)
-        except FileNotFoundError:
-            entries = []
+        manifest_path = self._manifest_path
+        entries = self._read_manifest()
         key = str(target).casefold()
         if any(str(e.completed).casefold() == key for e in entries):
             raise _Refused(f"output {target} is already in the manifest")
@@ -575,8 +656,10 @@ class _Runner:
             raise
         try:
             write_manifest(manifest_path, [*entries, entry])
-        except BaseException:
+        except BaseException as exc:
             target.unlink(missing_ok=True)  # no output without its manifest row
+            if isinstance(exc, ManifestError | OSError):
+                raise _ManifestTrouble(f"{STOP_MANIFEST_NOT_WRITABLE}: {exc}") from exc
             raise
         saved = sum(entry.original_sizes) - completed_size
         return _Outcome(Status.COMPLETED, f"{action}: saved {saved} bytes", saved)
@@ -671,10 +754,10 @@ class _Runner:
 
     def process(self, rec: FileRecord) -> str:
         """Handle one record; returns a stop reason, or "" to carry on with the next file."""
-        self.attempted.add((_norm(rec.path), rec.size, rec.mtime))
+        self.attempted.add((path_key(rec.path), rec.size, rec.mtime))
         sources = rec.parts or (rec.path,)
-        if self.prefetched is not None and _norm(self.prefetched) not in {
-            _norm(p) for p in sources
+        if self.prefetched is not None and path_key(self.prefetched) not in {
+            path_key(p) for p in sources
         }:
             self.drop_prefetch()
         try:
@@ -700,6 +783,9 @@ class _Runner:
         except ScratchFull as exc:
             self._finish(rec, _Outcome(Status.RETRY, f"scratch full: {exc}"))
             return STOP_SCRATCH_FULL
+        except _ManifestTrouble as exc:
+            self._finish(rec, _Outcome(Status.RETRY, str(exc)))
+            return str(exc)
         except ToolNotFound as exc:
             self._finish(rec, _Outcome(Status.RETRY, str(exc)))
             return f"tool not found: {exc.name}"
@@ -773,7 +859,12 @@ def run_queue(
         raise PlanNotAcknowledged(
             "the plan has not been acknowledged: review and acknowledge it with `plan` first"
         )
-    _refuse_outputs_in_library(settings)
+    refuse_outputs_in_library(settings)
+    pipeline = pipeline or Pipeline()
+    held = pipeline.held_stages()
+    if held:
+        _log.warning("run refused: %s (%s still held)", HELD_REASON, ", ".join(held))
+        return RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
     reset = state.reset_in_progress()
     if reset:
         _log.info("%d file(s) left in progress by an earlier run were reset to retry", reset)
@@ -781,11 +872,15 @@ def run_queue(
     if removed:
         _log.info("pruned %d old log file(s)", len(removed))
 
-    runner = _Runner(settings, tools, state, reporter, pipeline or Pipeline(), deadline, only, now)
+    runner = _Runner(settings, tools, state, reporter, pipeline, deadline, only, now)
     runner.sweep()
     if not os.path.isdir(settings.library_root):
         _log.error("library root %s is unreachable; nothing started", settings.library_root)
         return runner.summary(False, STOP_LIBRARY_UNREACHABLE)
+    problem = runner.check_delivery()
+    if problem:
+        _log.error("run stopped before any file: %s", problem)
+        return runner.summary(False, problem)
     runner.claim_targets()
 
     stopped_by_deadline = False

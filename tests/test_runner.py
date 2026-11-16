@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,11 +20,14 @@ from typer.testing import CliRunner
 
 from video_cleaner import cli as cli_module
 from video_cleaner import doctor as doctor_module
+from video_cleaner import paths as paths_module
+from video_cleaner import probe as probe_module
 from video_cleaner import runner as runner_module
 from video_cleaner import scratch as scratch_module
+from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.encode import CrfSearchResult
-from video_cleaner.manifest import read_manifest
+from video_cleaner.manifest import ManifestError, read_manifest, write_manifest
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.runner import (
@@ -783,7 +787,11 @@ def test_held_stub_stops_run_and_leaves_pending(settings: Settings, state: State
     _plan(state, b, est=100)
     fakes = Fakes()
     pipeline = fakes.pipeline()
-    pipeline.search_crf = Pipeline().search_crf  # the real, held implementation
+
+    def held_mid_run(*args: Any) -> CrfSearchResult:
+        raise NotImplementedError(HELD_REASON)  # not marked held: only found when called
+
+    pipeline.search_crf = held_mid_run
     summary = run_queue(
         settings,
         TOOLS,
@@ -1051,10 +1059,13 @@ def test_prefetch_uses_a_separate_reporter(
             started.append(src)
             super().start(src)
 
-    monkeypatch.setattr(runner_module, "Prefetcher", Spy)
     foreground = RecordingReporter()
     fakes = Fakes()
-    summary = _run(settings, state, fakes, reporter=foreground)
+    pipeline = fakes.pipeline()
+    pipeline.prefetcher = Spy
+    summary = run_queue(
+        settings, TOOLS, state, foreground, deadline=None, now=Clock(), pipeline=pipeline
+    )
     assert summary.completed == 2
     assert len(made) == 1 and made[0] is not foreground
     assert started == [b]
@@ -1150,7 +1161,9 @@ def test_manifest_write_failure_removes_output(
     settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     src = _source(settings, "a.avi")
-    _plan(state, src)
+    other = _source(settings, "b.avi")
+    _plan(state, src, est=900)
+    _plan(state, other, est=100)
 
     def broken(path: Path, entries: Any) -> None:
         raise OSError(28, "no space left on device")
@@ -1158,7 +1171,10 @@ def test_manifest_write_failure_removes_output(
     monkeypatch.setattr(runner_module, "write_manifest", broken)
     summary = _run(settings, state, Fakes())
     assert summary.retry == 1
+    assert summary.stop_reason.startswith("manifest not writable: ")
     assert _status(state, src).status is Status.RETRY
+    assert _status(state, other).status is Status.PENDING
+    assert _scratch_files(settings) == []
     assert not (settings.completed_dir / "a.mkv").exists()
     assert not list(settings.completed_dir.rglob("*.part"))
 
@@ -1205,8 +1221,8 @@ def test_remux_verify_failure_flags(settings: Settings, state: State) -> None:
 # --- CLI `run` (run_queue faked) -----------------------------------------------------------
 
 
-def _cli_config(tmp_path: Path) -> Path:
-    settings = _settings(tmp_path)
+def _cli_config(tmp_path: Path, **changes: Any) -> Path:
+    settings = _settings(tmp_path, **changes)
     config = tmp_path / "config.toml"
     lines = [
         f"{name} = '{getattr(settings, name)}'"
@@ -1286,7 +1302,16 @@ def test_cli_run_passes_deadline_and_path(tmp_path: Path, monkeypatch: pytest.Mo
     assert kw["only"] == target
 
 
-@pytest.mark.parametrize("reason", ["scratch full", "library unreachable", "held: Task 10b"])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "scratch full",
+        "library unreachable",
+        "held: Task 10b",
+        "manifest unreadable: bad header",
+        "completed folder not writable: denied",
+    ],
+)
 def test_cli_run_stop_reason_exits_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
 ) -> None:
@@ -1325,3 +1350,205 @@ def test_cli_run_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyP
     result, _ = _invoke_run(tmp_path, monkeypatch, KeyboardInterrupt())
     assert result.exit_code == 130
     assert "interrupted" in result.output
+
+
+# --- fix round 1: readiness, early refusal, manifest preflight, library collisions ---------
+
+
+def _forbid_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_tool(*args: Any, **kwargs: Any) -> ToolResult:
+        raise AssertionError("no tool may run")
+
+    for module in (runner_module, probe_module, verify_module):
+        monkeypatch.setattr(module, "run_tool", no_tool)
+
+    def no_prefetch(self: Any, src: Path) -> None:
+        raise AssertionError("no prefetch may start")
+
+    monkeypatch.setattr(scratch_module.Prefetcher, "start", no_prefetch)
+
+
+def test_default_pipeline_is_refused_before_anything(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_tools(monkeypatch)
+    enc = _source(settings, "a.avi")
+    remux = _source(settings, "b.mp4")
+    pt1 = _source(settings, "C pt1.avi")
+    pt2 = _source(settings, "C pt2.avi")
+    stuck = _source(settings, "d.avi")
+    _plan(state, enc, est=900)
+    _plan(state, remux, decision="remux", est=0)
+    _plan(state, pt1, decision="remux", parts=(pt1, pt2))
+    _plan(state, stuck)
+    state.set_status(stuck, Status.ENCODING)
+    before = {r.path: (r.status, r.note) for r in state.records()}
+    events = len(state.events(10_000))
+
+    for only in (None, remux, pt1):
+        summary = run_queue(
+            settings, TOOLS, state, RecordingReporter(), deadline=None, only=only, now=Clock()
+        )
+        assert summary == RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
+
+    assert {r.path: (r.status, r.note) for r in state.records()} == before
+    assert len(state.events(10_000)) == events  # not even reset_in_progress ran
+    assert not settings.scratch_dir.exists()
+    assert not settings.completed_dir.exists()
+
+
+def test_stage_marked_held_is_refused_up_front(settings: Settings, state: State) -> None:
+    _plan(state, _source(settings, "a.avi"))
+    fakes = Fakes()
+    pipeline = fakes.pipeline()
+
+    def scores(*args: Any) -> Sequence[float]:
+        raise NotImplementedError(HELD_REASON)
+
+    scores.held = True  # type: ignore[attr-defined]
+    pipeline.window_scores = scores
+    summary = run_queue(
+        settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
+    )
+    assert summary.stop_reason == HELD_REASON
+    assert fakes.calls == []
+
+
+def test_refusal_uses_resolved_paths(
+    tmp_path: Path, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _settings(tmp_path)
+    alias = tmp_path / "W"
+    real_resolve = paths_module._resolve
+
+    def resolve(p: Any) -> str:
+        text = str(real_resolve(p))
+        prefix = str(alias)
+        if os.path.normcase(text).startswith(os.path.normcase(prefix)):
+            return str(base.library_root) + text[len(prefix) :]
+        return text
+
+    monkeypatch.setattr(paths_module, "_resolve", resolve)
+    settings = _settings(tmp_path, scratch_dir=alias / "scratch")
+    with pytest.raises(RunRefused, match="scratch folder"):
+        _run(settings, state, Fakes())
+
+
+def test_cli_refuses_before_creating_log_or_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = tmp_path / "library"
+    called: list[Any] = []
+    monkeypatch.setattr(runner_module, "run_queue", lambda *a, **k: called.append(k))
+    monkeypatch.setattr(cli_module, "locate_tools", lambda: TOOLS)
+    config = _cli_config(
+        tmp_path, log_dir=library / "logs", state_db=library / "state" / "state.db"
+    )
+    result = CliRunner().invoke(cli_module.app, ["run", "--config", str(config)])
+    assert result.exit_code == 2
+    assert "library root" in result.output
+    assert not (library / "logs").exists()
+    assert not (library / "state").exists()
+    assert called == []
+
+
+def test_corrupt_manifest_stops_before_any_copy(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    settings.completed_dir.mkdir(parents=True)
+    (settings.completed_dir / "manifest.csv").write_text("not,a,manifest\n", encoding="utf-8")
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.stop_reason.startswith("manifest unreadable: ")
+    assert fakes.calls == []
+    assert _status(state, src).status is Status.PENDING
+
+
+def test_read_only_manifest_stops_before_any_copy(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    settings.completed_dir.mkdir(parents=True)
+    manifest = settings.completed_dir / "manifest.csv"
+    write_manifest(manifest, [])
+    before = manifest.read_bytes()
+    manifest.chmod(stat.S_IREAD)
+    try:
+        fakes = Fakes()
+        summary = _run(settings, state, fakes)
+    finally:
+        manifest.chmod(stat.S_IREAD | stat.S_IWRITE)
+    assert summary.stop_reason.startswith("manifest not writable: ")
+    assert fakes.calls == []
+    assert manifest.read_bytes() == before
+
+
+def test_unwritable_completed_folder_stops_before_any_copy(
+    settings: Settings, state: State
+) -> None:
+    _plan(state, _source(settings, "a.avi"))
+    settings.completed_dir.write_bytes(b"a file where the folder should be")
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.stop_reason.startswith("completed folder not writable: ")
+    assert fakes.calls == []
+
+
+def test_manifest_turning_corrupt_mid_run_stops(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = _source(settings, "a.avi")
+    b = _source(settings, "b.avi")
+    _plan(state, a, est=900)
+    _plan(state, b, est=100)
+    real_read = read_manifest
+    reads: list[Path] = []
+
+    def read(path: Path) -> Any:
+        reads.append(path)
+        if len(reads) > 1:
+            raise ManifestError("line 3: expected 10 fields")
+        return real_read(path)
+
+    monkeypatch.setattr(runner_module, "read_manifest", read)
+    summary = _run(settings, state, Fakes())
+    assert summary.stop_reason.startswith("manifest unreadable: ")
+    assert _status(state, a).status is Status.RETRY
+    assert _status(state, b).status is Status.PENDING
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert _scratch_files(settings) == []
+
+
+def test_combined_name_colliding_with_library_file_is_flagged(
+    settings: Settings, state: State
+) -> None:
+    pt1 = _source(settings, "Films/Film pt1.avi")
+    pt2 = _source(settings, "Films/Film pt2.avi")
+    sibling = _source(settings, "Films/Film.mkv")  # an unrelated, unplanned file
+    _plan(state, pt1, parts=(pt1, pt2))
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.flagged == 1
+    assert _status(state, pt1).note == f"output name collides with {sibling}"
+    assert fakes.calls == []
+
+
+def test_mkv_name_colliding_with_left_alone_library_file_is_flagged(
+    settings: Settings, state: State
+) -> None:
+    avi = _source(settings, "Clips/Clip.avi")
+    mkv = _source(settings, "Clips/clip.MKV")
+    _plan(state, avi)
+    _plan(state, mkv, decision="leave_alone", est=0)
+    summary = _run(settings, state, Fakes())
+    assert summary.flagged == 1
+    assert "output name collides with" in _status(state, avi).note
+    assert str(mkv) in _status(state, avi).note
+
+
+def test_delivering_beside_its_own_source_is_fine(settings: Settings, state: State) -> None:
+    avi = _source(settings, "Films/Film.avi")
+    mkv = _source(settings, "Shows/Show.mkv")
+    _plan(state, avi)
+    _plan(state, mkv, decision="remux", est=0)  # Show.mkv -> completed Show.mkv: itself
+    summary = _run(settings, state, Fakes())
+    assert summary.completed == 2
