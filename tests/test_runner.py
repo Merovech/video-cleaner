@@ -2082,3 +2082,16 @@ def test_only_with_finished_files_in_scope_is_not_an_error(
     state.set_status(a, Status.COMPLETED, "done")
     summary = _run(settings, state, Fakes(), only=settings.library_root / "Films")
     assert summary.stop_reason == ""
+
+
+def test_cli_run_keeps_the_machine_awake_only_while_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from video_cleaner import power
+
+    calls: list[int] = []
+    monkeypatch.setattr(power, "_set_execution_state", calls.append)
+    monkeypatch.setattr(power, "_WINDOWS", True)
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary())
+    assert result.exit_code == 0, result.output
+    assert calls == [power.ES_CONTINUOUS | power.ES_SYSTEM_REQUIRED, power.ES_CONTINUOUS]

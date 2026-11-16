@@ -13,7 +13,7 @@ from rich.console import Console
 
 from video_cleaner import calibrate as _calibrate
 from video_cleaner import doctor as doctor_mod
-from video_cleaner import planning
+from video_cleaner import planning, power
 from video_cleaner import runner as _runner
 from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
@@ -414,7 +414,7 @@ def run(
         _fail(str(exc))
     log_path = _logging(settings, verbose, quiet)
     tools = _tools()
-    with _open_reporter(settings) as reporter:
+    with _open_reporter(settings) as reporter, power.keep_awake():
         try:
             with State.open(settings.state_db) as state:
                 summary = _runner.run_queue(

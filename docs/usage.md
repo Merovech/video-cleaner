@@ -86,6 +86,10 @@ then the default winget and MKVToolNix install folders.
    the one holding `video-cleaner.lock` beside the state database. The lock is released by the
    operating system when the process ends, so a crash never leaves it stuck.
 
+7. **Low impact.** ffmpeg, ffprobe and mkvmerge run at below-normal priority, so the PC stays
+   usable, and Windows is kept from sleeping while `run` works (the normal power settings
+   return when it ends).
+
 ### The manifest and the completed folder
 
 `manifest.csv` accumulates: every run appends the files it delivered, and rows are never removed

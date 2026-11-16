@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from video_cleaner import power
 from video_cleaner.logging_setup import redact
 from video_cleaner.progress import Progress, Reporter, parse_mkvmerge_progress
 
@@ -385,9 +386,11 @@ def run_tool(
             errors="replace",
             cwd=cwd,
             shell=False,
+            creationflags=power.creation_flags(),  # below normal: the PC stays usable
         )
     except FileNotFoundError as exc:
         raise ToolNotFound(str(cmd[0]), "executable does not exist") from exc
+    power.lower_priority(proc.pid)
 
     if proc.stdout is None or proc.stderr is None:  # pragma: no cover - PIPE always sets them
         raise RuntimeError("subprocess pipes were not created")
