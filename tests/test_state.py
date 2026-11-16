@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
 import pytest
 
@@ -672,3 +673,35 @@ def test_requeue_refuses_completed_and_unknown(state: State) -> None:
     state.set_status(info.path, Status.COMPLETED, "done")
     with pytest.raises(StateError, match="completed"):
         state.requeue(info.path)
+
+
+class _FailingCommit:
+    """A connection whose next COMMIT fails (disk full, I/O error)."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.fail_next_commit = True
+
+    def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+        if sql == "COMMIT" and self.fail_next_commit:
+            self.fail_next_commit = False
+            raise sqlite3.OperationalError("disk I/O error")
+        return self._conn.execute(sql, *args)
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def test_failed_commit_rolls_back_and_leaves_the_handle_usable(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    State.open(db).close()
+    raw = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+    state = State(_FailingCommit(raw), db)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            upsert(state, make_info())
+        assert state.get(make_info().path) is None  # rolled back, nothing half-written
+        upsert(state, make_info())  # the next transaction works: no "within a transaction"
+        assert state.get(make_info().path) is not None
+    finally:
+        state.close()

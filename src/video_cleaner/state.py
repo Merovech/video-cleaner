@@ -9,6 +9,7 @@ as `Path`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import sqlite3
@@ -235,10 +236,13 @@ class State:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
+                # Inside the try: a failed COMMIT (disk full, I/O error) is rolled back too,
+                # instead of leaving the handle stuck in an open transaction.
+                conn.execute("COMMIT")
             except BaseException:
-                conn.execute("ROLLBACK")
+                with contextlib.suppress(sqlite3.Error):  # never mask the original error
+                    conn.execute("ROLLBACK")
                 raise
-            conn.execute("COMMIT")
 
     @staticmethod
     def _event(conn: sqlite3.Connection, text: str) -> None:
