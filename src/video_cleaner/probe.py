@@ -93,6 +93,9 @@ class MediaInfo:
     cover_art: int
     # Container-level bit rate in bit/s as ffprobe reported it; None when it did not.
     format_bit_rate: int | None = None
+    # Real video streams (not attached pictures) beyond `video`: alternate angles, untagged
+    # mjpeg/png tracks. Decide flags them, since muxing a new video drops the source's videos.
+    extra_video_streams: int = 0
 
     @property
     def bitrate_kbps(self) -> float:
@@ -228,6 +231,7 @@ def _build(data: Mapping[str, Any], path: Path, size: int, mtime: float) -> Medi
     audio: list[AudioStream] = []
     subtitles: list[SubtitleStream] = []
     cover_art = 0
+    extra_video = 0
     for stream in streams if isinstance(streams, list) else []:
         kind = stream.get("codec_type")
         if kind == "attachment" or (kind == "video" and _flag(stream, "attached_pic")):
@@ -235,6 +239,8 @@ def _build(data: Mapping[str, Any], path: Path, size: int, mtime: float) -> Medi
         elif kind == "video":
             if video is None:
                 video = _video_stream(stream)
+            else:
+                extra_video += 1
         elif kind == "audio":
             audio.append(_audio_stream(stream))
         elif kind == "subtitle":
@@ -251,6 +257,7 @@ def _build(data: Mapping[str, Any], path: Path, size: int, mtime: float) -> Medi
         chapters=len(chapters) if isinstance(chapters, list) else 0,
         cover_art=cover_art,
         format_bit_rate=_int_or_none(fmt.get("bit_rate")),
+        extra_video_streams=extra_video,
     )
 
 
@@ -258,7 +265,8 @@ def parse_ffprobe(data: dict[str, Any], path: Path, size: int, mtime: float) -> 
     """Turn ffprobe's JSON (``-show_format -show_streams -show_chapters``) into `MediaInfo`.
 
     Attached pictures (``disposition.attached_pic``) and ``attachment`` streams are counted in
-    ``cover_art`` and never become ``video``; ``video`` is the first other video stream.
+    ``cover_art`` and never become ``video``; ``video`` is the first other video stream and any
+    further ones are counted in ``extra_video_streams``.
     Raises `ProbeError` for a missing format section, a zero or missing duration, or streams
     too malformed to read.
     """

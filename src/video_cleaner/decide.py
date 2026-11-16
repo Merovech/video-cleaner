@@ -7,7 +7,9 @@ Pure function over `MediaInfo` and `Settings`; no I/O. The order of the checks m
    file size): never encoded and never flagged, even when HDR, Dolby Vision or interlaced.
    Remuxed only when new subtitles or a multi-part join call for it, otherwise left alone
    (MP4 and AVI included: no container conversion for its own sake).
-3. Eligible but Dolby Vision, HDR or interlaced: flag, because the encode would damage it.
+3. Eligible but Dolby Vision, HDR, interlaced or with more than one real video stream: flag,
+   because the encode would damage it (the mux takes no video from the source, so a second
+   video stream would be lost).
 4. Otherwise encode; the new video is muxed with the untouched streams, so remux is set too.
 """
 
@@ -73,6 +75,8 @@ def _flag_reasons(info: MediaInfo, video: VideoStream) -> list[str]:
         reasons.append(f"HDR (transfer {video.transfer})")
     if info.is_interlaced:
         reasons.append(f"interlaced (field order {video.field_order})")
+    if info.extra_video_streams > 0:
+        reasons.append(f"multiple video streams ({info.extra_video_streams} extra)")
     return reasons
 
 

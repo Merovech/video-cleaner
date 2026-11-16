@@ -156,6 +156,39 @@ def test_attachment_streams_count_as_cover_art_not_video() -> None:
     assert video_of(info).codec == "h264"
 
 
+def test_second_real_video_stream_counted_as_extra() -> None:
+    data = load_fixture("h264_1080p_sdr_mkv")
+    second = copy.deepcopy(data["streams"][0])
+    second["index"] = len(data["streams"])
+    second["codec_name"] = "mjpeg"
+    second["width"], second["height"] = 640, 360
+    data["streams"].append(second)
+    info = parse_ffprobe(data, Path("x.mkv"), SIZE, MTIME)
+    assert info.extra_video_streams == 1
+    assert info.cover_art == 0
+    assert video_of(info).codec == "h264"
+    assert video_of(info).width == 1920
+
+
+def test_two_extra_real_video_streams_counted() -> None:
+    data = load_fixture("h264_1080p_sdr_mkv")
+    for n in range(2):
+        extra = copy.deepcopy(data["streams"][0])
+        extra["index"] = 10 + n
+        data["streams"].append(extra)
+    assert parse_ffprobe(data, Path("x.mkv"), SIZE, MTIME).extra_video_streams == 2
+
+
+def test_attached_pic_cover_is_not_an_extra_video_stream() -> None:
+    info = parse_fixture("h264_with_cover_art_mkv")
+    assert info.cover_art == 1
+    assert info.extra_video_streams == 0
+
+
+def test_single_video_stream_has_no_extras() -> None:
+    assert parse_fixture("h264_1080p_sdr_mkv").extra_video_streams == 0
+
+
 def test_only_attached_pic_means_no_video() -> None:
     data = load_fixture("h264_with_cover_art_mkv")
     data["streams"] = [s for s in data["streams"] if s["codec_name"] != "h264"]

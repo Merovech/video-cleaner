@@ -39,6 +39,7 @@ def _info(
     dv_profile: int | None = None,
     field_order: str = "progressive",
     has_video: bool = True,
+    extra_video_streams: int = 0,
 ) -> MediaInfo:
     video = (
         VideoStream(
@@ -67,6 +68,7 @@ def _info(
         chapters=0,
         cover_art=0,
         format_bit_rate=kbps * 1000,
+        extra_video_streams=extra_video_streams,
     )
 
 
@@ -155,6 +157,35 @@ def test_no_video_stream_flagged_even_below_floor() -> None:
     assert d.action is Action.FLAG
 
 
+def test_extra_video_stream_on_encodable_file_flagged() -> None:
+    d = decide(_info(extra_video_streams=1), _settings())
+    _assert_shape(d, Action.FLAG, encode=False, remux=False)
+    assert d.reasons == ("multiple video streams (1 extra)",)
+
+
+def test_extra_video_streams_flag_wins_over_needs_subs_and_multipart() -> None:
+    d = decide(_info(extra_video_streams=2), _settings(), needs_subs=True, multipart=True)
+    _assert_shape(d, Action.FLAG, encode=False, remux=False)
+    assert d.reasons == ("multiple video streams (2 extra)",)
+
+
+def test_extra_video_streams_listed_with_other_flag_reasons() -> None:
+    d = decide(_info(field_order="tt", extra_video_streams=1), _settings())
+    assert d.reasons == ("interlaced (field order tt)", "multiple video streams (1 extra)")
+
+
+def test_no_extra_video_streams_still_encodes() -> None:
+    d = decide(_info(extra_video_streams=0), _settings())
+    _assert_shape(d, Action.ENCODE, encode=True, remux=True)
+
+
+def test_hevc_4k_with_extra_video_streams_left_alone() -> None:
+    info = _info(codec="hevc", height=2160, kbps=25000, extra_video_streams=1)
+    d = decide(info, _settings())
+    _assert_shape(d, Action.LEAVE_ALONE, encode=False, remux=False)
+    assert not any("video streams" in r for r in d.reasons)
+
+
 def test_hevc_4k_hdr_left_alone_not_flagged() -> None:
     info = _info(codec="hevc", height=2160, kbps=25000, transfer="smpte2084", dv_profile=8)
     d = decide(info, _settings())
@@ -169,6 +200,8 @@ def test_hevc_4k_hdr_left_alone_not_flagged() -> None:
         _info(height=2160, kbps=40000, transfer="smpte2084"),  # H.264 4K HDR
         _info(kbps=1800, field_order="tt"),  # interlaced below floor
         _info(kbps=1800, dv_profile=5, transfer=None),  # DV below floor
+        _info(codec="hevc", height=2160, kbps=25000, extra_video_streams=1),  # 4K HEVC, 2 videos
+        _info(kbps=1800, extra_video_streams=2),  # extra videos below floor
     ],
 )
 def test_ineligible_files_are_never_flagged(info: MediaInfo) -> None:
