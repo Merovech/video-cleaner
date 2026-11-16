@@ -210,6 +210,13 @@ def plan(
     ack: Annotated[
         bool, typer.Option("--ack", help="Acknowledge the plan last written by `plan`.")
     ] = False,
+    retry: Annotated[
+        Path | None,
+        typer.Option(
+            "--retry",
+            help="Put a file a run left alone or flagged back in the queue (surveyed path).",
+        ),
+    ] = None,
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
@@ -218,6 +225,18 @@ def plan(
     settings = _load_outside_library(config)
     _require_state(settings)
     setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
+    if retry is not None:
+        if ack:
+            _fail("give either --ack or --retry, not both")
+        try:
+            with State.open(settings.state_db) as state:
+                rec = state.requeue(retry)
+        except KeyError as exc:
+            _fail(str(exc.args[0]))
+        except StateError as exc:
+            _fail(str(exc))
+        _say(f"Requeued {rec.path}: {rec.status.value} ({rec.decision})")
+        return
     csv_path = settings.state_db.parent / planning.PLAN_CSV
     hash_path = settings.state_db.parent / planning.PLAN_HASH
     try:

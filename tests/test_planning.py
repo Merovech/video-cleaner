@@ -342,3 +342,25 @@ def test_plan_lists_at_most_20_flagged_on_the_console(tmp_path: Path) -> None:
     result = _invoke("plan", "--config", str(cfg), "-q")
     assert result.exit_code == 0, result.output
     assert "... 3 more in the CSV" in result.output
+
+
+def test_cli_plan_retry_requeues_a_run_outcome(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    with _cli_state(tmp_path) as st:
+        _populate(st)
+        st.set_status(LEFT, Status.FLAGGED, "verify failed")
+    result = _invoke("plan", "--retry", str(LEFT), "--config", str(cfg), "-q")
+    assert result.exit_code == 0, result.output
+    assert "left_alone" in result.output
+    with _cli_state(tmp_path) as st:
+        rec = st.get(LEFT)
+    assert rec is not None and (rec.status, rec.note) == (Status.LEFT_ALONE, "")
+
+
+def test_cli_plan_retry_unknown_path_exits_2(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    with _cli_state(tmp_path) as st:
+        _populate(st)
+    result = _invoke("plan", "--retry", str(tmp_path / "nope.mkv"), "--config", str(cfg), "-q")
+    assert result.exit_code == 2
+    assert "no live state record" in result.output

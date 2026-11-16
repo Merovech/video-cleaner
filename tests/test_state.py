@@ -218,6 +218,52 @@ def test_reupsert_does_not_touch_advanced_record(state: State) -> None:
     assert (rec.status, rec.decision, rec.est_saving_bytes) == (Status.COMPLETED, "encode", 100)
 
 
+@pytest.mark.parametrize(
+    ("status", "note"),
+    [
+        (Status.LEFT_ALONE, "projected saving 4% is below 10%"),
+        (Status.FLAGGED, "guard failed: worst window 71.0"),
+        (Status.FLAGGED, ""),
+        (Status.LEFT_ALONE, ""),
+    ],
+)
+def test_reupsert_keeps_run_outcome_on_encode_record(
+    state: State, status: Status, note: str
+) -> None:
+    """A run's LEFT_ALONE/FLAGGED verdict survives a re-survey of the unchanged file."""
+    info = make_info()
+    upsert(state, info, decision="encode", saving=100)
+    state.set_status(info.path, status, note)
+    upsert(state, info, decision="encode", saving=100)
+    rec = state.get(info.path)
+    assert rec is not None
+    assert (rec.status, rec.note) == (status, note)
+
+
+def test_reupsert_keeps_noted_record_in_initial_status(state: State) -> None:
+    """A note means the run touched the record, even when the status equals the initial one."""
+    info = make_info()
+    upsert(state, info, decision="flag", saving=0)
+    state.set_status(info.path, Status.FLAGGED, "output name collides with Film.mkv")
+    upsert(state, info, decision="encode", saving=100)
+    rec = state.get(info.path)
+    assert rec is not None
+    assert (rec.status, rec.decision, rec.note) == (
+        Status.FLAGGED,
+        "flag",
+        "output name collides with Film.mkv",
+    )
+
+
+def test_reupsert_refreshes_unstarted_left_alone_record(state: State) -> None:
+    info = make_info()
+    upsert(state, info, decision="leave_alone", saving=0)
+    upsert(state, info, decision="encode", saving=100)
+    rec = state.get(info.path)
+    assert rec is not None
+    assert (rec.status, rec.decision) == (Status.PENDING, "encode")
+
+
 def test_set_status_unknown_path_raises(state: State) -> None:
     with pytest.raises(KeyError):
         state.set_status(Path("/nope.mkv"), Status.QUEUED)
@@ -537,3 +583,27 @@ def test_approve_calibration_rejects_non_values(state: State, vmaf: float, crf: 
         state.approve_calibration(vmaf, crf)
     assert state.calibration() is None
     assert state.events() == []
+
+
+# --- deliberate retry of a run outcome -----------------------------------------------------
+
+
+def test_requeue_puts_run_outcome_back_to_initial_status(state: State) -> None:
+    info = make_info()
+    upsert(state, info, decision="encode", saving=100)
+    state.set_status(info.path, Status.FLAGGED, "guard failed")
+    rec = state.requeue(info.path)
+    assert (rec.status, rec.note) == (Status.PENDING, "")
+    stored = state.get(info.path)
+    assert stored is not None and (stored.status, stored.note) == (Status.PENDING, "")
+    assert "requeued" in state.events(1)[0]
+
+
+def test_requeue_refuses_completed_and_unknown(state: State) -> None:
+    info = make_info()
+    with pytest.raises(KeyError):
+        state.requeue(info.path)
+    upsert(state, info)
+    state.set_status(info.path, Status.COMPLETED, "done")
+    with pytest.raises(StateError, match="completed"):
+        state.requeue(info.path)

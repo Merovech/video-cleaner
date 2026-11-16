@@ -68,6 +68,13 @@ then the default winget and MKVToolNix install folders.
 Reruns skip files that are already done: state is keyed by path, size and modification time,
 so an overwritten original is seen as already HEVC and left alone.
 
+A run can also decide to leave a file alone or flag it (projected saving below `min_saving`,
+quality guard or verification failure, output name collision). A re-survey of the unchanged
+file keeps that outcome, so the next run does not repeat the same hours-long encode. To try such
+a file again deliberately, run `video-cleaner plan --retry <path>` with the path as surveyed:
+the file goes back to the status survey gave it (pending for an encode or remux) and the next
+`run` picks it up. A file whose size or modification time changed is planned afresh anyway.
+
 ## Settings
 
 Settings come from the defaults, then `%APPDATA%\video-cleaner\config.toml`, then environment

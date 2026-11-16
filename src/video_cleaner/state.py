@@ -61,8 +61,21 @@ _INITIAL_STATUS: dict[str, Status] = {
     "leave_alone": Status.LEFT_ALONE,
     "flag": Status.FLAGGED,
 }
-# Statuses in which a re-plan of an unchanged file may still replace the plan.
-_UNSTARTED = (Status.PENDING, Status.LEFT_ALONE, Status.FLAGGED, Status.STALE)
+
+
+def _unstarted(status: Status, decision: str, note: str) -> bool:
+    """Whether a re-plan of an unchanged file may still replace this record's plan.
+
+    True for a STALE record (its source came back) and for a record that is still exactly as
+    survey left it: initial status for its decision and no note. A LEFT_ALONE or FLAGGED status
+    set by a run (low projected saving, guard or verify failure, collision) does not count, so a
+    re-survey never sends the file through the same hours-long encode again.
+    """
+    if status is Status.STALE:
+        return True
+    return status is _INITIAL_STATUS.get(decision) and not note
+
+
 # Statuses a run passes through; a record left in one of them means the run was interrupted.
 IN_PROGRESS = (
     Status.QUEUED,
@@ -248,7 +261,8 @@ class State:
 
         A new key creates a record (initial status from *decision*) and marks any other live
         record for the path ``stale``. Re-planning an unchanged key refreshes the plan only while
-        the record has not started; a record that has advanced is left alone.
+        the record is untouched since survey (see `_unstarted`); a record a run has advanced or
+        decided on (including a run-set LEFT_ALONE/FLAGGED) is left alone.
         """
         initial = _INITIAL_STATUS.get(decision)
         if initial is None:
@@ -260,10 +274,13 @@ class State:
         parts_json = json.dumps([_key(p) for p in parts])
         with self._tx(write=True) as conn:
             existing = conn.execute(
-                "SELECT id, status FROM files WHERE path = ? AND size = ? AND mtime = ?",
+                "SELECT id, status, decision, note FROM files "
+                "WHERE path = ? AND size = ? AND mtime = ?",
                 (path, info.size, info.mtime),
             ).fetchone()
-            if existing is not None and Status(existing[1]) not in _UNSTARTED:
+            if existing is not None and not _unstarted(
+                Status(existing[1]), str(existing[2]), str(existing[3])
+            ):
                 return
             superseded = conn.execute(
                 "UPDATE files SET status = ?, updated_at = ? "
@@ -292,7 +309,7 @@ class State:
             else:
                 conn.execute(
                     "UPDATE files SET status = ?, decision = ?, reasons = ?, est_saving_bytes = ?, "
-                    "parts = ?, updated_at = ? WHERE id = ?",
+                    "parts = ?, note = '', updated_at = ? WHERE id = ?",
                     (
                         initial.value,
                         decision,
@@ -349,6 +366,36 @@ class State:
             )
             detail = f" ({note})" if note else ""
             self._event(conn, f"{key}: {row[1]} -> {status.value}{detail}")
+
+    def requeue(self, path: Path) -> FileRecord:
+        """Put the live record for *path* back to the status survey gave it, with no note.
+
+        The deliberate way to retry a file a run left alone or flagged (a re-survey keeps such
+        outcomes). Raises KeyError when there is no live record, and StateError for a completed
+        record (its output is already delivered). Returns the updated record.
+        """
+        key = _key(path)
+        with self._tx(write=True) as conn:
+            row = conn.execute(
+                "SELECT id, status, decision FROM files WHERE path = ? AND status != ? "
+                "ORDER BY id DESC LIMIT 1",
+                (key, Status.STALE.value),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no live state record for {path}")
+            if Status(row[1]) is Status.COMPLETED:
+                raise StateError(f"{path} is completed; nothing to retry")
+            initial = _INITIAL_STATUS[str(row[2])]
+            conn.execute(
+                "UPDATE files SET status = ?, note = '', updated_at = ? WHERE id = ?",
+                (initial.value, _now(), row[0]),
+            )
+            self._event(conn, f"{key}: {row[1]} -> {initial.value} (requeued)")
+            updated = conn.execute(
+                f"SELECT {_COLUMNS} FROM files WHERE id = ?",  # noqa: S608  # nosec B608
+                (row[0],),
+            ).fetchone()
+        return _record(updated)
 
     def records(self, *statuses: Status) -> list[FileRecord]:
         """Records with any of *statuses*, ordered by path (then age).
