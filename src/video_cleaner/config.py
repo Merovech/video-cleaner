@@ -7,7 +7,7 @@ import os
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import MISSING, dataclass, fields
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 ENV_PREFIX = "VC_"
@@ -36,6 +36,7 @@ X265_PRESETS = frozenset(
 
 
 LOG_FILE_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+MAX_HEARTBEAT_S = 15.0  # plan 4.4: never silent longer than 15 s
 
 
 class ConfigError(ValueError):
@@ -111,10 +112,24 @@ def _to_str(name: str, value: object) -> str:
 
 
 def _to_path(name: str, value: object) -> Path:
+    """An absolute path with no control characters.
+
+    A control character is what a TOML basic string makes of a Windows path ("D:\\temp" gives
+    a TAB); a relative path would depend on the folder the command happens to run in. Both are
+    refused. Windows forms (``D:\\x``, ``\\\\nas\\share``) count as absolute on any platform.
+    """
     if not isinstance(value, str):
         raise ConfigError(f"{name}: expected a path string, got {value!r}")
     if not value.strip():
         raise ConfigError(f"{name}: path must not be empty")
+    bad = next((c for c in value if ord(c) < 0x20 or ord(c) == 0x7F), None)
+    if bad is not None:
+        raise ConfigError(
+            f"{name}: path {value!r} contains the control character {bad!r}; use a TOML "
+            "literal string (single quotes) for Windows paths"
+        )
+    if not (Path(value).is_absolute() or PureWindowsPath(value).is_absolute()):
+        raise ConfigError(f"{name}: path {value!r} must be absolute")
     return Path(value)
 
 
@@ -154,7 +169,10 @@ def _validate(values: Mapping[str, Any]) -> None:
     _require(values["scratch_cap_bytes"] > 0, "scratch_cap_bytes must be positive")
     _require(values["min_file_size"] >= 0, "min_file_size must not be negative")
     _require(values["bitrate_floor_kbps"] >= 0, "bitrate_floor_kbps must not be negative")
-    _require(values["heartbeat_s"] > 0, "heartbeat_s must be positive")
+    _require(
+        0 < values["heartbeat_s"] <= MAX_HEARTBEAT_S,
+        f"heartbeat_s must be within (0, {MAX_HEARTBEAT_S:g}]: the console is never silent longer",
+    )
     _require(values["plain_progress_s"] > 0, "plain_progress_s must be positive")
     _require(
         values["log_file_level"] in LOG_FILE_LEVELS,
@@ -178,8 +196,10 @@ def default_config_path(env: Mapping[str, str] | None = None) -> Path | None:
 
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
-        with path.open("rb") as fh:
-            return tomllib.load(fh)
+        # utf-8-sig: Notepad and PowerShell may save the file with a byte order mark.
+        return tomllib.loads(path.read_text(encoding="utf-8-sig"))
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"config file {path} is not valid UTF-8: {exc}") from exc
     except FileNotFoundError:
         raise ConfigError(f"config file not found: {path}") from None
     except tomllib.TOMLDecodeError as exc:

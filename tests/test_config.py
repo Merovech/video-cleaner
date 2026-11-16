@@ -259,3 +259,41 @@ def test_log_file_level_default_and_rejects_unknown(tmp_path: Path) -> None:
     assert load_settings(None, _env(tmp_path)).log_file_level == "DEBUG"
     with pytest.raises(ConfigError, match="log_file_level"):
         load_settings(None, _env(tmp_path, VC_LOG_FILE_LEVEL="LOUD"))
+
+
+# --- item 16: heartbeat bound, absolute clean paths, BOM ------------------------------------
+
+
+def test_heartbeat_s_is_at_most_15(tmp_path: Path) -> None:
+    assert load_settings(None, _env(tmp_path, VC_HEARTBEAT_S="15")).heartbeat_s == 15.0
+    with pytest.raises(ConfigError, match="heartbeat_s"):
+        load_settings(None, _env(tmp_path, VC_HEARTBEAT_S="15.5"))
+
+
+@pytest.mark.parametrize("bad", ["relative/library", "library"])
+def test_path_settings_must_be_absolute(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ConfigError, match=r"library_root.*absolute"):
+        load_settings(None, _env(tmp_path, VC_LIBRARY_ROOT=bad))
+
+
+def test_path_settings_reject_control_characters(tmp_path: Path) -> None:
+    # What a TOML basic string makes of "D:\temp": a TAB instead of backslash-t.
+    cfg = _write(
+        tmp_path / "c.toml",
+        _paths_toml().replace("scratch_dir = 'D:/vc/scratch'", 'scratch_dir = "D:\\temp"'),
+    )
+    env = _env(tmp_path)
+    del env["VC_SCRATCH_DIR"]  # the file's value must be the one used
+    with pytest.raises(ConfigError, match=r"scratch_dir.*control character"):
+        load_settings(cfg, env)
+
+
+def test_unc_and_drive_paths_are_absolute(tmp_path: Path) -> None:
+    s = load_settings(None, _env(tmp_path, VC_LIBRARY_ROOT="\\\\nas\\media"))
+    assert str(s.library_root).startswith("\\\\") or s.library_root.as_posix().startswith("//")
+
+
+def test_config_file_with_utf8_bom_is_read(tmp_path: Path) -> None:
+    cfg = tmp_path / "bom.toml"
+    cfg.write_bytes(b"\xef\xbb\xbf" + (_paths_toml() + "vmaf_target = 94.0\n").encode("utf-8"))
+    assert load_settings(cfg, _env(tmp_path)).vmaf_target == 94.0
