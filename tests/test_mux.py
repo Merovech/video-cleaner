@@ -27,8 +27,20 @@ def test_mux_cmd_uses_new_video_and_source_without_video() -> None:
     assert cmd.count("--no-video") == 1
 
 
+def test_mux_cmd_new_video_contributes_only_its_video_track() -> None:
+    cmd = build_mux_cmd(_tools(), Path("out.mkv"), [Path("src.mkv")], Path("video.mkv"))
+    video_at = cmd.index(str(Path("video.mkv")))
+    # mkvmerge options apply to the file that follows them
+    assert cmd[video_at - 3 : video_at] == ["--no-chapters", "--no-global-tags", "--no-attachments"]
+    for flag in ("--no-chapters", "--no-global-tags", "--no-attachments"):
+        assert cmd.count(flag) == 1
+
+
 def test_mux_cmd_keeps_everything_else_from_the_source() -> None:
     cmd = build_mux_cmd(_tools(), Path("out.mkv"), [Path("src.mkv")], Path("video.mkv"))
+    after_source = cmd[cmd.index("--no-video") :]
+    assert after_source == ["--no-video", str(Path("src.mkv"))]
+    cmd = build_mux_cmd(_tools(), Path("out.mkv"), [Path("a.mkv"), Path("b.mkv")], None)
     for dropping in (
         "--no-audio",
         "--no-subtitles",

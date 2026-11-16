@@ -2,8 +2,9 @@
 
 Everything here is pure (arithmetic and command lists as data) except `search_crf` and
 `encode_full`, which are signature stubs held until Task 10b because no encode may run yet.
-The x265 command encodes the first video stream only: audio, subtitles, chapters,
-attachments and cover art are never mapped here; the mux step carries them over untouched.
+The x265 command encodes the first real video stream only (``0:V:0``, never an attached
+picture) and strips chapters and metadata: audio, subtitles, chapters, tags, attachments and
+cover art are left for the mux step, which copies them from the source untouched.
 """
 
 from __future__ import annotations
@@ -81,12 +82,23 @@ def interpolate_crf(
     (the nearest-end pair, extrapolated, when the target lies outside the sampled range),
     rounded half up and clamped to [*lo*, *hi*]. A pair with equal VMAF (or equal CRF) has no
     usable slope, so the middle CRF of the pair is returned, clamped. A single point returns
-    its own CRF, clamped.
+    its own CRF, clamped. An extrapolation that overflows to infinity is clamped to the bound
+    on its side.
+
+    A failed measurement is never hidden: a non-finite VMAF or target, or a CRF that is not
+    an ``int``, raises ValueError.
     """
     if not points:
         raise ValueError("points must not be empty")
     if lo > hi:
         raise ValueError(f"lo ({lo}) must not exceed hi ({hi})")
+    if not math.isfinite(target):
+        raise ValueError(f"target VMAF must be a finite number, got {target!r}")
+    for crf, vmaf in points:
+        if type(crf) is not int:
+            raise ValueError(f"CRF must be an int, got {crf!r}")
+        if not math.isfinite(vmaf):
+            raise ValueError(f"VMAF of CRF {crf} must be a finite number, got {vmaf!r}")
     ordered = sorted(points)
     if len(ordered) == 1:
         return _clamp(ordered[0][0], lo, hi)
@@ -95,8 +107,8 @@ def interpolate_crf(
     if vmaf_a == vmaf_b or crf_a == crf_b:
         return middle
     estimate = crf_a + (target - vmaf_a) * (crf_b - crf_a) / (vmaf_b - vmaf_a)
-    if not math.isfinite(estimate):
-        return middle
+    if math.isinf(estimate):  # finite inputs cannot give NaN, only an overflowing slope
+        return hi if estimate > 0 else lo
     return _clamp(_round_half_up(estimate), lo, hi)
 
 
@@ -124,9 +136,11 @@ def build_x265_cmd(
     """ffmpeg argument list encoding the first video stream of *src* to 10-bit x265.
 
     ``-ss`` / ``-t`` (when given) are placed before ``-i`` so ffmpeg seeks the input and
-    limits it, which is how sample windows are cut. Only ``0:v:0`` is mapped and audio and
-    subtitles are disabled, so cover art, attachments, data streams and chapters never reach
-    the output. Progress goes to stdout as ``-progress pipe:1`` key/value blocks.
+    limits it, which is how sample windows are cut. Only ``0:V:0`` is mapped (capital V:
+    the first real video stream, never an attached cover picture), audio and subtitles are
+    disabled, and ``-map_chapters -1`` / ``-map_metadata -1`` stop ffmpeg's default copy of
+    chapters and global/stream tags, so the output holds the bare video track for the mux.
+    Progress goes to stdout as ``-progress pipe:1`` key/value blocks.
     """
     if not X265_CRF_MIN <= crf <= X265_CRF_MAX:
         raise ValueError(f"crf must be within {X265_CRF_MIN}..{X265_CRF_MAX}, got {crf}")
@@ -143,7 +157,11 @@ def build_x265_cmd(
         "-i",
         str(src),
         "-map",
-        "0:v:0",
+        "0:V:0",
+        "-map_chapters",
+        "-1",
+        "-map_metadata",
+        "-1",
         "-c:v",
         "libx265",
         "-preset",
@@ -192,7 +210,8 @@ def encode_full(
     """Encode the whole video stream of ``info.path`` to *dst* at *crf*. HELD until Task 10b.
 
     Intended behaviour: run `build_x265_cmd` (no window) through `run_tool` with the x265
-    progress parser and the reporter. Video only: ``0:v:0`` is mapped, so audio, subtitles,
-    chapters, attachments and cover art are left for the mux step to copy untouched.
+    progress parser and the reporter. Video only: ``0:V:0`` is mapped and chapters and metadata
+    are stripped, so audio, subtitles, chapters, tags, attachments and cover art are left for
+    the mux step to copy from the source untouched.
     """
     raise NotImplementedError("held: Task 10b")

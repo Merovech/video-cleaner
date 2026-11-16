@@ -150,9 +150,27 @@ def test_interpolate_crf_rising_vmaf_with_crf_still_returns_a_clamped_crf() -> N
     assert 16 <= interpolate_crf([(20, 94.0), (24, 96.0)], 95.0) <= 24
 
 
-def test_interpolate_crf_overflowing_slope_falls_back_to_middle() -> None:
-    # A denormal VMAF difference makes the estimate infinite; the middle is used instead.
-    assert interpolate_crf([(20, 0.0), (24, 5e-324)], 1.0) == 22
+def test_interpolate_crf_overflowing_slope_clamps_to_the_extrapolated_side() -> None:
+    # A denormal VMAF difference makes the extrapolation infinite: it is clamped, not hidden.
+    assert interpolate_crf([(20, 0.0), (24, 5e-324)], 1.0) == 24
+    assert interpolate_crf([(20, 5e-324), (24, 0.0)], 1.0) == 16
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_interpolate_crf_rejects_non_finite_vmaf(bad: float) -> None:
+    with pytest.raises(ValueError, match="VMAF"):
+        interpolate_crf([(20, bad), (24, 94.0)], 95.0)
+
+
+def test_interpolate_crf_rejects_non_finite_target() -> None:
+    with pytest.raises(ValueError, match="target"):
+        interpolate_crf([(20, 96.0), (24, 94.0)], float("nan"))
+
+
+@pytest.mark.parametrize("bad_crf", [20.5, True, "20"])
+def test_interpolate_crf_rejects_non_int_crf(bad_crf: object) -> None:
+    with pytest.raises(ValueError, match="CRF"):
+        interpolate_crf([(bad_crf, 96.0), (24, 94.0)], 95.0)  # type: ignore[list-item]
 
 
 def test_interpolate_crf_rejects_inverted_bounds() -> None:
@@ -194,7 +212,7 @@ def test_x265_cmd_has_required_flags() -> None:
     assert cmd[0] == str(FFMPEG)
     assert _contains_run(cmd, ["-c:v", "libx265", "-preset", "slow", "-crf", "22"])
     assert _contains_run(cmd, ["-pix_fmt", "yuv420p10le"])
-    assert _contains_run(cmd, ["-map", "0:v:0"])
+    assert _contains_run(cmd, ["-map", "0:V:0"])
     assert _contains_run(cmd, ["-an", "-sn"])
     assert _contains_run(cmd, ["-progress", "pipe:1", "-nostats"])
     assert "-y" in cmd
@@ -250,11 +268,26 @@ def test_x265_cmd_start_zero_is_still_emitted() -> None:
 def test_x265_cmd_never_maps_cover_art() -> None:
     cmd = build_x265_cmd(_tools(), Path("in.mkv"), Path("out.mkv"), 22, _settings())
     maps = [cmd[i + 1] for i, part in enumerate(cmd) if part == "-map"]
-    assert maps == ["0:v:0"]  # exactly one explicit video stream: no 0:v, 0, 0:t, 0:d, 0:s, 0:a
-    for forbidden in ("-attach", "-c", "-c:a", "-c:s", "-c:t", "-c:d", "-map_chapters", "copy"):
+    # Capital V: the first real video stream, never an attached picture (lower-case v matches
+    # attached pics too). Exactly one map: no 0:v, 0, 0:t, 0:d, 0:s, 0:a.
+    assert maps == ["0:V:0"]
+    for forbidden in ("-attach", "-c", "-c:a", "-c:s", "-c:t", "-c:d", "copy"):
         assert forbidden not in cmd
     assert "-an" in cmd
     assert "-sn" in cmd
+
+
+def test_x265_cmd_drops_chapters_and_metadata_from_the_encode() -> None:
+    # The mux step takes chapters and tags from the source; the encode must carry none, or
+    # mkvmerge writes a duplicate chapter edition and stale track statistics.
+    cmd = build_x265_cmd(
+        _tools(), Path("in.mkv"), Path("out.mkv"), 22, _settings(), start_s=5.0, length_s=30.0
+    )
+    assert _contains_run(cmd, ["-map_chapters", "-1"])
+    assert _contains_run(cmd, ["-map_metadata", "-1"])
+    # output options: after the input, before the output path
+    assert cmd.index("-i") < cmd.index("-map_chapters") < len(cmd) - 1
+    assert cmd.index("-i") < cmd.index("-map_metadata") < len(cmd) - 1
 
 
 def test_x265_cmd_keeps_odd_paths_as_single_arguments() -> None:
