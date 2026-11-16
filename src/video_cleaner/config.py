@@ -151,8 +151,13 @@ def _validate(values: Mapping[str, Any]) -> None:
     )
 
 
-def _default_config_path(env: Mapping[str, str]) -> Path | None:
-    appdata = env.get("APPDATA")
+def default_config_path(env: Mapping[str, str] | None = None) -> Path | None:
+    """The config file `load_settings` reads when no path is given, or None without APPDATA.
+
+    The single source of this rule: `doctor` checks the permissions of the same file.
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    appdata = environ.get("APPDATA")
     return Path(appdata) / APP_DIR_NAME / "config.toml" if appdata else None
 
 
@@ -187,7 +192,7 @@ def load_settings(
         file_path: Path | None = config_path
         explicit = True
     else:
-        file_path = _default_config_path(environ)
+        file_path = default_config_path(environ)
         explicit = False
     if file_path is not None and (explicit or file_path.is_file()):
         table = _read_toml(file_path)

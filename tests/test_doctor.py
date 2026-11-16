@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from video_cleaner import doctor
 from video_cleaner.cli import app
-from video_cleaner.config import Settings
+from video_cleaner.config import Settings, default_config_path, load_settings
 from video_cleaner.doctor import Check, prune_logs, run_doctor
 
 ENCODERS_OK = """Encoders:
@@ -409,6 +409,46 @@ def test_doctor_icacls_failure_is_a_warning(tmp_path: Path) -> None:
     check = _run(tmp_path, config_path=config, runner=runner)["config permissions"]
     assert check.ok is False and not check.required
     assert "Access is denied" in check.detail
+
+
+def test_doctor_checks_the_config_file_load_settings_reads(tmp_path: Path) -> None:
+    appdata = tmp_path / "appdata"
+    config = appdata / "video-cleaner" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text(_config(tmp_path).read_text(encoding="utf-8"), encoding="utf-8")
+    env = {**_env(tmp_path), "APPDATA": str(appdata)}
+    settings = load_settings(env=env)
+    assert settings.library_root == tmp_path / "library"  # load_settings read this file
+    assert default_config_path(env) == config
+    seen: list[list[str]] = []
+    fake = FakeRunner()
+
+    def runner(cmd: Sequence[str]) -> tuple[int, str]:
+        seen.append(list(cmd))
+        return fake(cmd)
+
+    run_doctor(settings, env=env, runner=runner, disk_usage=_usage(10**12), windows=True)
+    assert ["icacls", str(config)] in seen
+
+
+def test_cli_doctor_checks_the_default_config_it_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    appdata = tmp_path / "appdata"
+    config = appdata / "video-cleaner" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text(_config(tmp_path).read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+    received: list[object] = []
+
+    def fake(settings: Settings, **kwargs: object) -> list[Check]:
+        received.append(kwargs.get("config_path"))
+        return [Check("python", True, "3.12")]
+
+    monkeypatch.setattr(doctor, "run_doctor", fake)
+    result = CliRunner().invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert received == [config]
 
 
 def test_default_runner_captures_output() -> None:

@@ -8,7 +8,7 @@ import typer
 from rich.console import Console
 
 from video_cleaner import doctor as doctor_mod
-from video_cleaner.config import ConfigError, load_settings
+from video_cleaner.config import ConfigError, default_config_path, load_settings
 
 app = typer.Typer(
     name="video-cleaner",
@@ -41,12 +41,14 @@ def doctor(
     ] = None,
 ) -> None:
     """Check the environment (ffmpeg, libx265, libvmaf, paths)."""
+    # Resolve once with config's own rule, so the permission check covers the loaded file.
+    # The explicit/default distinction is kept: a missing default file is not an error.
+    config_path = config if config is not None else default_config_path(os.environ)
     try:
-        settings = load_settings(config)
+        settings = load_settings(config, os.environ)
     except ConfigError as exc:
         _err.print(f"config error: {exc}", markup=False, highlight=False)
         raise typer.Exit(code=2) from None
-    config_path = config if config is not None else doctor_mod.default_config_path(os.environ)
     checks = doctor_mod.run_doctor(settings, config_path=config_path)
     for check in checks:
         typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")

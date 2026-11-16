@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_cleaner.config import APP_DIR_NAME, Settings
+from video_cleaner.config import Settings, default_config_path
 from video_cleaner.tools import ToolNotFound, _locate
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
@@ -271,11 +271,6 @@ class _Doctor:
         yield Check("keyring", found, detail, required=False)
 
 
-def default_config_path(env: Mapping[str, str]) -> Path | None:
-    appdata = env.get("APPDATA")
-    return Path(appdata) / APP_DIR_NAME / "config.toml" if appdata else None
-
-
 def run_doctor(
     settings: Settings,
     *,
@@ -289,7 +284,8 @@ def run_doctor(
 ) -> list[Check]:
     """Run every environment check and return the results; never raises.
 
-    *config_path* defaults to ``%APPDATA%\\video-cleaner\\config.toml`` from *env*. The other
+    *config_path* defaults to `config.default_config_path` for *env*, the file `load_settings`
+    reads when it is given no path. The other
     keyword arguments exist for tests and default to the real system.
     """
     environ: Mapping[str, str] = os.environ if env is None else env
