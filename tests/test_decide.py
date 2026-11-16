@@ -31,6 +31,7 @@ def _info(
     *,
     codec: str = "h264",
     height: int = 1080,
+    width: int | None = None,
     kbps: int = 8000,
     size: int = 6 * GIB,
     container: str = MKV,
@@ -42,7 +43,7 @@ def _info(
     video = (
         VideoStream(
             codec=codec,
-            width=height * 16 // 9,
+            width=height * 16 // 9 if width is None else width,
             height=height,
             pix_fmt="yuv420p",
             fps=23.976,
@@ -176,10 +177,45 @@ def test_ineligible_files_are_never_flagged(info: MediaInfo) -> None:
 
 
 def test_height_boundary_for_4k() -> None:
-    assert decide(_info(height=1999), _settings()).action is Action.ENCODE
-    d = decide(_info(height=2000), _settings())
+    assert decide(_info(width=2880, height=1999), _settings()).action is Action.ENCODE
+    d = decide(_info(width=2880, height=2000), _settings())
     assert d.action is Action.LEAVE_ALONE
-    assert any("2000" in r for r in d.reasons)
+    assert "4K/UHD (2880x2000)" in d.reasons
+
+
+def test_width_boundary_for_4k() -> None:
+    assert decide(_info(width=2999, height=1250), _settings()).action is Action.ENCODE
+    d = decide(_info(width=3000, height=1250), _settings())
+    assert d.action is Action.LEAVE_ALONE
+    assert "4K/UHD (3000x1250)" in d.reasons
+
+
+@pytest.mark.parametrize("height", [1600, 1608])
+def test_cropped_uhd_scope_h264_left_alone(height: int) -> None:
+    info = _info(width=3840, height=height, kbps=40000)
+    d = decide(info, _settings())
+    _assert_shape(d, Action.LEAVE_ALONE, encode=False, remux=False)
+    assert f"4K/UHD (3840x{height})" in d.reasons
+    _assert_shape(
+        decide(info, _settings(), needs_subs=True), Action.REMUX, encode=False, remux=True
+    )
+
+
+def test_cropped_uhd_scope_h264_hdr_left_alone_not_flagged() -> None:
+    info = _info(width=3840, height=1600, kbps=40000, transfer="smpte2084", dv_profile=7)
+    d = decide(info, _settings())
+    _assert_shape(d, Action.LEAVE_ALONE, encode=False, remux=False)
+
+
+def test_1440p_h264_above_floor_still_encodes() -> None:
+    d = decide(_info(width=2560, height=1440, kbps=16000), _settings())
+    _assert_shape(d, Action.ENCODE, encode=True, remux=True)
+
+
+def test_1080p_not_treated_as_4k() -> None:
+    d = decide(_info(width=1920, height=1080), _settings())
+    _assert_shape(d, Action.ENCODE, encode=True, remux=True)
+    assert not any("4K" in r for r in d.reasons)
 
 
 def test_av1_left_alone() -> None:
@@ -232,7 +268,7 @@ def test_reasons_explain_each_decision() -> None:
         assert d.reasons, name
         assert all(r.strip() for r in d.reasons), name
     assert any("hevc" in r for r in cases["leave"].reasons)
-    assert any("2160" in r for r in cases["leave"].reasons)
+    assert "4K/UHD (3840x2160)" in cases["leave"].reasons
     assert any("subtitles" in r for r in cases["remux"].reasons)
     assert any("8000 kbps" in r for r in cases["encode"].reasons)
 

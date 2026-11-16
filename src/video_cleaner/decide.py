@@ -20,6 +20,7 @@ from video_cleaner.config import Settings
 from video_cleaner.probe import MediaInfo, VideoStream
 
 EFFICIENT_CODECS = frozenset({"hevc", "av1"})
+UHD_MIN_WIDTH = 3000
 UHD_MIN_HEIGHT = 2000
 
 
@@ -43,8 +44,9 @@ def _no_encode_reasons(info: MediaInfo, video: VideoStream, settings: Settings) 
     codec = video.codec.lower()
     if codec in EFFICIENT_CODECS:
         reasons.append(f"already {codec}")
-    if video.height >= UHD_MIN_HEIGHT:
-        reasons.append(f"4K (height {video.height} >= {UHD_MIN_HEIGHT})")
+    # Either dimension: cropped UHD scope titles are 3840x1600 or so, well under 2000 lines.
+    if video.width >= UHD_MIN_WIDTH or video.height >= UHD_MIN_HEIGHT:
+        reasons.append(f"4K/UHD ({video.width}x{video.height})")
     kbps = info.bitrate_kbps
     if kbps < settings.bitrate_floor_kbps:
         reasons.append(f"bitrate {kbps:.0f} kbps below floor {settings.bitrate_floor_kbps} kbps")
