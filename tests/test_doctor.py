@@ -259,6 +259,37 @@ def test_doctor_warns_on_loose_windows_acl(tmp_path: Path) -> None:
     assert tight["config permissions"].ok is True
 
 
+SYSTEM_TOOLS = ("icacls", "nvidia-smi")
+
+
+def test_doctor_runs_windows_system_tools_by_full_path(tmp_path: Path) -> None:
+    # A bare "icacls" is also looked up in the current directory (CreateProcess search
+    # order), so a planted icacls.exe there would run instead of the real one.
+    config = tmp_path / "config.toml"
+    config.write_text("", encoding="utf-8")
+    runner = FakeRunner()
+    system_root = tmp_path / "Windows"
+    env = {**_env(tmp_path), "SystemRoot": str(system_root)}
+    _run(tmp_path, config_path=config, runner=runner, env=env)
+    called = {Path(c[0]).stem: c[0] for c in runner.calls if Path(c[0]).stem in SYSTEM_TOOLS}
+    assert called == {n: str(system_root / "System32" / f"{n}.exe") for n in SYSTEM_TOOLS}
+
+
+def test_doctor_system_tools_default_root_without_systemroot(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text("", encoding="utf-8")
+    runner = FakeRunner()
+    _run(tmp_path, config_path=config, runner=runner)
+    icacls = next(c[0] for c in runner.calls if Path(c[0]).stem == "icacls")
+    assert icacls == str(Path("C:/Windows") / "System32" / "icacls.exe")
+
+
+def test_doctor_runs_posix_tools_by_name(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    _run(tmp_path, runner=runner, windows=False, file_mode=lambda p: 0o600)
+    assert [c[0] for c in runner.calls if Path(c[0]).stem == "nvidia-smi"] == ["nvidia-smi"]
+
+
 @pytest.mark.parametrize(
     ("acl", "loose"),
     [
@@ -411,7 +442,7 @@ def test_doctor_icacls_failure_is_a_warning(tmp_path: Path) -> None:
     config.write_text("", encoding="utf-8")
 
     def runner(cmd: Sequence[str]) -> tuple[int, str]:
-        if cmd[0] == "icacls":
+        if Path(cmd[0]).stem == "icacls":
             return 5, "Access is denied.\n"
         return FakeRunner()(cmd)
 
@@ -437,7 +468,7 @@ def test_doctor_checks_the_config_file_load_settings_reads(tmp_path: Path) -> No
         return fake(cmd)
 
     run_doctor(settings, env=env, runner=runner, disk_usage=_usage(10**12), windows=True)
-    assert ["icacls", str(config)] in seen
+    assert [c[1:] for c in seen if Path(c[0]).stem == "icacls"] == [[str(config)]]
 
 
 def test_cli_doctor_checks_the_default_config_it_loaded(

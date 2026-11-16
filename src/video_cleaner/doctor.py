@@ -33,6 +33,9 @@ RUNNER_TIMEOUT_S = 20.0
 SUPPORTED_PYTHON = ((3, 11), (3, 12))
 LOG_GLOB = "run-*.log"
 
+# Used when SystemRoot is not set (it always is on a normal Windows session).
+DEFAULT_SYSTEM_ROOT = "C:/Windows"
+
 # Principals that mean "other users on this machine" and read-type rights (icacls notation).
 _BROAD_PRINCIPALS = ("Everyone", "BUILTIN\\Users", "NT AUTHORITY\\Authenticated Users")
 _READ_RIGHTS = frozenset({"F", "M", "RX", "R", "GR", "GA", "RD"})
@@ -146,6 +149,14 @@ class _Doctor:
         except (OSError, subprocess.SubprocessError) as exc:
             return -1, f"{type(exc).__name__}: {exc}"
 
+    def _system_tool(self, name: str) -> str:
+        """*name* on POSIX (PATH only); on Windows the full path in ``System32``, because a bare
+        name is also looked up in the current directory, where a planted copy would run."""
+        if not self.windows:
+            return name
+        root = self.env.get("SystemRoot") or DEFAULT_SYSTEM_ROOT
+        return str(Path(root) / "System32" / f"{name}.exe")
+
     def python(self) -> Iterator[Check]:
         major, minor = self.python_version
         version = f"{major}.{minor}"
@@ -191,7 +202,11 @@ class _Doctor:
 
     def gpu(self) -> Iterator[Check]:
         code, output = self._run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"]
+            [
+                self._system_tool("nvidia-smi"),
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader",
+            ]
         )
         line = _first_line(output)
         if code == 0 and line:
@@ -240,7 +255,7 @@ class _Doctor:
             yield Check(name, True, "no config file (defaults and VC_* only)", required=False)
             return
         if self.windows:
-            code, output = self._run(["icacls", str(path)])
+            code, output = self._run([self._system_tool("icacls"), str(path)])
             if code != 0:
                 detail = f"icacls failed (exit {code}): {_first_line(output)}"
                 yield Check(name, False, detail, required=False)
