@@ -491,6 +491,15 @@ def status(config: ConfigOption = None) -> None:
 def _print_results(results: planning.ResultsReport, csv_path: Path) -> None:
     _say(f"Completed: {len(results.entries)}")
     _say(f"Saved: {_gib(results.bytes_saved)}")
+    if results.unchanged:
+        tally = {v: results.unchanged.count(v) for v in planning.UNCHANGED_VERDICTS}
+        _say(
+            "Original unchanged: "
+            + ", ".join(f"{verdict} {n}" for verdict, n in tally.items())
+            + " (only a 'yes' entry may replace its original)"
+        )
+        for entry, verdict in zip(results.entries, results.unchanged, strict=True):
+            _say(f"  {verdict}: {entry.completed}")
     _say(f"Left alone: {results.left_alone}")
     _say(f"Flagged: {len(results.flagged)}")
     for path, reason in results.flagged:
@@ -525,7 +534,7 @@ def report(
         _fail(f"manifest unreadable: {exc}")
     try:
         with State.open(settings.state_db) as state:
-            results = planning.build_results(entries, state)
+            results = planning.build_results(entries, state, library_root=settings.library_root)
         planning.write_results_csv(results, csv_path)
     except (planning.PlanError, StateError) as exc:
         _fail(str(exc))

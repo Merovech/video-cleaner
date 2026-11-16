@@ -278,3 +278,76 @@ def test_report_refuses_outputs_in_library(tmp_path: Path, field: str) -> None:
     assert result.exit_code == 2
     assert "library root" in result.output
     assert os.listdir(library) == []
+
+
+# --- original-unchanged check before the nightly overwrite ---------------------------------
+
+
+def _real_original(lib: Path, name: str, data: bytes) -> tuple[Path, int, float]:
+    path = lib / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    st = path.stat()
+    return path, st.st_size, st.st_mtime
+
+
+def _entry(tmp_path: Path, originals: list[tuple[Path, int, float]], name: str) -> ManifestEntry:
+    return ManifestEntry(
+        original=tuple(p for p, _, _ in originals),
+        original_sizes=tuple(s for _, s, _ in originals),
+        original_mtimes=tuple(m for _, _, m in originals),
+        completed=tmp_path / "completed" / name,
+        completed_size=1,
+        vmaf_mean=None,
+        vmaf_worst=None,
+        crf=None,
+        verified=True,
+        action="remux",
+    )
+
+
+def test_report_says_per_entry_whether_the_original_is_unchanged(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    lib = tmp_path / "library"
+    same = _real_original(lib, "Same.avi", b"same")
+    changed_path, size, mtime = _real_original(lib, "Changed.avi", b"before")
+    gone = (lib / "Gone.avi", 5, 1.0)
+    entries = [
+        _entry(tmp_path, [same], "Same.mkv"),
+        _entry(tmp_path, [(changed_path, size, mtime)], "Changed.mkv"),
+        _entry(tmp_path, [gone], "Gone.mkv"),
+    ]
+    changed_path.write_bytes(b"after, longer")
+    write_manifest(tmp_path / "completed" / "manifest.csv", entries)
+    with _state(tmp_path):
+        pass
+    result = _invoke("report", "--config", str(cfg))
+    assert result.exit_code == 0, result.output
+    rows = {Path(r["completed"]).name: r for r in _read(tmp_path / "appdata" / "report.csv")}
+    assert rows["Same.mkv"]["original_unchanged"] == "yes"
+    assert rows["Changed.mkv"]["original_unchanged"] == "no"
+    assert rows["Gone.mkv"]["original_unchanged"] == "no"
+    out = " ".join(result.output.split())
+    assert "Original unchanged: yes 1, no 2, unknown 0" in out
+    assert f"no: {tmp_path / 'completed' / 'Changed.mkv'}" in out
+    assert f"yes: {tmp_path / 'completed' / 'Same.mkv'}" in out
+
+
+def test_original_check_is_unknown_when_library_is_unreachable(tmp_path: Path) -> None:
+    lib = tmp_path / "library"  # never created: unreachable
+    entries = [_entry(tmp_path, [(lib / "a.avi", 1, 1.0)], "a.mkv")]
+    assert planning.originals_unchanged(entries, lib) == ("unknown",)
+
+
+def test_original_check_is_unknown_on_other_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lib = tmp_path / "library"
+    lib.mkdir()
+    entries = [_entry(tmp_path, [(lib / "a.avi", 1, 1.0)], "a.mkv")]
+
+    def denied(entry: ManifestEntry) -> bool:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(planning, "check_unchanged", denied)
+    assert planning.originals_unchanged(entries, lib) == ("unknown",)

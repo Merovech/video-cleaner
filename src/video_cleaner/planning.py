@@ -24,7 +24,7 @@ from pathlib import Path
 
 from video_cleaner.atomicio import write_csv_atomic, write_text_atomic
 from video_cleaner.decide import Action
-from video_cleaner.manifest import ManifestEntry
+from video_cleaner.manifest import ManifestEntry, check_unchanged
 from video_cleaner.multipart import find_part_groups
 from video_cleaner.state import FileRecord, State, Status
 
@@ -53,7 +53,12 @@ REPORT_COLUMNS = (
     "vmaf_worst",
     "crf",
     "action",
+    "original_unchanged",
 )
+UNCHANGED_YES = "yes"
+UNCHANGED_NO = "no"
+UNCHANGED_UNKNOWN = "unknown"
+UNCHANGED_VERDICTS = (UNCHANGED_YES, UNCHANGED_NO, UNCHANGED_UNKNOWN)
 # Said for a record that somehow carries no reason, so every row explains itself.
 _DEFAULT_REASON = {
     Action.ENCODE.value: "encode candidate",
@@ -300,6 +305,8 @@ class ResultsReport:
     left_alone: int
     flagged: tuple[tuple[Path, str], ...]
     retry: tuple[tuple[Path, str], ...]
+    # Per entry: are its originals still exactly as recorded? "yes", "no" or "unknown".
+    unchanged: tuple[str, ...] = ()
 
 
 def _saving_pct(entry: ManifestEntry) -> float:
@@ -307,10 +314,31 @@ def _saving_pct(entry: ManifestEntry) -> float:
     return 0.0 if original <= 0 else 100.0 * (original - entry.completed_size) / original
 
 
-def build_results(entries: Sequence[ManifestEntry], state: State) -> ResultsReport:
+def originals_unchanged(entries: Sequence[ManifestEntry], library_root: Path) -> tuple[str, ...]:
+    """Per entry, whether its originals still have the recorded size and mtime (read-only).
+
+    "yes" means the completed file may replace them; "no" means an original changed or is gone
+    (the completed file is stale and must not be placed); "unknown" means it could not be
+    checked (the library root is unreachable, or a stat failed other than "not found").
+    """
+    if not library_root.is_dir():
+        return tuple(UNCHANGED_UNKNOWN for _ in entries)
+    verdicts: list[str] = []
+    for entry in entries:
+        try:
+            verdicts.append(UNCHANGED_YES if check_unchanged(entry) else UNCHANGED_NO)
+        except OSError:
+            verdicts.append(UNCHANGED_UNKNOWN)
+    return tuple(verdicts)
+
+
+def build_results(
+    entries: Sequence[ManifestEntry], state: State, *, library_root: Path | None = None
+) -> ResultsReport:
     """Totals of what was completed (from the manifest) and what was not (from the state).
 
-    Multi-part member records and STALE history are not counted as left-alone files.
+    Multi-part member records and STALE history are not counted as left-alone files. With
+    *library_root*, every entry also gets its `originals_unchanged` verdict.
     """
     records = state.records()
     members = group_members(records)
@@ -325,6 +353,7 @@ def build_results(entries: Sequence[ManifestEntry], state: State) -> ResultsRepo
         left_alone=sum(1 for r in live if r.status is Status.LEFT_ALONE),
         flagged=tuple((r.path, why(r)) for r in live if r.status is Status.FLAGGED),
         retry=tuple((r.path, why(r)) for r in live if r.status is Status.RETRY),
+        unchanged=() if library_root is None else originals_unchanged(entries, library_root),
     )
 
 
@@ -333,7 +362,8 @@ def _optional(value: float | int | None) -> object:
 
 
 def write_results_csv(results: ResultsReport, path: Path) -> None:
-    """One row per completed file: sizes, saving %, VMAF, CRF and action."""
+    """One row per completed file: sizes, saving %, VMAF, CRF, action, original unchanged."""
+    verdicts = results.unchanged or tuple("" for _ in results.entries)
     _write_csv(
         path,
         REPORT_COLUMNS,
@@ -348,7 +378,8 @@ def write_results_csv(results: ResultsReport, path: Path) -> None:
                 _optional(e.vmaf_worst),
                 _optional(e.crf),
                 e.action,
+                verdict,
             ]
-            for e in results.entries
+            for e, verdict in zip(results.entries, verdicts, strict=True)
         ),
     )

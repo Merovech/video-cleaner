@@ -36,7 +36,7 @@ activated virtual environment). `--help` works on every command.
 | `calibrate --approve --vmaf-target X --crf-max Y` | Approves a VMAF target (`guard_mean_floor` to 100) and a CRF ceiling (`crf_min` to 51). A run uses these instead of the config's `vmaf_target` and `crf_max`. Refused until a `calibrate --samples` sweep has finished. |
 | `run [--until HH:MM] [--max-hours N] [--path X]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. |
 | `status` | Shows the number of files per status, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
-| `report [--output FILE]` | Writes the results so far to `report.csv` beside the state database (or `FILE`) and prints a summary. |
+| `report [--output FILE]` | Writes the results so far to `report.csv` beside the state database (or `FILE`) and prints a summary, including for every manifest entry whether its original(s) are still unchanged (run it before overwriting originals). |
 
 **Current state (Phase 1, hold):** `doctor`, `survey`, `plan`, `status` and `report` work.
 `run` and `calibrate --samples` refuse with `held: Task 10b` (exit 1) until the encode, CRF search
@@ -91,7 +91,9 @@ then the default winget and MKVToolNix install folders.
 `manifest.csv` accumulates: every run appends the files it delivered, and rows are never removed
 except to repair an interrupted delivery (see below). `original_mtime` is the original's
 modification time as a float of seconds since the epoch (what `os.stat` reports), so compare it
-numerically, not as a date string. After you have overwritten the originals of some rows on the
+numerically, not as a date string. `video-cleaner report` does this check for you: it prints
+`yes`/`no`/`unknown` per completed file and writes it to the `original_unchanged` column of
+`report.csv`; only a `yes` file may replace its original(s). After you have overwritten the originals of some rows on the
 NAS, you may move or delete those completed files; the rows can stay (a row whose record is
 completed and whose file is gone is left as history) or you can archive the manifest and start a
 new one between runs. `completed_dir\calibration` holds calibration clips for viewing only:
