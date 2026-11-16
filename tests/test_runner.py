@@ -1349,6 +1349,7 @@ def _invoke_run(
     monkeypatch.setattr(runner_module, "run_queue", fake_run_queue)
     monkeypatch.setattr(cli_module, "locate_tools", lambda: TOOLS)
     config = _cli_config(tmp_path)
+    State.open(tmp_path / "appdata" / "state.db").close()  # `run` needs a surveyed state
     result = CliRunner().invoke(cli_module.app, ["run", "--config", str(config), *args])
     return result, calls
 
@@ -1662,9 +1663,9 @@ def test_run_refused_without_calibration_approval(
         fakes = Fakes()
         with pytest.raises(CalibrationNotApproved, match="calibrate"):
             _run(settings, state, fakes, ack=False)
-        # Raised before the held check too: the default (held) pipeline gets the same answer.
-        with pytest.raises(CalibrationNotApproved):
-            run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
+        # The held check comes first (fix list item 20): the default pipeline says "held".
+        held = run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
+        assert held.stop_reason == HELD_REASON
         assert fakes.calls == []
         assert _status(state, src).status is Status.PENDING
         assert len(state.events(10_000)) == events
@@ -2164,3 +2165,21 @@ def test_requeue_resets_attempts(settings: Settings, state: State) -> None:
     assert _status(state, a).attempts == 1
     state.requeue(a)
     assert _status(state, a).attempts == 0
+
+
+def test_held_is_reported_before_plan_ack_and_calibration(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    with State.open(settings.state_db) as state:  # no ack, no calibration
+        summary = run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
+    assert summary.stop_reason == HELD_REASON
+
+
+def test_cli_run_without_state_database_exits_2_and_creates_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner_module, "run_queue", lambda *a, **k: _summary())
+    config = _cli_config(tmp_path)
+    result = CliRunner().invoke(cli_module.app, ["run", "--config", str(config)])
+    assert result.exit_code == 2
+    assert "survey" in result.output
+    assert not (tmp_path / "appdata").exists()

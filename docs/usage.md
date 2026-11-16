@@ -49,15 +49,16 @@ and VMAF stages are enabled.
 
 Exit codes: 0 success; 1 a run or calibration that stopped (including `held: Task 10b`) or a
 failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,
-an output overlapping the library, another run active, missing state database) or a
+an output overlapping the library, another run active, no state database yet) or a
 configuration error; 130 interrupted with Ctrl+C.
 
 `doctor` checks: Python 3.11 or 3.12; ffmpeg found and built with `libx265` and `libvmaf`
 (`hevc_nvenc` is informational); ffprobe and mkvmerge found; an NVIDIA GPU visible
 (informational); free space on the scratch drive at least `scratch_cap_bytes`; `library_root`
 readable; the state database, log folder, `completed_dir` and `scratch_dir` neither inside the
-library nor containing it ("library overlap"); `completed_dir` and `scratch_dir` writable; the config
-file not readable by other users (informational); `keyring` importable (informational, needed
+library nor containing it ("library overlap"); `completed_dir` and `scratch_dir` writable (a
+missing one is reported as "does not exist (will be created)"; `doctor` creates nothing); the
+config file not readable by other users (informational); `keyring` importable (informational, needed
 from Phase 2). Tools are found through `VC_FFMPEG` / `VC_FFPROBE` / `VC_MKVMERGE`, then `PATH`,
 then the default winget and MKVToolNix install folders.
 

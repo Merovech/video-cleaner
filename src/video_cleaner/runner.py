@@ -1032,6 +1032,13 @@ def run_queue(
     current record in its in-progress status (the next run retries it), cleans its scratch and
     propagates.
     """
+    # Held first: nobody should be sent through plan --ack and calibrate --approve only to be
+    # told the run cannot start anyway.
+    pipeline = pipeline or Pipeline()
+    held = pipeline.held_stages()
+    if held:
+        _log.warning("run refused: %s (%s still held)", HELD_REASON, ", ".join(held))
+        return RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
     acknowledged = state.plan_acknowledged()
     if acknowledged is None:
         raise PlanNotAcknowledged(
@@ -1043,11 +1050,6 @@ def run_queue(
         )
     settings = apply_calibration(settings, state)
     refuse_outputs_in_library(settings)
-    pipeline = pipeline or Pipeline()
-    held = pipeline.held_stages()
-    if held:
-        _log.warning("run refused: %s (%s still held)", HELD_REASON, ", ".join(held))
-        return RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
     with instance_lock(lock_path_for(settings.state_db)):
         return _run_locked(
             settings, tools, state, reporter, pipeline, deadline, only, now, current_log

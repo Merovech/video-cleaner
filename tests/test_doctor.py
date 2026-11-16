@@ -219,10 +219,21 @@ def test_doctor_flags_unreadable_library_root(tmp_path: Path) -> None:
 
 
 def test_doctor_write_probe_leaves_no_file(tmp_path: Path) -> None:
+    (tmp_path / "completed").mkdir()
+    (tmp_path / "scratch").mkdir()
     checks = _run(tmp_path)
     assert checks["completed_dir"].ok and checks["scratch_dir"].ok
     assert list((tmp_path / "completed").iterdir()) == []
     assert list((tmp_path / "scratch").iterdir()) == []
+
+
+def test_doctor_reports_missing_folders_without_creating_them(tmp_path: Path) -> None:
+    checks = _run(tmp_path)
+    for name in ("completed_dir", "scratch_dir"):
+        assert checks[name].ok, checks[name].detail
+        assert "does not exist (will be created)" in checks[name].detail
+    assert not (tmp_path / "completed").exists()
+    assert not (tmp_path / "scratch").exists()
 
 
 def test_doctor_refuses_output_dir_inside_library(tmp_path: Path) -> None:

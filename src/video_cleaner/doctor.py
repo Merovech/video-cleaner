@@ -250,8 +250,15 @@ class _Doctor:
                 yield self._writable(name, directory)
 
     def _writable(self, name: str, directory: Path) -> Check:
+        if not directory.exists():
+            # Never created here: doctor runs on the unedited example config during setup.
+            ancestor = _existing_ancestor(directory)
+            if ancestor.is_dir() and os.access(ancestor, os.W_OK):
+                return Check(name, True, f"{directory} does not exist (will be created)")
+            return Check(
+                name, False, f"{directory} cannot be created: {ancestor} is not a writable folder"
+            )
         try:
-            directory.mkdir(parents=True, exist_ok=True)
             fd, probe = tempfile.mkstemp(prefix=".vc-doctor-", dir=directory)
             os.close(fd)
             Path(probe).unlink()

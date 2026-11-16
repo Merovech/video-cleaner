@@ -194,7 +194,11 @@ def survey(
         except (_survey.SurveyError, ToolNotFound) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print("survey interrupted; files already surveyed stay recorded", highlight=False)
+            _err.print(
+                "survey interrupted; files are recorded only once all of them are probed, so "
+                "nothing from this survey was recorded: run it again",
+                highlight=False,
+            )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_survey_summary(surveyed, result)
 
@@ -430,6 +434,7 @@ def run(
 ) -> None:
     """Execute the acknowledged plan."""
     settings = _load_outside_library(config)
+    _require_state(settings)  # never creates an empty database
     try:
         deadline = _runner.deadline_from(until, max_hours, datetime.now())
     except ValueError as exc:
