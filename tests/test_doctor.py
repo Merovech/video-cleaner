@@ -234,6 +234,26 @@ def test_doctor_refuses_output_dir_inside_library(tmp_path: Path) -> None:
     assert not (library / "completed").exists()
 
 
+@pytest.mark.parametrize("field", ["state_db", "log_dir"])
+def test_doctor_refuses_state_or_logs_inside_library(tmp_path: Path, field: str) -> None:
+    settings = _settings(tmp_path, **{field: tmp_path / "library" / "vc" / "x"})
+    check = _run(tmp_path, settings=settings)["library overlap"]
+    assert check.ok is False and check.required
+    assert "library root" in check.detail
+
+
+def test_doctor_refuses_library_inside_completed(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, completed_dir=tmp_path)
+    check = _run(tmp_path, settings=settings)["library overlap"]
+    assert check.ok is False
+    assert "is inside the completed folder" in check.detail
+
+
+def test_doctor_library_overlap_ok(tmp_path: Path) -> None:
+    check = _run(tmp_path)["library overlap"]
+    assert check.ok and check.required
+
+
 def test_doctor_unwritable_dir_fails(tmp_path: Path) -> None:
     blocker = tmp_path / "file"
     blocker.write_bytes(b"")

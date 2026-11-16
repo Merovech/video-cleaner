@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.config import Settings, default_config_path
-from video_cleaner.paths import is_under, path_key
+from video_cleaner.paths import library_overlaps, path_key
 from video_cleaner.tools import ToolNotFound, _locate
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
@@ -233,13 +233,23 @@ class _Doctor:
         yield Check("library_root", True, f"{root} readable")
 
     def writable_dirs(self) -> Iterator[Check]:
-        for name in ("completed_dir", "scratch_dir"):
+        overlaps = dict(library_overlaps(self.settings))
+        if overlaps:
+            yield Check("library overlap", False, "; ".join(overlaps.values()))
+        else:
+            yield Check("library overlap", True, "outputs and library root are apart")
+        for name, label in (
+            ("completed_dir", "completed folder"),
+            ("scratch_dir", "scratch folder"),
+        ):
             directory: Path = getattr(self.settings, name)
-            yield self._writable(name, directory)
+            problem = overlaps.get(label)
+            if problem is not None:
+                yield Check(name, False, problem)  # never created inside the library
+            else:
+                yield self._writable(name, directory)
 
     def _writable(self, name: str, directory: Path) -> Check:
-        if is_under(directory, self.settings.library_root):
-            return Check(name, False, f"{directory} is inside library_root; it must be local")
         try:
             directory.mkdir(parents=True, exist_ok=True)
             fd, probe = tempfile.mkstemp(prefix=".vc-doctor-", dir=directory)

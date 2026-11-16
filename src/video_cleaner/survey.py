@@ -22,7 +22,7 @@ from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.moviehash import movie_hash
 from video_cleaner.multipart import PartGroup, find_part_groups, parts_compatible
-from video_cleaner.paths import is_under
+from video_cleaner.paths import OutputInLibrary, outputs_outside_library
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.state import State, UnrepresentablePath
@@ -112,24 +112,16 @@ def discover_files(root: Path) -> list[Path]:
 
 
 def check_outputs_outside(settings: Settings, root: Path) -> Path:
-    """Raise `SurveyError` if anything the survey writes would land under *root*.
+    """Raise `SurveyError` if any output (the survey CSV included) overlaps *root* or
+    ``settings.library_root``, in either direction (`paths.outputs_outside_library`).
 
-    Checks the state database, the survey CSV and the log directory, and also
-    ``settings.library_root`` when *root* is a different folder. Returns the CSV path.
+    Returns the CSV path.
     """
     csv_path = settings.state_db.parent / CSV_NAME
-    targets = (
-        ("state database", settings.state_db),
-        ("survey CSV", csv_path),
-        ("log directory", settings.log_dir),
-    )
-    for base in dict.fromkeys((root, settings.library_root)):
-        for label, target in targets:
-            if is_under(target, base):
-                raise SurveyError(
-                    f"{label} {target} is under the library root {base}; "
-                    "the survey never writes to the library"
-                )
+    try:
+        outputs_outside_library(settings, extra=(("survey CSV", csv_path),), roots=(root,))
+    except OutputInLibrary as exc:
+        raise SurveyError(str(exc)) from None
     return csv_path
 
 

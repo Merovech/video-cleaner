@@ -20,7 +20,7 @@ from video_cleaner.encode import X265_CRF_MAX
 from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
-from video_cleaner.paths import is_under
+from video_cleaner.paths import OutputInLibrary, outputs_outside_library
 from video_cleaner.progress import RichReporter, _encodable, make_reporter
 from video_cleaner.state import State, StateError
 from video_cleaner.tools import ToolNotFound, locate_tools
@@ -503,11 +503,10 @@ def report(
     """Write a CSV of the results so far and print a summary."""
     settings = _load_outside_library(config)
     csv_path = settings.state_db.parent / planning.REPORT_CSV if output is None else output
-    if is_under(csv_path, settings.library_root):
-        _fail(
-            f"report {csv_path} is under the library root {settings.library_root}; "
-            "nothing is ever written to the library"
-        )
+    try:
+        outputs_outside_library(settings, extra=(("report", csv_path),))
+    except OutputInLibrary as exc:
+        _fail(str(exc))
     _require_state(settings)
     try:
         entries = read_manifest(settings.completed_dir / _runner.MANIFEST_NAME)

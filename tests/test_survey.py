@@ -356,10 +356,10 @@ def test_check_outputs_outside_covers_logs_and_configured_root(tmp_path: Path) -
         state_db=tmp_path / "state.db",
         log_dir=lib / "logs",
     )
-    with pytest.raises(SurveyError, match="log directory"):
+    with pytest.raises(SurveyError, match="log folder"):
         survey_module.check_outputs_outside(logs_inside, lib)
     # --root on a sub-folder does not excuse writing elsewhere under library_root
-    with pytest.raises(SurveyError, match="log directory"):
+    with pytest.raises(SurveyError, match="log folder"):
         survey_module.check_outputs_outside(logs_inside, tmp_path / "subset")
     fine = _settings(tmp_path)
     assert survey_module.check_outputs_outside(fine, fine.library_root) == (

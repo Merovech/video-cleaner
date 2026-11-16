@@ -55,7 +55,7 @@ from video_cleaner.manifest import (
 )
 from video_cleaner.multipart import find_part_groups
 from video_cleaner.mux import build_mux_cmd
-from video_cleaner.paths import is_under, path_key
+from video_cleaner.paths import OutputInLibrary, is_under, outputs_outside_library, path_key
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.scratch import (
@@ -313,30 +313,12 @@ def _same_file(a: Path, b: Path) -> bool:
 
 def refuse_outputs_in_library(settings: Settings) -> None:
     """Raise `RunRefused` if anything a run writes would land under the library root, or if
-    the library root lies inside a folder a run writes to or cleans."""
-    for label, path in (
-        ("scratch folder", settings.scratch_dir),
-        ("completed folder", settings.completed_dir),
-        ("state database", settings.state_db),
-        ("log folder", settings.log_dir),
-    ):
-        if is_under(path, settings.library_root):
-            raise RunRefused(
-                f"{label} {path} is under the library root {settings.library_root}; "
-                "a run never writes to the library"
-            )
-    # The other way round is as bad: completed paths mirror the library's relative folders,
-    # so a library inside the completed folder can be written to, and scratch sweeps delete.
-    for label, path in (
-        ("scratch folder", settings.scratch_dir),
-        ("completed folder", settings.completed_dir),
-        ("log folder", settings.log_dir),
-    ):
-        if is_under(settings.library_root, path):
-            raise RunRefused(
-                f"the library root {settings.library_root} is inside the {label} {path}; "
-                "a run never writes to the library"
-            )
+    the library root lies inside a folder a run writes to or cleans
+    (`paths.outputs_outside_library`)."""
+    try:
+        outputs_outside_library(settings)
+    except OutputInLibrary as exc:
+        raise RunRefused(str(exc)) from None
 
 
 def apply_calibration(settings: Settings, state: State) -> Settings:
