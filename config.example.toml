@@ -1,17 +1,49 @@
 # video-cleaner example configuration.
 #
 # Copy to %APPDATA%\video-cleaner\config.toml and edit. The real config file is git-ignored.
-# Any value can be overridden by an environment variable named VC_<SECTION>_<KEY>
-# (for example VC_PATHS_SCRATCH). Placeholder values below are examples only.
+# Keys are flat and match the Settings field names. Any key can be overridden by an
+# environment variable named VC_<KEY IN UPPERCASE> (for example VC_VMAF_TARGET).
+# Precedence: defaults < this file < environment. Unknown keys are an error.
+#
+# Use TOML literal strings (single quotes) for Windows paths: no escapes are processed,
+# so a UNC path is written as '\\nas\media' (two leading backslashes, once).
+# Placeholder paths below are examples only.
 
-[paths]
-# Read-only library root (the tool never writes here).
-library = '\nas\media'
-# Scratch area for working copies and encodes.
-scratch = 'D:\video-cleaner\scratch'
-# Where accepted re-encodes are placed, mirroring the source relative path.
-completed = 'D:\video-cleaner\completed'
+# --- Paths -------------------------------------------------------------------------
+# Read-only library root (the tool never writes here). Required.
+library_root = '\\nas\media'
+# Scratch area for working copies and encodes. Required.
+scratch_dir = 'D:\video-cleaner\scratch'
+# Where accepted re-encodes are placed, mirroring the source relative path. Required.
+completed_dir = 'D:\video-cleaner\completed'
+# State database. Default: %LOCALAPPDATA%\video-cleaner\state.db
+# state_db = 'C:\Users\you\AppData\Local\video-cleaner\state.db'
+# Per-run DEBUG logs. Default: %LOCALAPPDATA%\video-cleaner\logs
+# log_dir = 'C:\Users\you\AppData\Local\video-cleaner\logs'
 
-[limits]
-# Scratch cap in terabytes.
-scratch_cap_tb = 2.0
+# --- Limits and thresholds (values shown are the defaults) -----------------------------
+# Scratch cap in bytes (default 2 TB).
+# scratch_cap_bytes = 2000000000000
+# Ignore files smaller than this many bytes.
+# min_file_size = 0
+# Skip files whose bitrate is below this floor (kbps). Placeholder until calibration.
+# bitrate_floor_kbps = 2500
+
+# --- Quality ---------------------------------------------------------------------------
+# Per-file CRF is searched to reach this VMAF, clamped to crf_min..crf_max.
+# vmaf_target = 95.0
+# crf_min = 16
+# crf_max = 24
+# Post-encode guard: mean VMAF over the sample windows, and the worst window.
+# guard_mean_floor = 93.0
+# guard_worst_floor = 88.0   # placeholder until calibration
+# Output is kept only if it is at least this fraction smaller (0.10 = 10%).
+# min_saving = 0.10
+# x265 preset.
+# preset = "slow"
+
+# --- Console feedback ------------------------------------------------------------------
+# Heartbeat so the console is never silent longer than this many seconds.
+# heartbeat_s = 15.0
+# Progress line interval when output is not a TTY.
+# plain_progress_s = 30.0
