@@ -12,6 +12,7 @@ import pytest
 
 from video_cleaner.probe import MediaInfo
 from video_cleaner.state import (
+    SCHEMA_VERSION,
     FileRecord,
     StaleRecord,
     State,
@@ -333,7 +334,7 @@ def test_wal_mode_and_schema_version(tmp_path: Path) -> None:
     raw = sqlite3.connect(db)
     try:
         assert raw.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(2,)]
+        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(SCHEMA_VERSION,)]
     finally:
         raw.close()
 
@@ -369,7 +370,9 @@ def test_version_1_database_is_migrated(tmp_path: Path) -> None:
         assert rec is not None and rec.movie_hash == "8e245d9679d31e12"
     raw = sqlite3.connect(db)
     try:
-        assert raw.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 2
+        assert raw.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == (
+            SCHEMA_VERSION
+        )
     finally:
         raw.close()
     with State.open(db) as s:  # reopening a migrated database is a no-op

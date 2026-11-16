@@ -25,7 +25,7 @@ from typing import Any
 
 from video_cleaner.probe import MediaInfo
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_S = 30.0
 
 
@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS files (
     note TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     movie_hash TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     UNIQUE (path, size, mtime)
 );
 CREATE INDEX IF NOT EXISTS files_status_saving ON files (status, est_saving_bytes DESC);
@@ -118,10 +119,14 @@ _CALIBRATION_KEY = "calibration"
 _CALIBRATION_SWEPT_KEY = "calibration_swept_at"
 # The only text interpolated into SQL (the `nosec B608` lines) is this constant and runs of
 # "?" placeholders; every value is bound as a parameter.
-_COLUMNS = "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note, movie_hash"
+_COLUMNS = (
+    "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note, movie_hash, "
+    "attempts"
+)
 # Schema upgrades, applied in order to a database at the version before each key.
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     2: ("ALTER TABLE files ADD COLUMN movie_hash TEXT",),
+    3: ("ALTER TABLE files ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",),
 }
 
 
@@ -139,6 +144,8 @@ class FileRecord:
     # OpenSubtitles hash of this record's file (for a multi-part group: of its first part; each
     # member part has its own record and hash). None when not computed or not computable.
     movie_hash: str | None = None
+    # Runs that ended for this file in a RETRY it caused (tool failure, I/O error).
+    attempts: int = 0
 
 
 def _now() -> str:
@@ -169,6 +176,7 @@ def _record(row: Sequence[Any]) -> FileRecord:
         parts=tuple(Path(p) for p in json.loads(row[7])),
         note=str(row[8]),
         movie_hash=None if row[9] is None else str(row[9]),
+        attempts=int(row[10]),
     )
 
 
@@ -358,8 +366,11 @@ class State:
         *,
         size: int | None = None,
         mtime: float | None = None,
+        count_attempt: bool = False,
     ) -> None:
         """Set the status and note of the live (non-stale) record for *path*.
+
+        *count_attempt* adds one to the record's ``attempts`` (a run that failed on this file).
 
         With *size* and *mtime* the update targets exactly that (path, size, mtime) record and
         raises `StaleRecord` if it is not the live one (superseded or unknown), changing nothing;
@@ -388,8 +399,9 @@ class State:
                 if row is None:
                     raise KeyError(f"no live state record for {path}")
             conn.execute(
-                "UPDATE files SET status = ?, note = ?, updated_at = ? WHERE id = ?",
-                (status.value, note, _now(), row[0]),
+                "UPDATE files SET status = ?, note = ?, updated_at = ?, "
+                "attempts = attempts + ? WHERE id = ?",
+                (status.value, note, _now(), int(count_attempt), row[0]),
             )
             detail = f" ({note})" if note else ""
             self._event(conn, f"{key}: {row[1]} -> {status.value}{detail}")
@@ -414,7 +426,7 @@ class State:
                 raise StateError(f"{path} is completed; nothing to retry")
             initial = _INITIAL_STATUS[str(row[2])]
             conn.execute(
-                "UPDATE files SET status = ?, note = '', updated_at = ? WHERE id = ?",
+                "UPDATE files SET status = ?, note = '', attempts = 0, updated_at = ? WHERE id = ?",
                 (initial.value, _now(), row[0]),
             )
             self._event(conn, f"{key}: {row[1]} -> {initial.value} (requeued)")

@@ -126,6 +126,11 @@ a file again deliberately, run `video-cleaner plan --retry <path>` with the path
 the file goes back to the status survey gave it (pending for an encode or remux) and the next
 `run` picks it up. A file whose size or modification time changed is planned afresh anyway.
 
+A file that makes a run fail (a tool error or an I/O error on that file) is retried by the next
+run; after the third such failure it is flagged instead, with the last error in its note.
+`plan --retry` also resets that count. Stop conditions that are not the file's fault (scratch
+full, a tool not found, the library or the manifest unreachable) do not count.
+
 ## Settings
 
 Settings come from the defaults, then `%APPDATA%\video-cleaner\config.toml`, then environment

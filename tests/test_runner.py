@@ -2126,3 +2126,41 @@ def test_multi_part_member_without_a_live_record_is_stale(
     assert summary.completed == 0
     assert _status(state, pt1).status is Status.STALE
     assert "copy" not in fakes.names()  # never falls back to a fresh stat of the part
+
+
+def test_file_failing_three_runs_is_flagged(settings: Settings, state: State) -> None:
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    fakes = Fakes()
+    fakes.fail["encode_full"] = lambda p: ToolFailed(3, "ffmpeg -i a", None)
+    for run in (1, 2):
+        assert _run(settings, state, fakes).retry == 1, run
+        assert _status(state, a).status is Status.RETRY
+        assert _status(state, a).attempts == run
+    summary = _run(settings, state, fakes)
+    assert summary.flagged == 1 and summary.retry == 0
+    rec = _status(state, a)
+    assert rec.status is Status.FLAGGED
+    assert "failed 3 times" in rec.note and "exit code 3" in rec.note
+
+
+def test_stop_conditions_do_not_count_as_attempts(settings: Settings, state: State) -> None:
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    fakes = Fakes()
+    fakes.fail["copy"] = lambda p: ToolNotFound("ffmpeg")  # a setup problem, not the file's
+    for _ in range(4):
+        _run(settings, state, fakes)
+    rec = _status(state, a)
+    assert rec.status is Status.RETRY and rec.attempts == 0
+
+
+def test_requeue_resets_attempts(settings: Settings, state: State) -> None:
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    fakes = Fakes()
+    fakes.fail["encode_full"] = lambda p: ToolFailed(3, "ffmpeg -i a", None)
+    _run(settings, state, fakes)
+    assert _status(state, a).attempts == 1
+    state.requeue(a)
+    assert _status(state, a).attempts == 0

@@ -97,6 +97,8 @@ STOP_MANIFEST_UNREADABLE = "manifest unreadable"
 STOP_MANIFEST_NOT_WRITABLE = "manifest not writable"
 STOP_COMPLETED_NOT_WRITABLE = "completed folder not writable"
 STALE_NOTE = "source changed"
+# A file that fails this many runs (tool failure, I/O error) is flagged instead of retried.
+MAX_ATTEMPTS = 3
 MANIFEST_NAME = "manifest.csv"
 # A delivery in flight: ``<target>.part`` in the completed folder (targets are always .mkv).
 DELIVERY_SUFFIX = ".part"
@@ -292,6 +294,8 @@ class _Outcome:
     status: Status
     note: str
     bytes_saved: int = 0
+    # A RETRY the file itself caused (not a stop condition such as a full scratch).
+    attempt: bool = False
 
 
 @dataclass
@@ -485,9 +489,18 @@ class _Runner:
         self.reporter.stage(f"{status.value}: {rec.path.name}")
 
     def _finish(self, rec: FileRecord, outcome: _Outcome) -> None:
+        if outcome.attempt and rec.attempts + 1 >= MAX_ATTEMPTS:
+            outcome = _Outcome(
+                Status.FLAGGED, f"failed {MAX_ATTEMPTS} times; last: {outcome.note}", attempt=True
+            )
         try:
             self.state.set_status(
-                rec.path, outcome.status, _clean(outcome.note), size=rec.size, mtime=rec.mtime
+                rec.path,
+                outcome.status,
+                _clean(outcome.note),
+                size=rec.size,
+                mtime=rec.mtime,
+                count_attempt=outcome.attempt,
             )
         except StaleRecord:
             _log.warning("%s: record superseded; outcome %s dropped", rec.path, outcome.status)
@@ -947,11 +960,13 @@ class _Runner:
             self._finish(rec, _Outcome(Status.RETRY, str(exc)))
             return f"tool not found: {exc.name}"
         except ToolOutputError as exc:
-            outcome = _Outcome(Status.RETRY, f"tool output handling failed: {exc}")
+            outcome = _Outcome(Status.RETRY, f"tool output handling failed: {exc}", attempt=True)
         except ToolFailed as exc:
             kept = self._keep_tool_log(exc.log_path)
             where = f"; log {kept}" if kept is not None else ""
-            outcome = _Outcome(Status.RETRY, f"tool failed with exit code {exc.returncode}{where}")
+            outcome = _Outcome(
+                Status.RETRY, f"tool failed with exit code {exc.returncode}{where}", attempt=True
+            )
         except NotImplementedError as exc:
             if str(exc) != HELD_REASON:
                 outcome = _Outcome(Status.FLAGGED, f"NotImplementedError: {exc}")
@@ -967,7 +982,7 @@ class _Runner:
             if not self._library_reachable():
                 self._finish(rec, _Outcome(Status.RETRY, f"library unreachable: {exc}"))
                 return STOP_LIBRARY_UNREACHABLE
-            outcome = _Outcome(Status.RETRY, f"I/O error: {exc}")
+            outcome = _Outcome(Status.RETRY, f"I/O error: {exc}", attempt=True)
         except Exception as exc:
             _log.exception("%s: unexpected error", rec.path)
             outcome = _Outcome(Status.FLAGGED, f"{type(exc).__name__}: {exc}")
