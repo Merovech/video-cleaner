@@ -324,6 +324,14 @@ class Fakes:
         return [c[0] for c in self.calls]
 
 
+def _named(path: Path, name: str) -> bool:
+    """True if *path* is the source *name* or its scratch copy ``<8 hex>-<name>``.
+
+    Never a substring match: the hex prefix of a scratch name can spell "bad", "add" and so on.
+    """
+    return path.name == name or (path.name.endswith("-" + name) and len(path.name) == len(name) + 9)
+
+
 def _no_errors(tools: Tools, output: Path, reporter: Reporter) -> str:
     return ""
 
@@ -652,7 +660,7 @@ def test_run_continues_after_corrupt_file(settings: Settings, state: State) -> N
     _plan(state, bad, est=900)
     _plan(state, good, est=100)
     fakes = Fakes()
-    fakes.fail["probe"] = lambda p: ProbeError(p, "zero duration") if "bad" in p.name else None
+    fakes.fail["probe"] = lambda p: ProbeError(p, "zero duration") if _named(p, "bad.avi") else None
     summary = _run(settings, state, fakes)
     assert summary.flagged == 1 and summary.completed == 1
     record = _status(state, bad)
@@ -668,7 +676,7 @@ def test_unexpected_exception_flags_and_continues(settings: Settings, state: Sta
     _plan(state, a, est=900)
     _plan(state, b, est=100)
     fakes = Fakes()
-    fakes.fail["search_crf"] = lambda p: RuntimeError("boom") if "a.avi" in p.name else None
+    fakes.fail["search_crf"] = lambda p: RuntimeError("boom") if _named(p, "a.avi") else None
     summary = _run(settings, state, fakes)
     assert summary.flagged == 1 and summary.completed == 1
     assert "RuntimeError: boom" in _status(state, a).note
@@ -684,9 +692,9 @@ def test_tool_failed_and_tool_output_error_go_to_retry(settings: Settings, state
     log = settings.scratch_dir / "x.stderr.log"
 
     def fail(p: Path) -> BaseException | None:
-        if "a.avi" in str(p):
+        if _named(p, "a.avi"):
             return ToolFailed(3, "ffmpeg -i a", log)
-        if "b.avi" in str(p):
+        if _named(p, "b.avi"):
             return ToolOutputError("encode", "stdout", "parser broke")
         return None
 
@@ -992,7 +1000,7 @@ def test_run_resumes_without_redoing_completed(settings: Settings, state: State)
     summary = _run(settings, state, second)
     assert summary.completed == 1
     encoded = [c[1].name for c in second.calls if c[0] == "encode_full"]
-    assert len(encoded) == 1 and encoded[0].endswith("b.avi")
+    assert len(encoded) == 1 and _named(Path(encoded[0]), "b.avi")
     assert _status(state, a).status is Status.COMPLETED
     assert len(read_manifest(settings.completed_dir / "manifest.csv")) == 2
 
@@ -1036,14 +1044,14 @@ def test_run_never_writes_under_library_root(settings: Settings, state: State) -
     _plan(state, pt1, est=600, parts=(pt1, pt2))
     before = _tree(settings.library_root)
     fakes = Fakes()
-    fakes.fail["probe"] = lambda p: ProbeError(p, "bad") if p.name.endswith("bad.avi") else None
+    fakes.fail["probe"] = lambda p: ProbeError(p, "bad") if _named(p, "bad.avi") else None
     low_crf = CrfSearchResult(crf=24, projected_saving=0.01, points=())
     good_crf = fakes.crf
     original_search = fakes.search_crf
 
     def search(info: MediaInfo, *args: Any) -> CrfSearchResult:
         original_search(info, *args)
-        return low_crf if info.path.name.endswith("low.avi") else good_crf
+        return low_crf if _named(info.path, "low.avi") else good_crf
 
     pipeline = fakes.pipeline()
     pipeline.search_crf = search
@@ -1649,7 +1657,6 @@ def test_approved_crf_max_below_configured_crf_min_is_refused(
     _forbid_tools(monkeypatch)
     settings = _settings(tmp_path, crf_min=20)
     with State.open(settings.state_db) as state:
-        state.acknowledge_plan("plan-hash")
         state.approve_calibration(95.0, 18)  # approved before crf_min was raised in the config
         _plan(state, _source(settings, "a.avi"))
         fakes = Fakes()
