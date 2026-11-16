@@ -75,3 +75,6 @@ jobs:
 
       - name: Dependency audit
         run: uv run pip-audit --skip-editable
+
+      - name: Secret scan (gitleaks, tracked files)
+        run: uv run pre-commit run gitleaks --all-files
