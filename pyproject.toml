@@ -24,6 +24,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=3.8",
+    "bandit>=1.9.4",
+    "pip-audit>=2.10.1",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -60,3 +62,6 @@ source = ["src"]
 [tool.coverage.report]
 fail_under = 85
 show_missing = true
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", ".claude"]
