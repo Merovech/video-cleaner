@@ -42,7 +42,7 @@ activated virtual environment). `--help` works on every command.
 `run` and `calibrate --samples` refuse with `held: Task 10b` (exit 1) until the encode, CRF search
 and VMAF stages are enabled.
 
-Every command except `doctor` also takes `--config PATH` (default
+`survey`, `plan`, `calibrate` and `run` take `--config PATH` (default
 `%APPDATA%\video-cleaner\config.toml`), `-v`/`--verbose` (repeat for more console logging) and
 `-q`/`--quiet` (warnings only); `doctor`, `status` and `report` take `--config` only.
 
