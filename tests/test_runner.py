@@ -425,6 +425,17 @@ def test_run_refuses_outputs_under_library_root(tmp_path: Path, field: str) -> N
         _run(settings, state, Fakes())
 
 
+@pytest.mark.parametrize("field", ["scratch_dir", "completed_dir", "log_dir"])
+def test_run_refuses_library_root_inside_an_output_folder(tmp_path: Path, field: str) -> None:
+    # completed_dir = <x> with library_root = <x>/library would mirror <library>/library/a.avi
+    # to <x>/library/a.mkv, inside the library; scratch sweeps would reach it too.
+    outer = tmp_path / "outer"
+    base = _settings(tmp_path)
+    settings = _settings(tmp_path, library_root=outer / "library", **{field: outer})
+    with _open_state(base) as state, pytest.raises(RunRefused, match="library root"):
+        _run(settings, state, Fakes())
+
+
 def test_library_unreachable_stops_before_anything(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     with _open_state(settings) as state:

@@ -290,7 +290,8 @@ class _Work:
 
 
 def refuse_outputs_in_library(settings: Settings) -> None:
-    """Raise `RunRefused` if anything a run writes would land under the library root."""
+    """Raise `RunRefused` if anything a run writes would land under the library root, or if
+    the library root lies inside a folder a run writes to or cleans."""
     for label, path in (
         ("scratch folder", settings.scratch_dir),
         ("completed folder", settings.completed_dir),
@@ -300,6 +301,18 @@ def refuse_outputs_in_library(settings: Settings) -> None:
         if is_under(path, settings.library_root):
             raise RunRefused(
                 f"{label} {path} is under the library root {settings.library_root}; "
+                "a run never writes to the library"
+            )
+    # The other way round is as bad: completed paths mirror the library's relative folders,
+    # so a library inside the completed folder can be written to, and scratch sweeps delete.
+    for label, path in (
+        ("scratch folder", settings.scratch_dir),
+        ("completed folder", settings.completed_dir),
+        ("log folder", settings.log_dir),
+    ):
+        if is_under(settings.library_root, path):
+            raise RunRefused(
+                f"the library root {settings.library_root} is inside the {label} {path}; "
                 "a run never writes to the library"
             )
 
