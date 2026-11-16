@@ -1,10 +1,15 @@
-"""Scratch space: verified copy from the library, a size cap, and background prefetch.
+r"""Scratch space: verified copy from the library, a size cap, and background prefetch.
 
 The library is read-only: this module only ever reads the source and writes under the
 scratch root. A copy is streamed to ``<dest>.part`` and renamed into place only once it is
 complete and the source is seen unchanged, so a file at its final name is always a whole,
 verified copy. Any failure (NAS drop, disk full, source changed, Ctrl+C) removes the partial
 file and is re-raised for the caller to record.
+
+Everything the tool puts in scratch lives in a dedicated subfolder,
+``<scratch_dir>/.video-cleaner``, created by the tool with a marker file (`prepare_tool_scratch`).
+Sweeps, the size cap and all work folders are confined to it, so a ``scratch_dir`` that is a
+shared folder (``D:\``, say) never has a foreign file counted or deleted.
 """
 
 from __future__ import annotations
@@ -41,6 +46,47 @@ class SourceChanged(Exception):
 
 class ScratchFull(Exception):
     """The scratch volume ran out of space, or the scratch cap would be exceeded."""
+
+
+class ScratchNotOurs(Exception):
+    """The tool folder exists, is not empty and lacks the marker: it is not ours to use."""
+
+
+TOOL_FOLDER = ".video-cleaner"
+MARKER_NAME = "video-cleaner-scratch.marker"
+_MARKER_TEXT = (
+    "This folder is video-cleaner's scratch area. Everything in it may be deleted by "
+    "video-cleaner at any time.\n"
+)
+
+
+def tool_scratch(scratch_dir: Path) -> Path:
+    """The tool-owned subfolder of *scratch_dir* (not created)."""
+    return scratch_dir / TOOL_FOLDER
+
+
+def is_tool_scratch(folder: Path) -> bool:
+    """True if *folder* carries the marker `prepare_tool_scratch` writes."""
+    return (folder / MARKER_NAME).is_file()
+
+
+def prepare_tool_scratch(scratch_dir: Path) -> Path:
+    """Create (if needed) and return the marked tool folder under *scratch_dir*.
+
+    A missing or empty folder is created and marked. An existing, non-empty folder without the
+    marker was not made by the tool: `ScratchNotOurs` is raised and nothing in it is touched.
+    """
+    root = tool_scratch(scratch_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    if is_tool_scratch(root):
+        return root
+    if any(root.iterdir()):
+        raise ScratchNotOurs(
+            f"{root} exists but was not created by video-cleaner (no {MARKER_NAME}); "
+            "move it away or choose another scratch_dir"
+        )
+    (root / MARKER_NAME).write_text(_MARKER_TEXT, encoding="utf-8")
+    return root
 
 
 class _Cancelled(Exception):

@@ -26,6 +26,7 @@ from video_cleaner.decide import Action
 from video_cleaner.instancelock import instance_lock, lock_path_for
 from video_cleaner.progress import Reporter
 from video_cleaner.runner import HELD_REASON, refuse_outputs_in_library
+from video_cleaner.scratch import ScratchNotOurs, prepare_tool_scratch
 from video_cleaner.state import FileRecord, State, Status
 from video_cleaner.tools import Tools
 
@@ -263,7 +264,8 @@ def run_calibration(
     is still held, `RunRefused` if an output folder is under the library root, `AlreadyRunning`
     while a run or another calibration holds the single-instance lock, and
     `CalibrationError` when there is nothing to sample or a score is unusable. Work files go to
-    ``<scratch>/calibration`` and are removed after each sample; nothing is stored in *state*.
+    ``<scratch>/.video-cleaner/calibration`` (the tool-owned scratch folder) and are removed
+    after each sample; nothing is stored in *state*.
     """
     held = engine.held_stages()
     if held:
@@ -284,11 +286,15 @@ def _calibrate_locked(
     picked = select_samples(state.records(), samples)
     if not picked:
         raise CalibrationError("no encode candidates to sample: run `survey` first")
+    try:
+        work_root = prepare_tool_scratch(settings.scratch_dir) / CLIPS_FOLDER
+    except ScratchNotOurs as exc:
+        raise CalibrationError(str(exc)) from None
     clips = settings.completed_dir / CLIPS_FOLDER
     clips.mkdir(parents=True, exist_ok=True)
     rows: list[CalibrationRow] = []
     for index, sample in enumerate(picked, start=1):
-        workdir = settings.scratch_dir / CLIPS_FOLDER / f"{index:02d}"
+        workdir = work_root / f"{index:02d}"
         try:
             for crf in CALIBRATION_CRFS:
                 reporter.stage(f"calibrate {index}/{len(picked)} CRF {crf}: {sample.path.name}")

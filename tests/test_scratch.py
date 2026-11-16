@@ -675,3 +675,30 @@ def test_prefetch_cancel_after_completion_removes_the_copy(tmp_path: Path) -> No
     assert list(manager.root.iterdir()) == []
     assert manager.reserve(1000) is True
     assert src.exists()
+
+
+# --- the tool-owned scratch folder ---------------------------------------------------------
+
+
+def test_prepare_tool_scratch_creates_marked_subfolder(tmp_path: Path) -> None:
+    root = scratch.prepare_tool_scratch(tmp_path / "s")
+    assert root == tmp_path / "s" / scratch.TOOL_FOLDER
+    assert (root / scratch.MARKER_NAME).is_file()
+    assert scratch.is_tool_scratch(root)
+    assert scratch.prepare_tool_scratch(tmp_path / "s") == root  # idempotent
+
+
+def test_prepare_tool_scratch_marks_an_empty_existing_folder(tmp_path: Path) -> None:
+    (tmp_path / scratch.TOOL_FOLDER).mkdir()
+    root = scratch.prepare_tool_scratch(tmp_path)
+    assert scratch.is_tool_scratch(root)
+
+
+def test_prepare_tool_scratch_refuses_a_foreign_non_empty_folder(tmp_path: Path) -> None:
+    folder = tmp_path / scratch.TOOL_FOLDER
+    folder.mkdir()
+    (folder / "x.txt").write_bytes(b"x")
+    with pytest.raises(scratch.ScratchNotOurs):
+        scratch.prepare_tool_scratch(tmp_path)
+    assert not scratch.is_tool_scratch(folder)
+    assert (folder / "x.txt").exists()

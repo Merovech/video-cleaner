@@ -59,12 +59,16 @@ from video_cleaner.paths import is_under, path_key
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.scratch import (
+    MARKER_NAME,
     CopyResult,
     Prefetcher,
     ScratchFull,
     ScratchManager,
+    ScratchNotOurs,
     SourceChanged,
     copy_with_progress,
+    is_tool_scratch,
+    prepare_tool_scratch,
 )
 from video_cleaner.state import IN_PROGRESS, FileRecord, StaleRecord, State, Status
 from video_cleaner.tools import (
@@ -96,9 +100,10 @@ MKVMERGE_ERROR_EXIT = 2
 
 _WORK_DECISIONS = frozenset({Action.ENCODE.value, Action.REMUX.value})
 _HHMM = re.compile(r"(\d{1,2}):(\d{2})")
-# Names this module (and the Prefetcher) create in scratch; the startup sweep touches no others.
+# Names this module (and the Prefetcher, and calibration) create in the tool scratch folder;
+# the startup sweep removes every one of them and touches nothing else.
 _COPY_NAME = re.compile(r"[0-9a-f]{8}-.+")
-_WORK_NAME = re.compile(r"work-[0-9a-f]{12}")
+_WORK_NAME = re.compile(r"work-[0-9a-f]{12}|calibration")
 
 
 class PlanNotAcknowledged(Exception):
@@ -386,7 +391,11 @@ class _Runner:
         self.deadline = deadline
         self.only = only
         self.now = now
-        self.scratch = ScratchManager(settings.scratch_dir, settings.scratch_cap_bytes)
+        try:
+            self.scratch_root = prepare_tool_scratch(settings.scratch_dir)
+        except ScratchNotOurs as exc:
+            raise RunRefused(str(exc)) from None
+        self.scratch = ScratchManager(self.scratch_root, settings.scratch_cap_bytes)
         self.prefetcher = pipeline.prefetcher(self.scratch, _BackgroundReporter())
         self.prefetched: Path | None = None
         self.attempted: set[tuple[str, int, float]] = set()
@@ -563,19 +572,22 @@ class _Runner:
             _log.warning("could not remove scratch folder %s: %s", work.workdir, exc)
 
     def sweep(self) -> None:
-        """Remove what a killed run left in scratch: partial copies, work folders, orphans."""
-        keep: set[str] = set()
-        for rec in self.state.records(Status.PENDING, Status.RETRY):
-            keep.update(path_key(self.prefetcher.dest_for(p)) for p in (rec.parts or (rec.path,)))
-        for entry in os.scandir(self.settings.scratch_dir):
+        """Remove everything a killed run left in the tool scratch folder (and nothing else).
+
+        Copies (partial or whole: a kept copy is never reused), work folders and calibration
+        work all go. A folder without the tool's marker is never swept.
+        """
+        root = self.scratch_root
+        if not is_tool_scratch(root):  # pragma: no cover - prepare_tool_scratch marks it
+            _log.warning("not sweeping %s: it lacks %s", root, MARKER_NAME)
+            return
+        for entry in os.scandir(root):
             try:
                 if entry.is_dir(follow_symlinks=False):
                     if _WORK_NAME.fullmatch(entry.name):
                         shutil.rmtree(entry.path)
                         _log.info("removed leftover scratch folder %s", entry.path)
-                elif _COPY_NAME.fullmatch(entry.name) and (
-                    entry.name.endswith(".part") or path_key(entry.path) not in keep
-                ):
+                elif _COPY_NAME.fullmatch(entry.name):
                     os.unlink(entry.path)
                     _log.info("removed leftover scratch file %s", entry.path)
             except OSError as exc:
@@ -921,7 +933,7 @@ class _Runner:
             f"{rec.path}|{rec.size}|{rec.mtime}".encode("utf-8", "surrogatepass"),
             usedforsecurity=False,
         ).hexdigest()[:12]
-        work = _Work(workdir=self.settings.scratch_dir / f"work-{digest}")
+        work = _Work(workdir=self.scratch_root / f"work-{digest}")
         try:
             outcome = self._work(rec, target, work)
         except (_SourceStale, SourceChanged) as exc:

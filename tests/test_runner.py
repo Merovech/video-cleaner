@@ -196,11 +196,18 @@ def _tree(root: Path) -> dict[str, tuple[int, int]]:
 
 
 def _scratch_files(settings: Settings) -> list[str]:
+    """Files under the scratch folder, apart from the tool folder's marker."""
     return sorted(
         str(Path(folder, name).relative_to(settings.scratch_dir))
         for folder, _dirs, names in os.walk(settings.scratch_dir)
         for name in names
+        if name != scratch_module.MARKER_NAME
     )
+
+
+def _tool_scratch(settings: Settings) -> Path:
+    """The tool-owned scratch folder, created and marked the way a run would."""
+    return scratch_module.prepare_tool_scratch(settings.scratch_dir)
 
 
 class Fakes:
@@ -457,12 +464,18 @@ def test_startup_resets_sweeps_and_prunes(
     src = _source(settings, "a.avi")
     _plan(state, src)
     state.set_status(src, Status.ENCODING)  # a killed run left it in progress
-    settings.scratch_dir.mkdir(parents=True)
-    (settings.scratch_dir / "deadbeef-old.avi.part").write_bytes(b"p")
-    (settings.scratch_dir / "deadbeef-orphan.mkv").write_bytes(b"o")
-    (settings.scratch_dir / "work-deadbeef0123").mkdir()
-    (settings.scratch_dir / "work-deadbeef0123" / "video.mkv").write_bytes(b"w")
+    ours = _tool_scratch(settings)
+    (ours / "deadbeef-old.avi.part").write_bytes(b"p")
+    (ours / "deadbeef-orphan.mkv").write_bytes(b"o")
+    (ours / "work-deadbeef0123").mkdir()
+    (ours / "work-deadbeef0123" / "video.mkv").write_bytes(b"w")
+    (ours / "calibration" / "01").mkdir(parents=True)
+    (ours / "calibration" / "01" / "crf17.mkv").write_bytes(b"c")
+    # A shared scratch folder: foreign files, even with names like ours, must survive.
     (settings.scratch_dir / "notes.txt").write_bytes(b"not ours")
+    (settings.scratch_dir / "cafebabe-holiday.mkv").write_bytes(b"not ours")
+    (settings.scratch_dir / "work-0123456789ab").mkdir()
+    (settings.scratch_dir / "work-0123456789ab" / "keep.txt").write_bytes(b"not ours")
     pruned: list[tuple[Path, Path | None]] = []
 
     def fake_prune(log_dir: Path, **kw: Any) -> list[Path]:
@@ -475,15 +488,19 @@ def test_startup_resets_sweeps_and_prunes(
     assert pruned == [(settings.log_dir, current)]
     assert summary.completed == 1  # the reset record was retried
     assert "retry" in _transitions(state, src)
-    assert _scratch_files(settings) == ["notes.txt"]  # only our own leftovers are swept
+    # only our own leftovers are swept, and only inside the tool folder
+    assert _scratch_files(settings) == [
+        "cafebabe-holiday.mkv",
+        "notes.txt",
+        os.path.join("work-0123456789ab", "keep.txt"),
+    ]
 
 
 def test_second_run_is_refused_while_one_holds_the_lock(settings: Settings, state: State) -> None:
     src = _source(settings, "a.avi")
     _plan(state, src)
     state.set_status(src, Status.ENCODING)  # the live run's file: must not be reset
-    settings.scratch_dir.mkdir(parents=True)
-    live = settings.scratch_dir / "deadbeef-a.avi.part"
+    live = _tool_scratch(settings) / "deadbeef-a.avi.part"
     live.write_bytes(b"p")  # the live run's copy: must not be swept
     fakes = Fakes()
     with instance_lock(lock_path_for(settings.state_db)), pytest.raises(AlreadyRunning) as info:
@@ -1983,3 +2000,41 @@ def test_failed_final_rename_leaves_no_row_and_no_part(
     assert read_manifest(settings.completed_dir / "manifest.csv") == []
     assert not list(settings.completed_dir.rglob("*.part"))
     assert not (settings.completed_dir / "a.mkv").exists()
+
+
+def test_scratch_work_stays_inside_the_tool_folder(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    fakes = Fakes()
+    assert _run(settings, state, fakes).completed == 1
+    ours = settings.scratch_dir / scratch_module.TOOL_FOLDER
+    copy_dest = fakes.calls[0][2]
+    assert copy_dest.parent == ours
+    mux = next(c for c in fakes.calls if c[0] == "mux")
+    assert mux[3].parent.parent == ours and mux[3].parent.name.startswith("work-")
+
+
+def test_foreign_files_in_scratch_do_not_count_toward_the_cap(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, scratch_cap_bytes=3000)
+    settings.scratch_dir.mkdir(parents=True)
+    (settings.scratch_dir / "big-foreign.bin").write_bytes(b"f" * 5000)
+    src = _source(settings, "a.avi")
+    with _open_state(settings) as state:
+        _plan(state, src)
+        summary = _run(settings, state, Fakes())
+    assert summary.completed == 1
+    assert (settings.scratch_dir / "big-foreign.bin").exists()
+
+
+def test_unmarked_tool_folder_is_never_swept(settings: Settings, state: State) -> None:
+    ours = settings.scratch_dir / scratch_module.TOOL_FOLDER
+    ours.mkdir(parents=True)
+    keep = ours / "deadbeef-someone.mkv"
+    keep.write_bytes(b"k")  # a folder of that name that we did not create
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    fakes = Fakes()
+    with pytest.raises(RunRefused, match="not created by video-cleaner"):
+        _run(settings, state, fakes)
+    assert keep.exists()
+    assert fakes.calls == []

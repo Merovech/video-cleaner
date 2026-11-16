@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from helpers import add_record as _add
 from helpers import tmp_settings, write_config
 from video_cleaner import calibrate as calibrate_mod
+from video_cleaner import scratch as scratch_mod
 from video_cleaner.calibrate import (
     CALIBRATION_CRFS,
     CalibrationEngine,
@@ -253,7 +254,8 @@ def test_calibrate_table_has_size_and_vmaf_per_crf(tmp_path: Path) -> None:
     assert len(clips) == 8
     assert all(c.endswith(".mp4") for c in clips)
     assert _library_snapshot(settings.library_root) == before
-    assert not list((settings.scratch_dir / "calibration").glob("**/*.mkv"))  # work cleaned
+    ours = settings.scratch_dir / scratch_mod.TOOL_FOLDER / "calibration"
+    assert not list(ours.glob("**/*.mkv"))  # work cleaned
 
 
 def test_default_engine_is_held_and_touches_nothing(tmp_path: Path) -> None:
@@ -493,3 +495,16 @@ def test_cli_calibrate_already_running_exits_2(
         result = _invoke("calibrate", "--samples", "1", "--config", str(cfg), "-q")
     assert result.exit_code == 2
     assert str(os.getpid()) in result.output
+
+
+def test_calibration_never_removes_a_preexisting_scratch_folder(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    foreign = settings.scratch_dir / "calibration" / "01"
+    foreign.mkdir(parents=True)
+    (foreign / "mine.txt").write_bytes(b"not the tool's")
+    with State.open(settings.state_db) as state:
+        _populate(settings, state)
+        run_calibration(
+            settings, TOOLS, state, NullReporter(), samples=1, engine=FakeEngine().engine()
+        )
+    assert (foreign / "mine.txt").exists()
