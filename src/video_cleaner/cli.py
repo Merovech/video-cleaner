@@ -501,6 +501,10 @@ def _print_results(results: planning.ResultsReport, csv_path: Path) -> None:
         for entry, verdict in zip(results.entries, results.unchanged, strict=True):
             _say(f"  {verdict}: {entry.completed}")
     _say(f"Left alone: {results.left_alone}")
+    if results.replace:
+        _say(f"Replace (Dolby Vision profile 5, no HDR10 fallback): {len(results.replace)}")
+        for path in results.replace:
+            _say(f"  {path}")
     _say(f"Flagged: {len(results.flagged)}")
     for path, reason in results.flagged:
         _say(f"  {path}: {reason}")

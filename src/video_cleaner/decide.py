@@ -24,6 +24,9 @@ from video_cleaner.probe import MediaInfo, VideoStream
 EFFICIENT_CODECS = frozenset({"hevc", "av1"})
 UHD_MIN_WIDTH = 3000
 UHD_MIN_HEIGHT = 2000
+# Plan section 9 item 11: a Dolby Vision profile 5 file has no HDR10 base layer, so most players
+# show wrong colours; it is left alone and listed for Ari to replace with another release.
+DV5_REPLACE_REASON = "Dolby Vision profile 5: replace (no HDR10 fallback)"
 
 
 class Action(StrEnum):
@@ -90,6 +93,8 @@ def decide(
 
     skip = _no_encode_reasons(info, video, settings)
     if skip:
+        if video.dv_profile == 5:
+            skip.append(DV5_REPLACE_REASON)
         remux = _remux_reasons(needs_subs, multipart)
         action = Action.REMUX if remux else Action.LEAVE_ALONE
         return Decision(action, (*skip, *remux), encode=False, remux=bool(remux))

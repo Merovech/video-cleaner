@@ -312,3 +312,16 @@ def test_decision_is_immutable_and_action_is_str_enum() -> None:
         d.action = Action.FLAG  # type: ignore[misc]
     assert isinstance(Action.ENCODE, str) and Action.ENCODE.value == "encode"
     assert {a.name for a in Action} == {"LEAVE_ALONE", "ENCODE", "REMUX", "FLAG"}
+
+
+def test_left_alone_dolby_vision_profile_5_says_replace() -> None:
+    from video_cleaner.decide import DV5_REPLACE_REASON
+
+    info = _info(codec="hevc", height=2160, kbps=25000, transfer=None, dv_profile=5)
+    d = decide(info, _settings())
+    _assert_shape(d, Action.LEAVE_ALONE, encode=False, remux=False)
+    assert DV5_REPLACE_REASON == "Dolby Vision profile 5: replace (no HDR10 fallback)"
+    assert DV5_REPLACE_REASON in d.reasons
+    assert DV5_REPLACE_REASON in decide(info, _settings(), needs_subs=True).reasons
+    other = decide(_info(codec="hevc", height=2160, kbps=25000, dv_profile=8), _settings())
+    assert DV5_REPLACE_REASON not in other.reasons

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import os
 import re
 import subprocess
@@ -501,6 +502,28 @@ def test_survey_compatible_multipart_group_is_one_record(tmp_path: Path) -> None
     assert rows["Dr. Mabuse pt1.mkv"]["action"] == "encode"
     assert rows["Dr. Mabuse pt2.mkv"]["action"] == "leave_alone"
     assert rows["Dr. Mabuse pt2.mkv"]["reasons"] == "part of group Dr. Mabuse.mkv"
+
+
+def test_survey_csv_has_hdr_dv_interlace_and_subtitle_columns(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    lib = settings.library_root
+    _touch(lib / "Plain.mkv")
+    _touch(lib / "Dv.mkv")
+
+    def dv5(path: Path) -> MediaInfo:
+        base = _info(path, codec="hevc", width=3840, height=2160)
+        assert base.video is not None
+        video = dataclasses.replace(base.video, dv_profile=5, transfer=None)
+        return dataclasses.replace(base, video=video)
+
+    result, state = _run(settings, _fake_probe({"Dv.mkv": dv5}))
+    state.close()
+    rows = _by_name(_csv_rows(result.csv_path))
+    plain, dv = rows["Plain.mkv"], rows["Dv.mkv"]
+    assert (plain["hdr"], plain["dv_profile"], plain["interlaced"]) == ("no", "", "no")
+    assert plain["subtitle_streams"] == "0"
+    assert (dv["hdr"], dv["dv_profile"]) == ("no", "5")
+    assert "Dolby Vision profile 5: replace (no HDR10 fallback)" in dv["reasons"]
 
 
 def _name_hash(path: Path) -> str:

@@ -351,3 +351,17 @@ def test_original_check_is_unknown_on_other_os_errors(
 
     monkeypatch.setattr(planning, "check_unchanged", denied)
     assert planning.originals_unchanged(entries, lib) == ("unknown",)
+
+
+def test_report_lists_dolby_vision_profile_5_files_to_replace(tmp_path: Path) -> None:
+    from video_cleaner.decide import DV5_REPLACE_REASON
+
+    cfg = write_config(tmp_path)
+    dv5 = tmp_path / "library" / "DV5.mkv"
+    with _state(tmp_path) as st:
+        add_record(st, dv5, "leave_alone", ("already hevc", DV5_REPLACE_REASON))
+    result = _invoke("report", "--config", str(cfg))
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.output.split())
+    assert "Replace (Dolby Vision profile 5, no HDR10 fallback): 1" in out
+    assert str(dv5) in out

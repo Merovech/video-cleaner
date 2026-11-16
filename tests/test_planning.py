@@ -364,3 +364,11 @@ def test_cli_plan_retry_unknown_path_exits_2(tmp_path: Path) -> None:
     result = _invoke("plan", "--retry", str(tmp_path / "nope.mkv"), "--config", str(cfg), "-q")
     assert result.exit_code == 2
     assert "no live state record" in result.output
+
+
+def test_plan_notes_dolby_vision_profile_5_files_to_replace(state: State) -> None:
+    from video_cleaner.decide import DV5_REPLACE_REASON
+
+    _add(state, LIB / "DV5.mkv", "leave_alone", ("already hevc", DV5_REPLACE_REASON))
+    report = build_plan(state)
+    assert any("1 file(s) are Dolby Vision profile 5" in n for n in report.notes)

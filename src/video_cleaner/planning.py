@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.atomicio import write_csv_atomic, write_text_atomic
-from video_cleaner.decide import Action
+from video_cleaner.decide import DV5_REPLACE_REASON, Action
 from video_cleaner.manifest import ManifestEntry, check_unchanged
 from video_cleaner.multipart import find_part_groups
 from video_cleaner.state import FileRecord, State, Status
@@ -186,6 +186,12 @@ def build_plan(state: State) -> PlanReport:
         notes.append(
             f"{counts[Action.FLAG.value]} file(s) flagged: never touched; see their reasons"
         )
+    dv5 = sum(1 for row in rows if DV5_REPLACE_REASON in row.reasons)
+    if dv5:
+        notes.append(
+            f"{dv5} file(s) are Dolby Vision profile 5 with no HDR10 fallback: left alone; "
+            "replace them with another release (see the CSV)"
+        )
     if rows:
         notes.append("estimated savings are survey placeholders until calibration")
     return PlanReport(
@@ -307,6 +313,8 @@ class ResultsReport:
     retry: tuple[tuple[Path, str], ...]
     # Per entry: are its originals still exactly as recorded? "yes", "no" or "unknown".
     unchanged: tuple[str, ...] = ()
+    # Dolby Vision profile 5 files to replace with another release (left alone).
+    replace: tuple[Path, ...] = ()
 
 
 def _saving_pct(entry: ManifestEntry) -> float:
@@ -354,6 +362,7 @@ def build_results(
         flagged=tuple((r.path, why(r)) for r in live if r.status is Status.FLAGGED),
         retry=tuple((r.path, why(r)) for r in live if r.status is Status.RETRY),
         unchanged=() if library_root is None else originals_unchanged(entries, library_root),
+        replace=tuple(r.path for r in live if DV5_REPLACE_REASON in r.reasons),
     )
 
 
