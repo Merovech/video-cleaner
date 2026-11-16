@@ -93,39 +93,7 @@ def test_changed_size_or_mtime_creates_new_record_and_marks_old_stale(state: Sta
     current = state.get(info.path)
     assert current is not None
     assert (current.size, current.mtime, current.status) == (SIZE + 1, MTIME + 10, Status.PENDING)
-    assert state.next_pending() == current
-
-
-def test_next_pending_orders_by_estimated_saving(state: State) -> None:
-    upsert(state, make_info("/m/small.mkv"), saving=10)
-    upsert(state, make_info("/m/big.mkv"), saving=900)
-    upsert(state, make_info("/m/mid.mkv"), saving=500)
-    upsert(state, make_info("/m/left.mkv"), decision="leave_alone", saving=99999)
-    order: list[str] = []
-    while (rec := state.next_pending()) is not None:
-        order.append(rec.path.name)
-        state.set_status(rec.path, Status.QUEUED)
-    assert order == ["big.mkv", "mid.mkv", "small.mkv"]
-
-
-def test_next_pending_empty_is_none(state: State) -> None:
-    assert state.next_pending() is None
-    assert state.next_retry() is None
-
-
-def test_next_retry_is_separate_from_pending(state: State) -> None:
-    upsert(state, make_info("/m/a.mkv"), saving=10)
-    upsert(state, make_info("/m/b.mkv"), saving=50)
-    upsert(state, make_info("/m/c.mkv"), saving=20)
-    state.set_status(Path("/m/b.mkv"), Status.RETRY, "nas dropped")
-    state.set_status(Path("/m/c.mkv"), Status.RETRY)
-    pending = state.next_pending()
-    assert pending is not None
-    assert pending.path == Path("/m/a.mkv")
-    retry = state.next_retry()
-    assert retry is not None
-    assert retry.path == Path("/m/b.mkv")
-    assert retry.note == "nas dropped"
+    assert state.records(Status.PENDING) == [current]
 
 
 def test_resume_after_reopen_keeps_status(tmp_path: Path) -> None:
@@ -142,7 +110,7 @@ def test_resume_after_reopen_keeps_status(tmp_path: Path) -> None:
         assert rec.note == "crf 20"
         assert rec.parts == parts
         assert s2.plan_acknowledged() == "abc"
-        assert s2.next_pending() is None
+        assert s2.records(Status.PENDING) == []
         # Re-planning the unchanged file must not reset an advanced status.
         upsert(s2, make_info(parts[0]), saving=77, parts=parts)
         again = s2.get(parts[0])
@@ -434,7 +402,7 @@ def test_concurrent_use_from_threads(state: State) -> None:
             for i in range(25):
                 upsert(state, make_info(f"/m/t{n}-{i}.mkv"), saving=i)
                 state.counts()
-                state.next_pending()
+                state.records(Status.PENDING)
         except BaseException as exc:
             errors.append(exc)
 
@@ -497,11 +465,9 @@ def test_reset_in_progress_after_simulated_crash(tmp_path: Path) -> None:
         s.set_status(Path("/m/done.mkv"), Status.COMPLETED)
         upsert(s, make_info("/m/ret.mkv"))
         s.set_status(Path("/m/ret.mkv"), Status.RETRY, "earlier")
-    # "kill" happened: reopen. The pickers never return the interrupted records.
+    # "kill" happened: reopen. The interrupted records are not RETRY until reset.
     with State.open(db) as s2:
-        retry = s2.next_retry()
-        assert retry is not None
-        assert retry.path == Path("/m/ret.mkv")
+        assert [r.path for r in s2.records(Status.RETRY)] == [Path("/m/ret.mkv")]
         assert s2.reset_in_progress() == len(IN_PROGRESS)
         counts = s2.counts()
         assert counts[Status.RETRY] == len(IN_PROGRESS) + 1

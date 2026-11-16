@@ -25,7 +25,7 @@ from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
-from video_cleaner.progress import Reporter, RichReporter, _encodable, make_reporter
+from video_cleaner.progress import Reporter, RichReporter, encodable, make_reporter
 from video_cleaner.state import State, StateError
 from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
@@ -36,7 +36,7 @@ app = typer.Typer(
     add_completion=False,
 )
 
-_err = Console(stderr=True)
+_err = Console(stderr=True, emoji=False)
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
 MAX_LISTED_UNPROBEABLE = 20
@@ -140,7 +140,7 @@ def _open_reporter(settings: Settings) -> Iterator[Reporter]:
 
 def _say(text: str = "") -> None:
     """Print a plain line to stdout; file names never break a narrow-encoding console."""
-    typer.echo(_encodable(text, sys.stdout))
+    typer.echo(encodable(text, sys.stdout))
 
 
 def _gib(n: int) -> str:
@@ -398,7 +398,10 @@ def calibrate(
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _say(_calibrate.format_calibration_table(rows))
     _say(f"Table: {settings.state_db.parent / _calibrate.CALIBRATION_TXT}")
-    _say(f"Side-by-side clips: {settings.completed_dir / _calibrate.CLIPS_FOLDER}")
+    _say(
+        f"Side-by-side clips: {settings.completed_dir / _calibrate.CLIPS_FOLDER} "
+        "(newest folder: this sweep)"
+    )
     _say("Approve with `video-cleaner calibrate --approve --vmaf-target X --crf-max Y`.")
 
 

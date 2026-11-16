@@ -230,3 +230,14 @@ def test_stream_order_matters_for_compatibility() -> None:
 
 def test_two_files_without_video_are_incompatible() -> None:
     assert parts_compatible(_info(has_video=False), _info(has_video=False)) is False
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("Movie pt\u0661.mkv", "Movie pt\u0662.mkv"),  # Arabic-Indic digits are not part numbers
+        ("Movie pt1\n.mkv", "Movie pt2\n.mkv"),  # a marker must end the stem exactly
+    ],
+)
+def test_part_marker_is_ascii_digits_at_the_very_end(names: tuple[str, str]) -> None:
+    assert find_part_groups([Path("/m") / n for n in names]) == []

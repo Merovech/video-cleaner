@@ -18,6 +18,7 @@ import math
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from video_cleaner.atomicio import write_text_atomic
@@ -246,6 +247,13 @@ def _row(
     )
 
 
+def _make_folder(folder: Path) -> None:
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CalibrationError(f"cannot create {folder}: {exc}") from exc
+
+
 def run_calibration(
     settings: Settings,
     tools: Tools,
@@ -254,8 +262,13 @@ def run_calibration(
     *,
     samples: int,
     engine: CalibrationEngine,
+    stamp: Callable[[], str] = lambda: f"{datetime.now():%Y%m%d-%H%M%S}",
 ) -> list[CalibrationRow]:
     """Sweep `CALIBRATION_CRFS` over `select_samples` and write the table and the clips.
+
+    The clips of one sweep go to their own ``<completed>/calibration/<stamp>`` folder, so a
+    sweep never mixes with (or deletes) an earlier one. A folder that cannot be created is a
+    `CalibrationError`.
 
     Raises `NotImplementedError` (held) before touching anything while a stage of *engine*
     is still held, `RunRefused` if an output folder is under the library root, `AlreadyRunning`
@@ -271,7 +284,7 @@ def run_calibration(
         raise NotImplementedError(HELD_REASON)
     refuse_outputs_in_library(settings)
     with instance_lock(lock_path_for(settings.state_db)):
-        return _calibrate_locked(settings, tools, state, reporter, samples, engine)
+        return _calibrate_locked(settings, tools, state, reporter, samples, engine, stamp())
 
 
 def _calibrate_locked(
@@ -281,6 +294,7 @@ def _calibrate_locked(
     reporter: Reporter,
     samples: int,
     engine: CalibrationEngine,
+    run_name: str,
 ) -> list[CalibrationRow]:
     picked = select_samples(state.records(), samples)
     if not picked:
@@ -289,15 +303,15 @@ def _calibrate_locked(
         work_root = prepare_tool_scratch(settings.scratch_dir) / CLIPS_FOLDER
     except ScratchNotOurs as exc:
         raise CalibrationError(str(exc)) from None
-    clips = settings.completed_dir / CLIPS_FOLDER
-    clips.mkdir(parents=True, exist_ok=True)
+    clips = settings.completed_dir / CLIPS_FOLDER / run_name
+    _make_folder(clips)
     rows: list[CalibrationRow] = []
     for index, sample in enumerate(picked, start=1):
         workdir = work_root / f"{index:02d}"
         try:
             for crf in CALIBRATION_CRFS:
                 reporter.stage(f"calibrate {index}/{len(picked)} CRF {crf}: {sample.path.name}")
-                workdir.mkdir(parents=True, exist_ok=True)
+                _make_folder(workdir)
                 encoded = engine.encode_sample(tools, settings, sample, crf, workdir, reporter)
                 scores = engine.score_windows(tools, settings, sample, encoded, workdir, reporter)
                 rows.append(_row(sample, crf, encoded, scores))

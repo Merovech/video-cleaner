@@ -22,10 +22,12 @@ MAX_PART_NUMBER = 99
 FPS_TOLERANCE = 0.001
 
 # A trailing part marker on the file stem: optional separators, pt/part/cd, optional
-# separators, one or two digits. The marker must not continue a word ("Concept1" and
-# "Apart 1" are not parts), hence the look-behind for a letter or digit.
+# separators, one or two ASCII digits. The marker must not continue a word ("Concept1" and
+# "Apart 1" are not parts), hence the look-behind for a letter or digit (Unicode-aware, so an
+# accented letter also counts). Matched with fullmatch: "$" would also match before a
+# trailing newline. [0-9], not \d, which accepts other scripts' digits.
 _PART_MARKER = re.compile(
-    r"^(?P<base>.*?)[ ._-]*(?<![^\W_])(?:pt|part|cd)[ ._-]*(?P<number>\d{1,2})$",
+    r"(?P<base>.*?)[ ._-]*(?<![^\W_])(?:pt|part|cd)[ ._-]*(?P<number>[0-9]{1,2})",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -40,7 +42,7 @@ class PartGroup:
 
 def _split_marker(path: Path) -> tuple[str, int] | None:
     """Return (base name, part number) if *path* ends in a part marker, else None."""
-    match = _PART_MARKER.match(path.stem)
+    match = _PART_MARKER.fullmatch(path.stem)
     if match is None:
         return None
     base = match.group("base")

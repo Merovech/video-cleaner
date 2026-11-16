@@ -110,7 +110,8 @@ def _fallback_dirs(name: str, env: Mapping[str, str]) -> list[Path]:
     return sorted(builds, key=lambda p: _version_key(p.parent), reverse=True)
 
 
-def _locate(name: str, env: Mapping[str, str]) -> Path:
+def locate_tool(name: str, env: Mapping[str, str]) -> Path:
+    """Find one tool (``ffmpeg``, ``ffprobe`` or ``mkvmerge``); see `locate_tools`."""
     var = _ENV_VARS[name]
     explicit = env.get(var)
     if explicit:
@@ -140,9 +141,9 @@ def locate_tools(env: Mapping[str, str] | None = None) -> Tools:
     """
     source = os.environ if env is None else env
     return Tools(
-        ffmpeg=_locate("ffmpeg", source),
-        ffprobe=_locate("ffprobe", source),
-        mkvmerge=_locate("mkvmerge", source),
+        ffmpeg=locate_tool("ffmpeg", source),
+        ffprobe=locate_tool("ffprobe", source),
+        mkvmerge=locate_tool("mkvmerge", source),
     )
 
 

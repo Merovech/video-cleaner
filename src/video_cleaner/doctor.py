@@ -23,7 +23,7 @@ from pathlib import Path
 
 from video_cleaner.config import Settings, default_config_path
 from video_cleaner.paths import library_overlaps, name_key
-from video_cleaner.tools import ToolNotFound, _locate
+from video_cleaner.tools import ToolNotFound, locate_tool
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
 DiskUsageFn = Callable[[Path], tuple[int, int, int]]  # (total, used, free), as shutil
@@ -166,7 +166,7 @@ class _Doctor:
 
     def _tool(self, name: str) -> tuple[Check, Path | None]:
         try:
-            path = _locate(name, self.env)
+            path = locate_tool(name, self.env)
         except ToolNotFound as exc:
             return Check(name, False, str(exc)), None
         return Check(name, True, str(path)), path

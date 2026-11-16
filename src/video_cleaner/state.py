@@ -487,23 +487,6 @@ class State:
             ).fetchone()
         return None if row is None else _record(row)
 
-    def _next_with_status(self, status: Status) -> FileRecord | None:
-        with self._tx() as conn:
-            row = conn.execute(
-                f"SELECT {_COLUMNS} FROM files WHERE status = ? "  # noqa: S608  # nosec B608
-                "ORDER BY est_saving_bytes DESC, id ASC LIMIT 1",
-                (status.value,),
-            ).fetchone()
-        return None if row is None else _record(row)
-
-    def next_pending(self) -> FileRecord | None:
-        """The PENDING record with the largest estimated saving (RETRY is `next_retry`)."""
-        return self._next_with_status(Status.PENDING)
-
-    def next_retry(self) -> FileRecord | None:
-        """The RETRY record with the largest estimated saving."""
-        return self._next_with_status(Status.RETRY)
-
     def counts(self) -> dict[Status, int]:
         """Number of records per status, with every status present (zero when none)."""
         with self._tx() as conn:

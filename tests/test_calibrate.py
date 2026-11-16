@@ -251,7 +251,8 @@ def test_calibrate_table_has_size_and_vmaf_per_crf(tmp_path: Path) -> None:
         assert f"{crf:>3}" in table
     assert "57.5" in table  # size % at CRF 17
     assert "91.00" in table and "89.00" in table  # mean and worst VMAF at CRF 17
-    clips = sorted(p.name for p in (settings.completed_dir / "calibration").iterdir())
+    (run_folder,) = (settings.completed_dir / "calibration").iterdir()  # one folder per sweep
+    clips = sorted(p.name for p in run_folder.iterdir())
     assert len(clips) == 8
     assert all(c.endswith(".mp4") for c in clips)
     assert _library_snapshot(settings.library_root) == before
@@ -548,3 +549,34 @@ def test_state_records_the_calibration_sweep(tmp_path: Path) -> None:
         state.record_calibration_sweep()
         swept = state.calibration_swept()
     assert swept is not None and swept[:2] == "20"  # an ISO timestamp
+
+
+def test_each_sweep_gets_its_own_clips_folder(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    stamps = iter(["20261116-010000", "20261116-020000"])
+    with State.open(settings.state_db) as state:
+        _populate(settings, state)
+        for _ in range(2):
+            run_calibration(
+                settings,
+                TOOLS,
+                state,
+                NullReporter(),
+                samples=1,
+                engine=FakeEngine().engine(),
+                stamp=lambda: next(stamps),
+            )
+    folders = sorted(p.name for p in (settings.completed_dir / "calibration").iterdir())
+    assert folders == ["20261116-010000", "20261116-020000"]
+
+
+def test_unwritable_clips_folder_is_a_calibration_error(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings.completed_dir.mkdir(parents=True)
+    (settings.completed_dir / "calibration").write_bytes(b"a file where the folder goes")
+    with State.open(settings.state_db) as state:
+        _populate(settings, state)
+        with pytest.raises(CalibrationError, match="cannot create"):
+            run_calibration(
+                settings, TOOLS, state, NullReporter(), samples=1, engine=FakeEngine().engine()
+            )

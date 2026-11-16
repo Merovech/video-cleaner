@@ -340,3 +340,26 @@ def test_rich_reporter_is_thread_safe() -> None:
 
     assert _run_threads(work) == []
     rep.close()
+
+
+def test_rich_reporter_prints_emoji_codes_literally() -> None:
+    """A file name such as "Smile :smile: (2020).mkv" must not turn into an emoji."""
+    from video_cleaner.progress import make_reporter as _make
+
+    buf = io.StringIO()
+    settings = Settings(
+        library_root=Path("/l"),
+        scratch_dir=Path("/s"),
+        completed_dir=Path("/c"),
+        state_db=Path("/d/s.db"),
+        log_dir=Path("/d/logs"),
+    )
+    rep = _make(settings, is_tty=True, out=buf)
+    rep.file_done("Smile :smile: (2020).mkv done")
+    assert ":smile:" in buf.getvalue()
+
+
+def test_encodable_is_public() -> None:
+    from video_cleaner.progress import encodable
+
+    assert encodable("abc", None) == "abc"

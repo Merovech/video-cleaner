@@ -539,3 +539,10 @@ def test_located_tools_are_absolute(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     found = locate_tools(env)
     assert all(p.is_absolute() for p in (found.ffmpeg, found.ffprobe, found.mkvmerge))
     assert found.ffmpeg == tmp_path / "x" / "ffmpeg.exe"
+
+
+def test_locate_tool_is_public(tmp_path: Path) -> None:
+    from video_cleaner.tools import locate_tool
+
+    exe = _touch(tmp_path / "bin" / "ffmpeg.exe")
+    assert locate_tool("ffmpeg", _fake_env(tmp_path, PATH=str(tmp_path / "bin"))) == exe

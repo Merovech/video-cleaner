@@ -140,7 +140,7 @@ class Reporter(Protocol):
     def file_done(self, summary: str) -> None: ...
 
 
-def _encodable(text: str, stream: IO[str] | None) -> str:
+def encodable(text: str, stream: IO[str] | None) -> str:
     """Make *text* writable to *stream* even if its encoding (e.g. cp1252) lacks characters.
 
     File names reach the reporters, so a redirected, narrow-encoding stream must never crash a
@@ -181,7 +181,7 @@ class PlainReporter:
         out = self._out if self._out is not None else sys.stdout
         line = f"[{self._now():%H:%M:%S}] {text}\n"
         try:
-            out.write(_encodable(line, out))
+            out.write(encodable(line, out))
         except UnicodeEncodeError:
             out.write(line.encode("ascii", errors="backslashreplace").decode("ascii"))
         out.flush()
@@ -213,17 +213,17 @@ class RichReporter:
     """In-place `rich` progress bar for interactive terminals.
 
     Thread-safe: all state and console writes are guarded by one re-entrant lock. Text sent
-    to the console is made encodable first (see `_encodable`).
+    to the console is made encodable first (see `encodable`).
     """
 
     def __init__(self, console: Console | None = None) -> None:
-        self._console = console or Console()
+        self._console = console or Console(emoji=False)
         self._progress: RichProgress | None = None
         self._task: TaskID | None = None
         self._lock = threading.RLock()
 
     def _text(self, text: str) -> str:
-        return _encodable(text, self._console.file)
+        return encodable(text, self._console.file)
 
     def _ensure_started(self) -> RichProgress:
         if self._progress is None:
@@ -283,5 +283,5 @@ def make_reporter(
 ) -> Reporter:
     """A `rich` in-place reporter on a TTY, otherwise plain lines every ``plain_progress_s``."""
     if is_tty:
-        return RichReporter(Console(file=out) if out is not None else None)
+        return RichReporter(Console(file=out, emoji=False) if out is not None else None)
     return PlainReporter(settings.plain_progress_s, clock=clock, out=out)
