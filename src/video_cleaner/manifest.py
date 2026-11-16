@@ -128,14 +128,22 @@ def completed_path_for(settings: Settings, original: Path, *, new_name: str | No
 def check_unchanged(entry: ManifestEntry) -> bool:
     """True only if every original still exists as a file with the recorded size and mtime.
 
-    A vanished, unreadable or replaced original is "changed"; this never raises for one.
+    A missing original (the file or a parent folder is gone, a parent became a file, or the path
+    cannot exist at all, e.g. an embedded NUL) or one that is no longer a regular file counts as
+    "changed" and gives False. Any other `OSError` (permission denied, network timeout, I/O
+    error) means "could not check", not "changed", and propagates to the caller so it can retry
+    instead of discarding a finished encode as stale.
+
+    Caveat: on Windows an unreachable share can surface as `FileNotFoundError`, which is
+    indistinguishable here from a deleted original. Callers must confirm that ``library_root``
+    is reachable before treating a False result for a missing original as stale.
     """
     for path, size, mtime in zip(
         entry.original, entry.original_sizes, entry.original_mtimes, strict=True
     ):
         try:
             st = os.stat(path)
-        except (OSError, ValueError):
+        except (FileNotFoundError, NotADirectoryError, ValueError):
             return False
         if not stat.S_ISREG(st.st_mode) or st.st_size != size or st.st_mtime != mtime:
             return False

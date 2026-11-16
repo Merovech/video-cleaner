@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -636,6 +637,58 @@ def test_check_unchanged_false_when_original_became_a_directory(tmp_path: Path) 
 def test_check_unchanged_false_for_unusable_path(tmp_path: Path) -> None:
     # An embedded NUL makes os.stat raise ValueError rather than OSError.
     entry = make_entry((Path(str(tmp_path / "a") + "\x00.avi"),), tmp_path / "a.mkv")
+
+    assert check_unchanged(entry) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError(errno.EACCES, "access denied"),
+        TimeoutError("share timed out"),
+        OSError(errno.EIO, "I/O error"),
+    ],
+)
+def test_check_unchanged_propagates_errors_that_are_not_a_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    # "Could not check" (NAS drop, permissions) must never look like "original changed".
+    a = make_file(tmp_path / "a.avi")
+    entry = entry_for_files((a,), tmp_path / "a.mkv")
+
+    def fail(*args: object, **kwargs: object) -> os.stat_result:
+        raise error
+
+    monkeypatch.setattr("video_cleaner.manifest.os.stat", fail)
+
+    with pytest.raises(type(error)):
+        check_unchanged(entry)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError(errno.ENOENT, "gone"),
+        NotADirectoryError(errno.ENOTDIR, "parent is a file"),
+    ],
+)
+def test_check_unchanged_false_for_missing_file_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    a = make_file(tmp_path / "a.avi")
+    entry = entry_for_files((a,), tmp_path / "a.mkv")
+
+    def fail(*args: object, **kwargs: object) -> os.stat_result:
+        raise error
+
+    monkeypatch.setattr("video_cleaner.manifest.os.stat", fail)
+
+    assert check_unchanged(entry) is False
+
+
+def test_check_unchanged_false_when_parent_is_a_file(tmp_path: Path) -> None:
+    parent = make_file(tmp_path / "not_a_dir")
+    entry = make_entry((parent / "a.avi",), tmp_path / "a.mkv")
 
     assert check_unchanged(entry) is False
 
