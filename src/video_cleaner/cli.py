@@ -1,6 +1,7 @@
-"""Command-line interface for video-cleaner (Phase 1 command stubs)."""
+"""Command-line interface for video-cleaner."""
 
 import os
+import sys
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -8,7 +9,13 @@ import typer
 from rich.console import Console
 
 from video_cleaner import doctor as doctor_mod
+from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, default_config_path, load_settings
+from video_cleaner.decide import Action
+from video_cleaner.logging_setup import setup_logging
+from video_cleaner.progress import RichReporter, _encodable, make_reporter
+from video_cleaner.state import State
+from video_cleaner.tools import ToolNotFound, locate_tools
 
 app = typer.Typer(
     name="video-cleaner",
@@ -18,6 +25,20 @@ app = typer.Typer(
 )
 
 _err = Console(stderr=True)
+
+# Unprobeable files listed in the survey summary; the CSV has all of them.
+MAX_LISTED_UNPROBEABLE = 20
+
+RootOption = Annotated[
+    Path | None, typer.Option("--root", help="Survey this folder instead of library_root.")
+]
+ConfigOption = Annotated[
+    Path | None, typer.Option("--config", help="Config file (default %APPDATA%\video-cleaner).")
+]
+VerboseOption = Annotated[
+    int, typer.Option("--verbose", "-v", count=True, help="More console logging.")
+]
+QuietOption = Annotated[bool, typer.Option("--quiet", "-q", help="Warnings only on the console.")]
 
 
 def _not_implemented(command: str) -> NoReturn:
@@ -58,10 +79,75 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+def _fail(message: str) -> NoReturn:
+    _err.print(message, markup=False, highlight=False)
+    raise typer.Exit(code=2)
+
+
+def _say(text: str = "") -> None:
+    """Print a plain line to stdout; file names never break a narrow-encoding console."""
+    typer.echo(_encodable(text, sys.stdout))
+
+
+def _gib(n: int) -> str:
+    return f"{n / 1024**3:.1f} GiB"
+
+
+def _print_survey_summary(root: Path, result: _survey.SurveyResult) -> None:
+    files = sum(result.counts.values())
+    _say(f"Survey of {root}: {files} files, {_gib(result.total_bytes)}")
+    for action in Action:
+        _say(f"  {action.value:<12} {result.counts.get(action, 0)}")
+    _say(f"Estimated saving: {_gib(result.est_saving_bytes)} (placeholder until calibration)")
+    _say(
+        f"Flagged: {result.counts.get(Action.FLAG, 0)} "
+        f"(unprobeable: {len(result.unprobeable)}, "
+        f"unrepresentable: {len(result.unrepresentable)})"
+    )
+    for path, reason in result.unprobeable[:MAX_LISTED_UNPROBEABLE]:
+        _say(f"  unprobeable: {path}: {reason}")
+    if len(result.unprobeable) > MAX_LISTED_UNPROBEABLE:
+        _say(f"  ... {len(result.unprobeable) - MAX_LISTED_UNPROBEABLE} more in the CSV")
+    for path in result.unrepresentable:
+        _say(f"  unrepresentable: {path!r}")
+    _say(f"Multi-part groups: {len(result.groups)}")
+    for group in result.groups:
+        _say(f"  {group.output_name}: {', '.join(p.name for p in group.parts)}")
+    _say(f"CSV: {result.csv_path}")
+
+
 @app.command()
-def survey() -> None:
-    """Scan the library and probe every file."""
-    _not_implemented("survey")
+def survey(
+    root: RootOption = None,
+    config: ConfigOption = None,
+    verbose: VerboseOption = 0,
+    quiet: QuietOption = False,
+) -> None:
+    """Scan the library and probe every file (read-only)."""
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        _fail(f"config error: {exc}")
+    surveyed = settings.library_root if root is None else root
+    try:
+        _survey.check_outputs_outside(settings, surveyed)
+    except _survey.SurveyError as exc:
+        _fail(str(exc))
+    setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
+    try:
+        tools = locate_tools()
+    except ToolNotFound as exc:
+        _fail(str(exc))
+    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
+    try:
+        with State.open(settings.state_db) as state:
+            result = _survey.run_survey(settings, tools, state, reporter, root=root)
+    except _survey.SurveyError as exc:
+        _fail(str(exc))
+    finally:
+        if isinstance(reporter, RichReporter):
+            reporter.close()
+    _print_survey_summary(surveyed, result)
 
 
 @app.command()
