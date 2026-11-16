@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from video_cleaner import doctor, encode, quality
+from video_cleaner import doctor, encode, planning, quality
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.encode import CrfSearchResult
@@ -875,7 +875,8 @@ def run_queue(
 ) -> RunSummary:
     """Work through the queue until it is empty, the deadline passes or a stop condition hits.
 
-    Raises `PlanNotAcknowledged` before touching anything if the plan was not acknowledged,
+    Raises `PlanNotAcknowledged` before touching anything if the plan was not acknowledged or
+    the current plan (`planning.plan_hash`) differs from the acknowledged one,
     `CalibrationNotApproved` if no calibration was approved (or the approved CRF ceiling is now
     below the configured ``crf_min``) and `RunRefused` if an output location is under the
     library root. The approved VMAF target and CRF ceiling replace the configured ones for the
@@ -884,9 +885,14 @@ def run_queue(
     current record in its in-progress status (the next run retries it), cleans its scratch and
     propagates.
     """
-    if not state.plan_acknowledged():
+    acknowledged = state.plan_acknowledged()
+    if acknowledged is None:
         raise PlanNotAcknowledged(
             "the plan has not been acknowledged: review and acknowledge it with `plan` first"
+        )
+    if planning.plan_hash(planning.build_plan(state)) != acknowledged:
+        raise PlanNotAcknowledged(
+            "plan changed since it was acknowledged: run plan, review, plan --ack"
         )
     settings = apply_calibration(settings, state)
     refuse_outputs_in_library(settings)

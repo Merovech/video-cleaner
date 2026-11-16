@@ -28,6 +28,7 @@ from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.encode import CrfSearchResult
 from video_cleaner.manifest import ManifestError, read_manifest, write_manifest
+from video_cleaner.planning import build_plan, plan_hash
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.runner import (
@@ -153,10 +154,17 @@ def _plan(
 
 
 def _open_state(settings: Settings) -> State:
+    """The state with an approved calibration; `_run` acknowledges the plan as it stands."""
     state = State.open(settings.state_db)
-    state.acknowledge_plan("plan-hash")
     state.approve_calibration(APPROVED_VMAF, APPROVED_CRF_MAX)
     return state
+
+
+def _ack(state: State) -> str:
+    """Acknowledge the plan exactly as it stands now (what `plan` + `plan --ack` record)."""
+    digest = plan_hash(build_plan(state))
+    state.acknowledge_plan(digest)
+    return digest
 
 
 def _status(state: State, path: Path) -> FileRecord:
@@ -330,7 +338,11 @@ def _run(
     only: Path | None = None,
     clock: Clock | None = None,
     current_log: Path | None = None,
+    ack: bool = True,
 ) -> RunSummary:
+    """run_queue with the fakes; acknowledges the current plan first unless *ack* is False."""
+    if ack:
+        _ack(state)
     return run_queue(
         settings,
         TOOLS,
@@ -392,8 +404,8 @@ def test_deadline_rejects_bad_max_hours(hours: float) -> None:
 def test_run_refuses_without_plan_ack(settings: Settings) -> None:
     with State.open(settings.state_db) as state:
         _plan(state, _source(settings, "a.avi"))
-        with pytest.raises(PlanNotAcknowledged):
-            _run(settings, state, Fakes())
+        with pytest.raises(PlanNotAcknowledged, match="not been acknowledged"):
+            _run(settings, state, Fakes(), ack=False)
         assert _status(state, settings.library_root / "a.avi").status is Status.PENDING
 
 
@@ -797,6 +809,7 @@ def test_held_stub_stops_run_and_leaves_pending(settings: Settings, state: State
         raise NotImplementedError(HELD_REASON)  # not marked held: only found when called
 
     pipeline.search_crf = held_mid_run
+    _ack(state)
     summary = run_queue(
         settings,
         TOOLS,
@@ -1034,6 +1047,7 @@ def test_run_never_writes_under_library_root(settings: Settings, state: State) -
 
     pipeline = fakes.pipeline()
     pipeline.search_crf = search
+    _ack(state)
     summary = run_queue(
         settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
     )
@@ -1068,6 +1082,7 @@ def test_prefetch_uses_a_separate_reporter(
     fakes = Fakes()
     pipeline = fakes.pipeline()
     pipeline.prefetcher = Spy
+    _ack(state)
     summary = run_queue(
         settings, TOOLS, state, foreground, deadline=None, now=Clock(), pipeline=pipeline
     )
@@ -1391,6 +1406,7 @@ def test_default_pipeline_is_refused_before_anything(
     _plan(state, pt1, decision="remux", parts=(pt1, pt2))
     _plan(state, stuck)
     state.set_status(stuck, Status.ENCODING)
+    _ack(state)
     before = {r.path: (r.status, r.note) for r in state.records()}
     events = len(state.events(10_000))
 
@@ -1416,6 +1432,7 @@ def test_stage_marked_held_is_refused_up_front(settings: Settings, state: State)
 
     scores.held = True  # type: ignore[attr-defined]
     pipeline.window_scores = scores
+    _ack(state)
     summary = run_queue(
         settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
     )
@@ -1573,11 +1590,11 @@ def test_run_refused_without_calibration_approval(
     with State.open(settings.state_db) as state:
         src = _source(settings, "a.avi")
         _plan(state, src)
-        state.acknowledge_plan("plan-hash")
+        _ack(state)
         events = len(state.events(10_000))
         fakes = Fakes()
         with pytest.raises(CalibrationNotApproved, match="calibrate"):
-            _run(settings, state, fakes)
+            _run(settings, state, fakes, ack=False)
         # Raised before the held check too: the default (held) pipeline gets the same answer.
         with pytest.raises(CalibrationNotApproved):
             run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
@@ -1592,9 +1609,8 @@ def test_plan_ack_is_checked_before_calibration(settings: Settings) -> None:
     with State.open(settings.state_db) as state:
         state.approve_calibration(APPROVED_VMAF, APPROVED_CRF_MAX)
         with pytest.raises(PlanNotAcknowledged):
-            _run(settings, state, Fakes())
-        state.acknowledge_plan("plan-hash")
-        summary = _run(settings, state, Fakes())  # both given: no refusal
+            _run(settings, state, Fakes(), ack=False)
+        summary = _run(settings, state, Fakes())  # acknowledged and approved: no refusal
         assert summary.stop_reason == ""
 
 
@@ -1614,6 +1630,7 @@ def test_run_uses_the_approved_calibration(settings: Settings, state: State) -> 
 
     pipeline = fakes.pipeline()
     pipeline.search_crf = search
+    _ack(state)
     summary = run_queue(
         settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
     )
@@ -1639,3 +1656,106 @@ def test_approved_crf_max_below_configured_crf_min_is_refused(
         with pytest.raises(CalibrationNotApproved, match="crf_min"):
             _run(settings, state, fakes)
         assert fakes.calls == []
+
+
+# --- plan acknowledgement must match the current plan (Task 14 fix, ruling R15) -------------
+
+
+def test_run_refused_when_plan_changed_since_ack(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_tools(monkeypatch)
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    _ack(state)
+    src.write_bytes(b"y" * 3000)  # the file changed and a survey recorded it
+    _plan(state, src)
+    events = len(state.events(10_000))
+    fakes = Fakes()
+    with pytest.raises(PlanNotAcknowledged, match="plan changed since it was acknowledged"):
+        run_queue(
+            settings,
+            TOOLS,
+            state,
+            RecordingReporter(),
+            deadline=None,
+            now=Clock(),
+            pipeline=fakes.pipeline(),
+        )
+    assert fakes.calls == []
+    assert len(state.events(10_000)) == events
+    assert not settings.scratch_dir.exists()
+    assert not settings.completed_dir.exists()
+
+
+def test_stale_found_by_a_run_needs_a_new_ack(settings: Settings, state: State) -> None:
+    """Deliberate: a run that marks a record STALE changes the plan (STALE drops out of it),
+    so the next run is refused until `plan` is reviewed and acknowledged again."""
+    a = _source(settings, "a.avi")
+    b = _source(settings, "b.avi")
+    _plan(state, a, est=900)
+    _plan(state, b, est=100)
+    _ack(state)
+    fakes = Fakes()
+
+    def touch(src: Path) -> None:
+        if src == a:
+            st = src.stat()
+            os.utime(src, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+
+    fakes.after_copy = touch
+    pipeline = fakes.pipeline()
+    first = run_queue(
+        settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
+    )
+    assert first.completed == 1
+    assert [r.path for r in state.records(Status.STALE)] == [a]
+    with pytest.raises(PlanNotAcknowledged, match="plan changed"):
+        run_queue(
+            settings,
+            TOOLS,
+            state,
+            RecordingReporter(),
+            deadline=None,
+            now=Clock(),
+            pipeline=Fakes().pipeline(),
+        )
+    _ack(state)  # `plan` reviewed and acknowledged again
+    again = run_queue(
+        settings,
+        TOOLS,
+        state,
+        RecordingReporter(),
+        deadline=None,
+        now=Clock(),
+        pipeline=Fakes().pipeline(),
+    )
+    assert again.stop_reason == ""
+
+
+def test_run_progress_keeps_the_ack_valid(settings: Settings, state: State) -> None:
+    a = _source(settings, "a.avi")
+    b = _source(settings, "b.avi")
+    _plan(state, a, est=900)
+    _plan(state, b, est=100)
+    _ack(state)
+    first = run_queue(
+        settings,
+        TOOLS,
+        state,
+        RecordingReporter(),
+        deadline=None,
+        now=Clock(),
+        pipeline=Fakes().pipeline(),
+    )
+    assert first.completed == 2
+    second = run_queue(  # statuses and notes changed, the decisions did not: no new ack needed
+        settings,
+        TOOLS,
+        state,
+        RecordingReporter(),
+        deadline=None,
+        now=Clock(),
+        pipeline=Fakes().pipeline(),
+    )
+    assert second.stop_reason == ""

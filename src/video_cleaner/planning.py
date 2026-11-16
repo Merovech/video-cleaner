@@ -199,8 +199,13 @@ def build_plan(state: State) -> PlanReport:
 def plan_hash(report: PlanReport) -> str:
     """sha256 of the decisions in *report*: path, action, reasons, size, saving, parts.
 
-    The status is left out on purpose: a run advancing files does not change what was
-    acknowledged. Any change a survey records (a new size, another decision or reason) does.
+    Status and note are not part of it, so a run that only advances or finishes files keeps
+    the acknowledgement valid. The hash does change when a survey upserts a different size,
+    decision, reason, saving or parts list, when a new record appears, and when a record turns
+    STALE (it drops out of the live records): the runner marks a record STALE itself when it
+    finds the source changed, so the next run is refused until `plan` is reviewed and
+    acknowledged again. The mtime is intentionally not part of the hash: a touch that leaves
+    every decision the same needs no new review.
     """
     canonical = [
         [
