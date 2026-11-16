@@ -10,7 +10,14 @@ from pathlib import Path, PureWindowsPath
 import pytest
 
 from video_cleaner.probe import MediaInfo
-from video_cleaner.state import FileRecord, State, StateError, Status
+from video_cleaner.state import (
+    FileRecord,
+    StaleRecord,
+    State,
+    StateError,
+    Status,
+    UnrepresentablePath,
+)
 
 SIZE = 8_000_000_000
 MTIME = 1_700_000_000.5
@@ -353,3 +360,142 @@ def test_source_reverting_to_old_key_revives_that_record(state: State) -> None:
     assert rec is not None
     assert rec.size == SIZE
     assert rec.status is Status.PENDING
+
+
+IN_PROGRESS = (
+    Status.QUEUED,
+    Status.COPYING,
+    Status.ENCODING,
+    Status.MUXING,
+    Status.VERIFYING,
+)
+
+
+def test_reset_in_progress_after_simulated_crash(tmp_path: Path) -> None:
+    db = tmp_path / "crash.db"
+    with State.open(db) as s:
+        for i, status in enumerate(IN_PROGRESS):
+            upsert(s, make_info(f"/m/f{i}.mkv"), saving=100 - i)
+            s.set_status(Path(f"/m/f{i}.mkv"), status)
+        upsert(s, make_info("/m/pending.mkv"))
+        upsert(s, make_info("/m/done.mkv"))
+        s.set_status(Path("/m/done.mkv"), Status.COMPLETED)
+        upsert(s, make_info("/m/ret.mkv"))
+        s.set_status(Path("/m/ret.mkv"), Status.RETRY, "earlier")
+    # "kill" happened: reopen. The pickers never return the interrupted records.
+    with State.open(db) as s2:
+        retry = s2.next_retry()
+        assert retry is not None
+        assert retry.path == Path("/m/ret.mkv")
+        assert s2.reset_in_progress() == len(IN_PROGRESS)
+        counts = s2.counts()
+        assert counts[Status.RETRY] == len(IN_PROGRESS) + 1
+        for status in IN_PROGRESS:
+            assert counts[status] == 0
+        assert counts[Status.PENDING] == 1
+        assert counts[Status.COMPLETED] == 1
+        rec = s2.get(Path("/m/f2.mkv"))
+        assert rec is not None
+        assert rec.status is Status.RETRY
+        assert rec.note == "reset after interrupted run"
+        untouched = s2.get(Path("/m/ret.mkv"))
+        assert untouched is not None
+        assert untouched.note == "earlier"
+
+
+def test_reset_in_progress_is_idempotent_and_writes_events(state: State) -> None:
+    for i, status in enumerate((Status.COPYING, Status.ENCODING)):
+        upsert(state, make_info(f"/m/f{i}.mkv"))
+        state.set_status(Path(f"/m/f{i}.mkv"), status)
+    before = len(state.events(limit=1000))
+    assert state.reset_in_progress() == 2
+    lines = state.events(limit=1000)
+    assert len(lines) == before + 2
+    assert all("reset after interrupted run" in line for line in lines[:2])
+    assert any("copying -> retry" in line for line in lines[:2])
+    assert any("encoding -> retry" in line for line in lines[:2])
+    assert state.reset_in_progress() == 0
+    assert len(state.events(limit=1000)) == before + 2
+
+
+def test_reset_in_progress_custom_target_and_ignores_stale(state: State) -> None:
+    upsert(state, make_info("/m/a.mkv"))
+    state.set_status(Path("/m/a.mkv"), Status.ENCODING)
+    upsert(state, make_info("/m/a.mkv", size=SIZE + 1))  # old encoding record becomes stale
+    upsert(state, make_info("/m/b.mkv"))
+    state.set_status(Path("/m/b.mkv"), Status.MUXING)
+    assert state.reset_in_progress(Status.PENDING) == 1
+    rec = state.get(Path("/m/b.mkv"))
+    assert rec is not None
+    assert rec.status is Status.PENDING
+    assert state.counts()[Status.STALE] == 1
+
+
+def test_records_filtering_and_order(state: State) -> None:
+    upsert(state, make_info("/m/b.mkv"))
+    upsert(state, make_info("/m/a.mkv"))
+    upsert(state, make_info("/m/c.mkv"), decision="flag")
+    upsert(state, make_info("/m/a.mkv", size=SIZE + 1))  # stales the first a.mkv
+    state.set_status(Path("/m/b.mkv"), Status.ENCODING)
+    live = state.records()
+    assert [r.path.name for r in live] == ["a.mkv", "b.mkv", "c.mkv"]
+    assert all(r.status is not Status.STALE for r in live)
+    assert [r.path.name for r in state.records(Status.PENDING)] == ["a.mkv"]
+    assert [r.path.name for r in state.records(Status.PENDING, Status.ENCODING)] == [
+        "a.mkv",
+        "b.mkv",
+    ]
+    stale = state.records(Status.STALE)
+    assert [(r.path.name, r.size) for r in stale] == [("a.mkv", SIZE)]
+    assert state.records(Status.COMPLETED) == []
+
+
+def test_set_status_with_old_key_cannot_touch_new_record(state: State) -> None:
+    old = make_info()
+    upsert(state, old)
+    state.set_status(old.path, Status.COPYING)
+    new = make_info(size=SIZE + 7, mtime=MTIME + 3)
+    upsert(state, new)
+    events_before = state.events(limit=1000)
+    with pytest.raises(StaleRecord):
+        state.set_status(old.path, Status.COMPLETED, size=old.size, mtime=old.mtime)
+    current = state.get(old.path)
+    assert current is not None
+    assert (current.size, current.mtime, current.status) == (new.size, new.mtime, Status.PENDING)
+    assert state.counts()[Status.COMPLETED] == 0
+    assert state.events(limit=1000) == events_before
+    assert issubclass(StaleRecord, StateError)
+
+
+def test_set_status_with_unknown_key_raises_stale_record(state: State) -> None:
+    upsert(state, make_info())
+    with pytest.raises(StaleRecord):
+        state.set_status(make_info().path, Status.COMPLETED, size=1, mtime=2.0)
+    assert state.counts()[Status.PENDING] == 1
+
+
+def test_set_status_with_current_key_updates(state: State) -> None:
+    info = make_info()
+    upsert(state, info)
+    state.set_status(info.path, Status.COPYING, "go", size=info.size, mtime=info.mtime)
+    rec = state.get(info.path)
+    assert rec is not None
+    assert (rec.status, rec.note) == (Status.COPYING, "go")
+
+
+def test_unrepresentable_path_raises_before_any_write(state: State) -> None:
+    bad = Path("/m/bad\udc80name.mkv")
+    with pytest.raises(UnrepresentablePath) as excinfo:
+        upsert(state, make_info(bad))
+    assert repr(bad) in str(excinfo.value)
+    assert isinstance(excinfo.value, StateError)
+    assert sum(state.counts().values()) == 0
+    assert state.events() == []
+    with pytest.raises(UnrepresentablePath):
+        state.get(bad)
+    with pytest.raises(UnrepresentablePath):
+        state.set_status(bad, Status.QUEUED)
+    good = make_info("/m/ok.mkv")
+    with pytest.raises(UnrepresentablePath):
+        upsert(state, good, parts=(good.path, bad))
+    assert sum(state.counts().values()) == 0

@@ -31,6 +31,14 @@ class StateError(Exception):
     """The state database cannot be used (closed, or written by a newer version)."""
 
 
+class StaleRecord(StateError):
+    """The (path, size, mtime) record named by the caller is not the live one any more."""
+
+
+class UnrepresentablePath(StateError):
+    """A path cannot be stored (for example a file name with undecodable bytes)."""
+
+
 class Status(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"
@@ -54,6 +62,15 @@ _INITIAL_STATUS: dict[str, Status] = {
 }
 # Statuses in which a re-plan of an unchanged file may still replace the plan.
 _UNSTARTED = (Status.PENDING, Status.LEFT_ALONE, Status.FLAGGED, Status.STALE)
+# Statuses a run passes through; a record left in one of them means the run was interrupted.
+IN_PROGRESS = (
+    Status.QUEUED,
+    Status.COPYING,
+    Status.ENCODING,
+    Status.MUXING,
+    Status.VERIFYING,
+)
+_INTERRUPTED_NOTE = "reset after interrupted run"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -102,7 +119,15 @@ def _now() -> str:
 
 
 def _key(path: Path) -> str:
-    return path.as_posix()
+    """The stored form of *path*; refuses paths SQLite cannot encode, before any write."""
+    text = path.as_posix()
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise UnrepresentablePath(
+            f"path cannot be stored in the state database: {path!r}"
+        ) from None
+    return text
 
 
 def _record(row: Sequence[Any]) -> FileRecord:
@@ -277,26 +302,90 @@ class State:
                 if Status(existing[1]) is Status.STALE:
                     self._event(conn, f"{path}: stale -> {initial.value} (source reverted)")
 
-    def set_status(self, path: Path, status: Status, note: str = "") -> None:
+    def set_status(
+        self,
+        path: Path,
+        status: Status,
+        note: str = "",
+        *,
+        size: int | None = None,
+        mtime: float | None = None,
+    ) -> None:
         """Set the status and note of the live (non-stale) record for *path*.
 
-        Raises KeyError when there is none.
+        With *size* and *mtime* the update targets exactly that (path, size, mtime) record and
+        raises `StaleRecord` if it is not the live one (superseded or unknown), changing nothing;
+        use this for results computed from specific source bytes. Without them, the live record
+        is updated. Raises KeyError when there is no live record at all.
         """
         key = _key(path)
+        if (size is None) != (mtime is None):
+            raise ValueError("size and mtime must be given together")
         with self._tx(write=True) as conn:
-            row = conn.execute(
-                "SELECT id, status FROM files WHERE path = ? AND status != ? "
-                "ORDER BY id DESC LIMIT 1",
-                (key, Status.STALE.value),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"no live state record for {path}")
+            if size is not None:
+                row = conn.execute(
+                    "SELECT id, status FROM files WHERE path = ? AND size = ? AND mtime = ?",
+                    (key, size, mtime),
+                ).fetchone()
+                if row is None or Status(row[1]) is Status.STALE:
+                    raise StaleRecord(
+                        f"no live state record for {path} with size={size} mtime={mtime}"
+                    )
+            else:
+                row = conn.execute(
+                    "SELECT id, status FROM files WHERE path = ? AND status != ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (key, Status.STALE.value),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"no live state record for {path}")
             conn.execute(
                 "UPDATE files SET status = ?, note = ?, updated_at = ? WHERE id = ?",
                 (status.value, note, _now(), row[0]),
             )
             detail = f" ({note})" if note else ""
             self._event(conn, f"{key}: {row[1]} -> {status.value}{detail}")
+
+    def records(self, *statuses: Status) -> list[FileRecord]:
+        """Records with any of *statuses*, ordered by path (then age).
+
+        With no statuses: every live record. STALE records appear only when requested.
+        """
+        with self._tx() as conn:
+            if statuses:
+                marks = ", ".join("?" for _ in statuses)
+                rows = conn.execute(
+                    f"SELECT {_COLUMNS} FROM files WHERE status IN ({marks}) "  # noqa: S608
+                    "ORDER BY path, id",
+                    tuple(s.value for s in statuses),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT {_COLUMNS} FROM files WHERE status != ? "  # noqa: S608
+                    "ORDER BY path, id",
+                    (Status.STALE.value,),
+                ).fetchall()
+        return [_record(r) for r in rows]
+
+    def reset_in_progress(self, to: Status = Status.RETRY) -> int:
+        """Move every record a killed run left in an in-progress status to *to*.
+
+        One transaction, one event per record; returns how many were moved.
+        """
+        marks = ", ".join("?" for _ in IN_PROGRESS)
+        with self._tx(write=True) as conn:
+            rows = conn.execute(
+                f"SELECT id, path, status FROM files WHERE status IN ({marks}) "  # noqa: S608
+                "ORDER BY path, id",
+                tuple(s.value for s in IN_PROGRESS),
+            ).fetchall()
+            for row_id, path, old in rows:
+                conn.execute(
+                    "UPDATE files SET status = ?, note = ?, updated_at = ? WHERE id = ?",
+                    (to.value, _INTERRUPTED_NOTE, _now(), row_id),
+                )
+                self._event(conn, f"{path}: {old} -> {to.value} ({_INTERRUPTED_NOTE})")
+        return len(rows)
 
     def get(self, path: Path) -> FileRecord | None:
         """The live record for *path*, or the most recent stale one if none is live."""
