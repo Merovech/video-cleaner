@@ -17,11 +17,16 @@ LOGGER_NAME = "video_cleaner"
 MASK = "***"
 _HANDLER_TAG = "_video_cleaner_handler"
 
-# Each pattern keeps the label and replaces only the value.
+# Each pattern keeps the label and replaces only the value. A key may carry a prefix
+# (access_token, x_api_key) and a closing quote before the separator (dict/JSON style
+# ``{"password": "x"}``). Values are quoted strings (spaces allowed, masked through the
+# closing quote) or a bare run up to whitespace, a quote or a delimiter.
+_VALUE = r"(?:\"[^\"\n]*\"?|'[^'\n]*'?|[^\s\"'&,;]+)"
+_SEP = r"[\"']?\s*[:=]\s*"
 _GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)(\bapi[-_]?key\s*[:=]\s*)[\"']?[^\s\"'&,;]+"),
-    re.compile(r"(?i)(\bpassword\s*[:=]\s*)[\"']?[^\s\"'&,;]+"),
-    re.compile(r"(?i)(\btoken\s*[:=]\s*)[\"']?[^\s\"'&,;]+"),
+    re.compile(rf"(?i)(api[-_]?key{_SEP}){_VALUE}"),
+    re.compile(rf"(?i)(password{_SEP}){_VALUE}"),
+    re.compile(rf"(?i)(token{_SEP}){_VALUE}"),
     re.compile(r"(?i)(\bbearer\s+)[^\s\"',;]+"),
 )
 
@@ -44,7 +49,13 @@ class RedactingFilter(logging.Filter):
         self._secrets = tuple(s for s in secrets if s)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact(record.getMessage(), self._secrets)
+        try:
+            message = record.getMessage()
+        except Exception:
+            # A malformed log call must never abort the run (the stdlib would only print
+            # "Logging error"); fall back to the raw message plus the arguments.
+            message = f"{record.msg} {record.args!r}" if record.args else str(record.msg)
+        record.msg = redact(message, self._secrets)
         record.args = None
         if record.exc_info and not record.exc_text:
             # Render now (Formatter would do the same) so the text can be redacted.

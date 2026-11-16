@@ -135,3 +135,50 @@ def test_setup_logging_creates_missing_log_dir(tmp_path: Path) -> None:
     target = tmp_path / "a" / "b"
     path = setup_logging(target, verbosity=0)
     assert path.exists()
+
+
+@pytest.mark.parametrize(
+    ("text", "leaked"),
+    [
+        ("{'Api-Key': 'abc123'}", "abc123"),
+        ('{"password": "hunter2"}', "hunter2"),
+        ('{"token":"tok999","x":1}', "tok999"),
+        ("access_token=abc123", "abc123"),
+        ("x_api_key=abc123", "abc123"),
+        ("X_API_KEY: abc123", "abc123"),
+        ('password="my pass phrase"', "pass phrase"),
+        ("password='my pass phrase' next", "pass phrase"),
+        ('{"password": "my pass phrase"}', "pass phrase"),
+        ('api_key = "two words"', "two words"),
+    ],
+)
+def test_redact_dict_underscore_and_quoted_forms(text: str, leaked: str) -> None:
+    out = redact(text)
+    assert leaked not in out
+    assert "***" in out
+
+
+def test_redact_quoted_value_keeps_surrounding_text() -> None:
+    out = redact('before password="my pass phrase" after')
+    assert out.startswith("before ")
+    assert out.endswith(" after")
+
+
+def test_bad_log_call_never_raises_and_still_redacts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = setup_logging(tmp_path, verbosity=1, secrets=["topsecretvalue"])
+    log = logging.getLogger(f"{LOGGER_NAME}.bad")
+    logging.raiseExceptions = False  # keep the stdlib "Logging error" noise out of the test
+    try:
+        log.info("a %s %s", 1)  # too few args
+        log.info("no placeholders", "topsecretvalue")  # too many args
+        log.info("%d items", "topsecretvalue")  # wrong type
+    finally:
+        logging.raiseExceptions = True
+    log.info("still-alive-marker")
+    err = capsys.readouterr().err
+    content = path.read_text(encoding="utf-8")
+    assert "still-alive-marker" in content
+    assert "topsecretvalue" not in err
+    assert "topsecretvalue" not in content

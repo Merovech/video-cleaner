@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -237,3 +240,103 @@ def test_rich_reporter_renders_stage_update_heartbeat_and_summary() -> None:
     text = buf.getvalue()
     assert "ffsubsync, 3m12s elapsed, still working" in text
     assert "Movie (2018).mkv done" in text
+
+
+def _cp1252_stream() -> tuple[io.BytesIO, io.TextIOWrapper]:
+    raw = io.BytesIO()
+    return raw, io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+
+
+def test_plain_reporter_survives_unencodable_file_names() -> None:
+    raw, stream = _cp1252_stream()
+    rep = _plain(FakeClock(), stream)  # type: ignore[arg-type]
+    rep.stage("encode 映画 (2018).mkv")
+    rep.update(Progress(percent=1.0, fps=None, speed=None, eta_s=None))
+    rep.heartbeat("映画", 15.0)
+    rep.file_done("映画 (2018).mkv done")
+    stream.flush()
+    text = raw.getvalue().decode("cp1252")
+    assert "(2018).mkv done" in text
+    assert len(text.splitlines()) == 4
+
+
+def test_rich_reporter_survives_unencodable_file_names() -> None:
+    raw, stream = _cp1252_stream()
+    console = Console(file=stream, force_terminal=True, width=120, color_system=None)
+    rep = RichReporter(console=console)
+    rep.stage("encode 映画.mkv")
+    rep.update(Progress(percent=10.0, fps=1.0, speed=1.0, eta_s=1.0))
+    rep.heartbeat("映画", 15.0)
+    rep.file_done("映画 (2018).mkv done")
+    rep.close()
+    stream.flush()
+    assert "(2018).mkv done" in raw.getvalue().decode("cp1252")
+
+
+class _SlowClock:
+    """Constant clock whose read yields to other threads, widening any check-then-set race."""
+
+    def __call__(self) -> float:
+        time.sleep(0.005)
+        return 1000.0
+
+
+def _run_threads(target: Callable[[int], None], n: int = 8) -> list[BaseException]:
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(n)
+
+    def runner(i: int) -> None:
+        try:
+            barrier.wait()
+            target(i)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=runner, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return errors
+
+
+def test_plain_reporter_rate_limit_holds_across_threads() -> None:
+    out = io.StringIO()
+    rep = PlainReporter(30.0, clock=_SlowClock(), out=out, now=lambda: FIXED_WALL)
+    p = Progress(percent=1.0, fps=None, speed=None, eta_s=None)
+    assert _run_threads(lambda _i: rep.update(p)) == []
+    assert len(out.getvalue().splitlines()) == 1
+
+
+def test_plain_reporter_is_thread_safe() -> None:
+    out = io.StringIO()
+    rep = PlainReporter(0.0001, out=out, now=lambda: FIXED_WALL)
+    p = Progress(percent=1.0, fps=None, speed=None, eta_s=None)
+
+    def work(i: int) -> None:
+        for n in range(50):
+            rep.stage(f"t{i}-{n}")
+            rep.update(p)
+            rep.heartbeat("x", 1.0)
+            rep.file_done("done")
+
+    assert _run_threads(work) == []
+    assert all(line.startswith("[07:30:05] ") for line in out.getvalue().splitlines())
+
+
+def test_rich_reporter_is_thread_safe() -> None:
+    console = Console(file=io.StringIO(), force_terminal=True, width=120, color_system=None)
+    rep = RichReporter(console=console)
+    p = Progress(percent=50.0, fps=1.0, speed=1.0, eta_s=1.0)
+
+    def work(i: int) -> None:
+        for n in range(60):
+            rep.stage(f"t{i}-{n}")
+            rep.update(p)
+            rep.heartbeat("x", 1.0)
+            rep.update(p)
+            rep.file_done("done")
+            rep.update(p)
+
+    assert _run_threads(work) == []
+    rep.close()

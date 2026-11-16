@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, TextIO
+from typing import IO, Protocol, TextIO
 
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     SpinnerColumn,
@@ -138,8 +140,26 @@ class Reporter(Protocol):
     def file_done(self, summary: str) -> None: ...
 
 
+def _encodable(text: str, stream: IO[str] | None) -> str:
+    """Make *text* writable to *stream* even if its encoding (e.g. cp1252) lacks characters.
+
+    File names reach the reporters, so a redirected, narrow-encoding stream must never crash a
+    long run: unencodable characters become backslash escapes.
+    """
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return text
+    try:
+        return text.encode(encoding, errors="backslashreplace").decode(encoding)
+    except (LookupError, UnicodeError):
+        return text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
 class PlainReporter:
-    """Timestamped plain lines; `update` is rate-limited to one line per *interval_s*."""
+    """Timestamped plain lines; `update` is rate-limited to one line per *interval_s*.
+
+    Thread-safe: all state and writes are guarded by one re-entrant lock.
+    """
 
     def __init__(
         self,
@@ -155,43 +175,61 @@ class PlainReporter:
         self._now = now
         self._label = ""
         self._last_update: float | None = None
+        self._lock = threading.RLock()
 
     def _emit(self, text: str) -> None:
         out = self._out if self._out is not None else sys.stdout
-        out.write(f"[{self._now():%H:%M:%S}] {text}\n")
+        line = f"[{self._now():%H:%M:%S}] {text}\n"
+        try:
+            out.write(_encodable(line, out))
+        except UnicodeEncodeError:
+            out.write(line.encode("ascii", errors="backslashreplace").decode("ascii"))
         out.flush()
 
     def stage(self, label: str) -> None:
-        self._label = label
-        self._emit(label)
+        with self._lock:
+            self._label = label
+            self._emit(label)
 
     def update(self, p: Progress) -> None:
-        now = self._clock()
-        if self._last_update is not None and now - self._last_update < self._interval_s:
-            return
-        self._last_update = now
-        prefix = f"{self._label}  " if self._label else ""
-        self._emit(f"{prefix}{format_progress(p)}")
+        with self._lock:
+            now = self._clock()
+            if self._last_update is not None and now - self._last_update < self._interval_s:
+                return
+            self._last_update = now
+            prefix = f"{self._label}  " if self._label else ""
+            self._emit(f"{prefix}{format_progress(p)}")
 
     def heartbeat(self, label: str, elapsed_s: float) -> None:
-        self._emit(format_heartbeat(label, elapsed_s))
+        with self._lock:
+            self._emit(format_heartbeat(label, elapsed_s))
 
     def file_done(self, summary: str) -> None:
-        self._emit(summary)
+        with self._lock:
+            self._emit(summary)
 
 
 class RichReporter:
-    """In-place `rich` progress bar for interactive terminals."""
+    """In-place `rich` progress bar for interactive terminals.
+
+    Thread-safe: all state and console writes are guarded by one re-entrant lock. Text sent
+    to the console is made encodable first (see `_encodable`).
+    """
 
     def __init__(self, console: Console | None = None) -> None:
         self._console = console or Console()
         self._progress: RichProgress | None = None
         self._task: TaskID | None = None
+        self._lock = threading.RLock()
+
+    def _text(self, text: str) -> str:
+        return _encodable(text, self._console.file)
 
     def _ensure_started(self) -> RichProgress:
         if self._progress is None:
             self._progress = RichProgress(
-                SpinnerColumn(),
+                # ASCII spinner on narrow-encoding consoles (the braille frames cannot be encoded).
+                SpinnerColumn("line" if self._console.options.ascii_only else "dots"),
                 TextColumn("{task.description}"),
                 BarColumn(),
                 TextColumn("{task.fields[detail]}"),
@@ -202,34 +240,38 @@ class RichReporter:
         return self._progress
 
     def stage(self, label: str) -> None:
-        progress = self._ensure_started()
-        if self._task is not None:
-            progress.remove_task(self._task)
-        self._task = progress.add_task(label, total=None, detail="")
+        with self._lock:
+            progress = self._ensure_started()
+            if self._task is not None:
+                progress.remove_task(self._task)
+            self._task = progress.add_task(self._text(escape(label)), total=None, detail="")
 
     def update(self, p: Progress) -> None:
-        if self._progress is None or self._task is None:
-            return
-        if p.percent is None:
-            self._progress.update(self._task, total=None, detail=format_progress(p))
-        else:
-            self._progress.update(
-                self._task, total=100.0, completed=p.percent, detail=format_progress(p)
-            )
+        with self._lock:
+            if self._progress is None or self._task is None:
+                return
+            detail = format_progress(p)
+            if p.percent is None:
+                self._progress.update(self._task, total=None, detail=detail)
+            else:
+                self._progress.update(self._task, total=100.0, completed=p.percent, detail=detail)
 
     def heartbeat(self, label: str, elapsed_s: float) -> None:
-        self._console.print(format_heartbeat(label, elapsed_s))
+        with self._lock:
+            self._console.print(self._text(escape(format_heartbeat(label, elapsed_s))))
 
     def file_done(self, summary: str) -> None:
-        self.close()
-        self._console.print(summary)
+        with self._lock:
+            self.close()
+            self._console.print(self._text(escape(summary)))
 
     def close(self) -> None:
         """Stop the live display; safe to call repeatedly."""
-        if self._progress is not None:
-            self._progress.stop()
-            self._progress = None
-            self._task = None
+        with self._lock:
+            if self._progress is not None:
+                self._progress.stop()
+                self._progress = None
+                self._task = None
 
 
 def make_reporter(
