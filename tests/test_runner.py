@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from typer.testing import CliRunner
 
+from video_cleaner import cli as cli_module
 from video_cleaner import doctor as doctor_module
 from video_cleaner import runner as runner_module
 from video_cleaner import scratch as scratch_module
@@ -1198,3 +1200,128 @@ def test_remux_verify_failure_flags(settings: Settings, state: State) -> None:
     summary = _run(settings, state, fakes)
     assert summary.flagged == 1
     assert "extra video streams" in _status(state, src).note
+
+
+# --- CLI `run` (run_queue faked) -----------------------------------------------------------
+
+
+def _cli_config(tmp_path: Path) -> Path:
+    settings = _settings(tmp_path)
+    config = tmp_path / "config.toml"
+    lines = [
+        f"{name} = '{getattr(settings, name)}'"
+        for name in ("library_root", "scratch_dir", "completed_dir", "state_db", "log_dir")
+    ]
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config
+
+
+def _summary(**changes: Any) -> RunSummary:
+    values: dict[str, Any] = {
+        "completed": 2,
+        "left_alone": 1,
+        "flagged": 0,
+        "retry": 0,
+        "bytes_saved": 3 * 1024**3,
+        "stopped_by_deadline": False,
+        "stop_reason": "",
+    }
+    values.update(changes)
+    return RunSummary(**values)
+
+
+def _invoke_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: RunSummary | BaseException,
+    *args: str,
+) -> tuple[Any, list[dict[str, Any]]]:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_queue(*a: Any, **kw: Any) -> RunSummary:
+        calls.append(kw)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(runner_module, "run_queue", fake_run_queue)
+    monkeypatch.setattr(cli_module, "locate_tools", lambda: TOOLS)
+    config = _cli_config(tmp_path)
+    result = CliRunner().invoke(cli_module.app, ["run", "--config", str(config), *args])
+    return result, calls
+
+
+def test_cli_run_completed_exits_0_and_summarises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, calls = _invoke_run(tmp_path, monkeypatch, _summary())
+    assert result.exit_code == 0, result.output
+    assert "completed 2" in result.output
+    assert "left alone 1" in result.output
+    assert "3.0 GiB" in result.output
+    assert "queue finished" in result.output
+    (kw,) = calls
+    assert kw["deadline"] is None and kw["only"] is None
+    assert kw["current_log"].parent == tmp_path / "appdata" / "logs"
+
+
+def test_cli_run_passes_deadline_and_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = tmp_path / "library" / "Films"
+    result, calls = _invoke_run(
+        tmp_path,
+        monkeypatch,
+        _summary(stopped_by_deadline=True),
+        "--until",
+        "07:00",
+        "--max-hours",
+        "3",
+        "--path",
+        str(target),
+    )
+    assert result.exit_code == 0, result.output
+    assert "deadline reached" in result.output
+    (kw,) = calls
+    assert kw["deadline"] is not None
+    assert kw["deadline"] - datetime.now() <= timedelta(hours=3)
+    assert kw["only"] == target
+
+
+@pytest.mark.parametrize("reason", ["scratch full", "library unreachable", "held: Task 10b"])
+def test_cli_run_stop_reason_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary(stop_reason=reason))
+    assert result.exit_code == 1
+    assert f"Run stopped: {reason}" in result.output
+
+
+@pytest.mark.parametrize(
+    "error",
+    [PlanNotAcknowledged("the plan has not been acknowledged"), RunRefused("under the library")],
+)
+def test_cli_run_refusals_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    result, _ = _invoke_run(tmp_path, monkeypatch, error)
+    assert result.exit_code == 2
+    assert str(error) in result.output
+
+
+def test_cli_run_bad_until_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result, calls = _invoke_run(tmp_path, monkeypatch, _summary(), "--until", "25:00")
+    assert result.exit_code == 2
+    assert "HH:MM" in result.output
+    assert calls == []
+
+
+def test_cli_run_config_error_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "run_queue", lambda *a, **k: _summary())
+    result = CliRunner().invoke(cli_module.app, ["run", "--config", str(tmp_path / "missing.toml")])
+    assert result.exit_code == 2
+    assert "config error" in result.output
+
+
+def test_cli_run_interrupt_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result, _ = _invoke_run(tmp_path, monkeypatch, KeyboardInterrupt())
+    assert result.exit_code == 130
+    assert "interrupted" in result.output

@@ -11,7 +11,7 @@ def test_help_lists_phase1_commands() -> None:
         assert cmd in out
 
 
-@pytest.mark.parametrize("cmd", ["plan", "calibrate", "run", "status", "report"])
+@pytest.mark.parametrize("cmd", ["plan", "calibrate", "status", "report"])
 def test_stub_commands_exit_2_not_implemented(cmd: str) -> None:
     result = CliRunner().invoke(app, [cmd])
     assert result.exit_code == 2

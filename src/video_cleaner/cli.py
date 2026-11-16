@@ -2,6 +2,7 @@
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -9,12 +10,13 @@ import typer
 from rich.console import Console
 
 from video_cleaner import doctor as doctor_mod
+from video_cleaner import runner as _runner
 from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, default_config_path, load_settings
 from video_cleaner.decide import Action
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.progress import RichReporter, _encodable, make_reporter
-from video_cleaner.state import State
+from video_cleaner.state import State, StateError
 from video_cleaner.tools import ToolNotFound, locate_tools
 
 app = typer.Typer(
@@ -169,10 +171,75 @@ def calibrate() -> None:
     _not_implemented("calibrate")
 
 
+def _print_run_summary(summary: _runner.RunSummary) -> None:
+    _say(
+        f"Run: completed {summary.completed}, left alone {summary.left_alone}, "
+        f"flagged {summary.flagged}, retry {summary.retry}; saved {_gib(summary.bytes_saved)}"
+    )
+    if summary.stop_reason:
+        _say(f"Run stopped: {summary.stop_reason}")
+    elif summary.stopped_by_deadline:
+        _say("Run ended: deadline reached (the file in progress was finished)")
+    else:
+        _say("Run ended: queue finished")
+
+
 @app.command()
-def run() -> None:
+def run(
+    until: Annotated[
+        str | None,
+        typer.Option("--until", help="Start no new file after this time of day (HH:MM)."),
+    ] = None,
+    max_hours: Annotated[
+        float | None, typer.Option("--max-hours", help="Start no new file after N hours.")
+    ] = None,
+    path: Annotated[
+        Path | None, typer.Option("--path", help="Only process this file or folder.")
+    ] = None,
+    config: ConfigOption = None,
+    verbose: VerboseOption = 0,
+    quiet: QuietOption = False,
+) -> None:
     """Execute the acknowledged plan."""
-    _not_implemented("run")
+    try:
+        settings = load_settings(config)
+    except ConfigError as exc:
+        _fail(f"config error: {exc}")
+    try:
+        deadline = _runner.deadline_from(until, max_hours, datetime.now())
+    except ValueError as exc:
+        _fail(str(exc))
+    log_path = setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
+    try:
+        tools = locate_tools()
+    except ToolNotFound as exc:
+        _fail(str(exc))
+    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
+    try:
+        with State.open(settings.state_db) as state:
+            summary = _runner.run_queue(
+                settings,
+                tools,
+                state,
+                reporter,
+                deadline=deadline,
+                only=path,
+                current_log=log_path,
+            )
+    except (_runner.PlanNotAcknowledged, _runner.RunRefused, StateError) as exc:
+        _fail(str(exc))
+    except KeyboardInterrupt:
+        _err.print(
+            "run interrupted; the file in progress is retried on the next run", highlight=False
+        )
+        raise typer.Exit(code=EXIT_INTERRUPTED) from None
+    finally:
+        if isinstance(reporter, RichReporter):
+            reporter.close()
+    _print_run_summary(summary)
+    _say(f"Log: {log_path}")
+    if summary.stop_reason:
+        raise typer.Exit(code=1)
 
 
 @app.command()
