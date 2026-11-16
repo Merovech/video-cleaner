@@ -18,7 +18,7 @@ under ``library_root``.
 
 The stages are injectable through `Pipeline`. Its defaults are the real implementations; the
 encode, CRF search and VMAF scoring defaults are still held (Task 10b) and raise
-``NotImplementedError("held: Task 10b")``, which stops the run and puts the file back to
+``NotImplementedError(HELD_REASON)``, which stops the run and puts the file back to
 PENDING.
 """
 
@@ -43,6 +43,7 @@ from video_cleaner import doctor, encode, planning, quality
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.encode import CrfSearchResult
+from video_cleaner.held import HELD_REASON, held_stages
 from video_cleaner.instancelock import instance_lock, lock_path_for
 from video_cleaner.logging_setup import redact
 from video_cleaner.manifest import (
@@ -90,7 +91,6 @@ from video_cleaner.verify import VerifyResult, verify_output
 
 _log = logging.getLogger(__name__)
 
-HELD_REASON = "held: Task 10b"
 STOP_SCRATCH_FULL = "scratch full"
 STOP_LIBRARY_UNREACHABLE = "library unreachable"
 STOP_MANIFEST_UNREADABLE = "manifest unreadable"
@@ -222,11 +222,7 @@ class Pipeline:
             "encode_full": self.encode_full,
             "window_scores": self.window_scores,
         }
-        return [
-            name
-            for name, stage in stages.items()
-            if any(stage is held for held in _HELD_STAGES) or getattr(stage, "held", False)
-        ]
+        return held_stages(stages, _HELD_STAGES)
 
 
 # --- deadline and summary ------------------------------------------------------------------

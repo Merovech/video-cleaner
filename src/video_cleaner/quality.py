@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from video_cleaner.held import HELD_REASON
 from video_cleaner.progress import Reporter
 from video_cleaner.tools import Tools
 
@@ -55,4 +56,4 @@ def vmaf_mean(
     parser mis-handles, so it must be escaped away by never passing one. The mean is read
     from the pooled metrics of that log.
     """
-    raise NotImplementedError("held: Task 10b")
+    raise NotImplementedError(HELD_REASON)

@@ -7,7 +7,7 @@ database and the clips to ``<completed>/calibration``. Ari then approves a VMAF 
 ceiling with ``calibrate --approve``; `run` refuses to start until he has.
 
 The real work (encode, VMAF, side-by-side) is injected through `CalibrationEngine`. Its defaults
-are held until Task 10b and raise ``NotImplementedError("held: Task 10b")``; `run_calibration`
+are held until Task 10b and raise ``NotImplementedError(HELD_REASON)``; `run_calibration`
 refuses a held engine before touching anything.
 """
 
@@ -23,9 +23,10 @@ from pathlib import Path
 from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action
+from video_cleaner.held import HELD_REASON, held_stages
 from video_cleaner.instancelock import instance_lock, lock_path_for
 from video_cleaner.progress import Reporter
-from video_cleaner.runner import HELD_REASON, refuse_outputs_in_library
+from video_cleaner.runner import refuse_outputs_in_library
 from video_cleaner.scratch import ScratchNotOurs, prepare_tool_scratch
 from video_cleaner.state import FileRecord, State, Status
 from video_cleaner.tools import Tools
@@ -120,11 +121,7 @@ class CalibrationEngine:
             "score_windows": self.score_windows,
             "make_sidebyside": self.make_sidebyside,
         }
-        return [
-            name
-            for name, stage in stages.items()
-            if any(stage is held for held in _HELD) or getattr(stage, "held", False)
-        ]
+        return held_stages(stages, _HELD)
 
 
 def default_engine() -> CalibrationEngine:

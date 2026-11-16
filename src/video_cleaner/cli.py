@@ -17,6 +17,7 @@ from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
+from video_cleaner.held import HELD_REASON
 from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
@@ -260,7 +261,7 @@ def plan(
 
 
 CALIBRATION_HELD_MESSAGE = (
-    f"{_runner.HELD_REASON}: calibration needs real encodes; it will run once the hold is lifted"
+    f"{HELD_REASON}: calibration needs real encodes; it will run once the hold is lifted"
 )
 
 

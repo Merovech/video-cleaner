@@ -27,13 +27,13 @@ from video_cleaner import scratch as scratch_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.encode import CrfSearchResult
+from video_cleaner.held import HELD_REASON
 from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.manifest import ManifestEntry, ManifestError, read_manifest, write_manifest
 from video_cleaner.planning import build_plan, plan_hash
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.runner import (
-    HELD_REASON,
     CalibrationNotApproved,
     Pipeline,
     PlanNotAcknowledged,

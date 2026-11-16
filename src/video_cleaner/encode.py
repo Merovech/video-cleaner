@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.config import Settings
+from video_cleaner.held import HELD_REASON
 from video_cleaner.probe import MediaInfo
 from video_cleaner.progress import Reporter
 from video_cleaner.tools import Tools
@@ -201,7 +202,7 @@ def search_crf(
     chosen CRF, re-estimated by a linear fit of log(size) against CRF between the two
     samples. Progress is reported through *reporter*; intermediates live in *workdir*.
     """
-    raise NotImplementedError("held: Task 10b")
+    raise NotImplementedError(HELD_REASON)
 
 
 def encode_full(
@@ -214,4 +215,4 @@ def encode_full(
     are stripped, so audio, subtitles, chapters, tags, attachments and cover art are left for
     the mux step to copy from the source untouched.
     """
-    raise NotImplementedError("held: Task 10b")
+    raise NotImplementedError(HELD_REASON)
