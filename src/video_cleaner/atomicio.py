@@ -43,6 +43,36 @@ def write_text_atomic(
         raise
 
 
+# A spreadsheet treats a cell starting with one of these as a formula (CSV injection, CWE-1236).
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+_ESCAPE = "'"
+
+
+def _is_number(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def csv_cell(value: object) -> object:
+    """*value* made safe to open in a spreadsheet: a text cell that would be read as a formula
+    gets a leading apostrophe. Numbers (``-3``, ``"-1.5"``) stay as they are. A text cell that
+    already starts with an apostrophe gets one more, so `csv_cell_value` reverses it exactly.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(_ESCAPE) or (value.startswith(_FORMULA_TRIGGERS) and not _is_number(value)):
+        return _ESCAPE + value
+    return value
+
+
+def csv_cell_value(text: str) -> str:
+    """The original text of a cell written through `csv_cell` (for readers of our own CSVs)."""
+    return text[1:] if text.startswith(_ESCAPE) else text
+
+
 def write_csv_atomic(
     path: Path,
     header: Sequence[str],
@@ -51,9 +81,12 @@ def write_csv_atomic(
     fsync: bool = False,
     errors: str = "strict",
 ) -> None:
-    """Write a CSV (csv module quoting) with *header* and *rows*; see `write_text_atomic`."""
+    """Write a CSV (csv module quoting) with *header* and *rows*; see `write_text_atomic`.
+
+    Every cell goes through `csv_cell`, so no file name can turn into a spreadsheet formula.
+    """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(header)
-    writer.writerows(rows)
+    writer.writerow([csv_cell(cell) for cell in header])
+    writer.writerows([csv_cell(cell) for cell in row] for row in rows)
     write_text_atomic(path, buffer.getvalue(), fsync=fsync, errors=errors)

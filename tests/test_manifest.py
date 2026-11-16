@@ -399,6 +399,33 @@ def test_manifest_roundtrips_names_with_line_breaks_and_leading_spaces(tmp_path:
     assert read_manifest(manifest) == [entry]
 
 
+def test_manifest_neutralises_formulas_and_still_roundtrips(tmp_path: Path) -> None:
+    # Relative paths never reach the manifest in a run; they make every cell start with a
+    # formula trigger (or an apostrophe) so the escaping is exercised both ways.
+    entry = ManifestEntry(
+        original=(Path("=HYPERLINK(1).avi"), Path("'quoted.avi")),
+        original_sizes=(5, 6),
+        original_mtimes=(MTIME, MTIME),
+        completed=Path("@done.mkv"),
+        completed_size=3,
+        vmaf_mean=95.0,
+        vmaf_worst=91.0,
+        crf=20,
+        verified=True,
+        action="-reencode",
+    )
+    manifest = tmp_path / "manifest.csv"
+
+    write_manifest(manifest, [entry])
+
+    with manifest.open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["original"] for r in rows] == ["'=HYPERLINK(1).avi", "''quoted.avi"]
+    assert rows[0]["completed"] == "'@done.mkv"
+    assert rows[0]["action"] == "'-reencode"
+    assert read_manifest(manifest) == [entry]
+
+
 def test_manifest_preserves_exact_mtime_floats(tmp_path: Path) -> None:
     mtimes = (1_700_000_000.1234567, 0.1 + 0.2, 1e-7, 1_731_000_000.0)
     files = tuple(tmp_path / f"p{i}.avi" for i in range(len(mtimes)))

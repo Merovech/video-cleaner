@@ -9,7 +9,12 @@ from typing import Any
 
 import pytest
 
-from video_cleaner.atomicio import write_csv_atomic, write_text_atomic
+from video_cleaner.atomicio import (
+    csv_cell,
+    csv_cell_value,
+    write_csv_atomic,
+    write_text_atomic,
+)
 
 
 def _leftovers(folder: Path, keep: str) -> list[str]:
@@ -83,3 +88,28 @@ def test_write_csv_atomic(tmp_path: Path) -> None:
     with target.open(encoding="utf-8", newline="") as fh:
         assert list(csv.reader(fh)) == [["a", "b"], ["x, y", "1"], ['q"uote', ""]]
     assert _leftovers(tmp_path, "out.csv") == []
+
+
+@pytest.mark.parametrize(
+    "cell",
+    ['=HYPERLINK("http://x")', "+1+cmd", "-2+3", "@SUM(A1)", "\tTab", "\rCR", "'quoted"],
+)
+def test_csv_cell_neutralises_formula_triggers(cell: str) -> None:
+    assert csv_cell(cell) == "'" + cell
+    assert csv_cell_value(str(csv_cell(cell))) == cell
+
+
+@pytest.mark.parametrize(
+    "cell", ["plain", "", "C:\\lib\\a=b.mkv", "-1.5", "-3", "1e-7", 7, -2, -1.25, None]
+)
+def test_csv_cell_leaves_safe_values_alone(cell: object) -> None:
+    assert csv_cell(cell) == cell
+    if isinstance(cell, str):
+        assert csv_cell_value(cell) == cell
+
+
+def test_write_csv_atomic_neutralises_formulas(tmp_path: Path) -> None:
+    target = tmp_path / "out.csv"
+    write_csv_atomic(target, ("name", "n"), [["=1+1", -4], ["@cmd", "-0.5"]])
+    with target.open(encoding="utf-8", newline="") as fh:
+        assert list(csv.reader(fh)) == [["name", "n"], ["'=1+1", "-4"], ["'@cmd", "-0.5"]]

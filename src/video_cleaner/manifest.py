@@ -19,7 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
-from video_cleaner.atomicio import write_csv_atomic
+from video_cleaner.atomicio import csv_cell_value, write_csv_atomic
 from video_cleaner.config import Settings
 
 COMPLETED_SUFFIX = ".mkv"
@@ -296,6 +296,7 @@ def read_manifest(path: Path) -> list[ManifestEntry]:
                 try:
                     if None in row or any(row[c] is None for c in MANIFEST_COLUMNS):
                         raise ManifestError(f"expected {len(header)} fields")
+                    row = {c: csv_cell_value(row[c]) for c in MANIFEST_COLUMNS}
                     original = _parse_path("original", row["original"])
                     size = _parse_int("original_size", row["original_size"])
                     mtime = _parse_float("original_mtime", row["original_mtime"])
