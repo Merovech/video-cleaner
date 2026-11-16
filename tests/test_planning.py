@@ -372,3 +372,24 @@ def test_plan_notes_dolby_vision_profile_5_files_to_replace(state: State) -> Non
     _add(state, LIB / "DV5.mkv", "leave_alone", ("already hevc", DV5_REPLACE_REASON))
     report = build_plan(state)
     assert any("1 file(s) are Dolby Vision profile 5" in n for n in report.notes)
+
+
+def test_cli_log_file_option_writes_the_run_log_there(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    with _cli_state(tmp_path) as st:
+        _populate(st)
+    target = tmp_path / "mine" / "plan.log"
+    result = _invoke("plan", "--config", str(cfg), "-q", "--log-file", str(target))
+    assert result.exit_code == 0, result.output
+    assert target.is_file()
+
+
+def test_cli_log_file_under_the_library_is_refused(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    with _cli_state(tmp_path) as st:
+        _populate(st)
+    target = tmp_path / "library" / "plan.log"
+    result = _invoke("plan", "--config", str(cfg), "-q", "--log-file", str(target))
+    assert result.exit_code == 2
+    assert "library root" in result.output
+    assert not target.exists()

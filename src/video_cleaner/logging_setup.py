@@ -73,17 +73,28 @@ def _console_level(verbosity: int) -> int:
     return logging.DEBUG if verbosity > 0 else logging.INFO
 
 
-def setup_logging(log_dir: Path, *, verbosity: int, secrets: Iterable[str] = ()) -> Path:
+def setup_logging(
+    log_dir: Path,
+    *,
+    verbosity: int,
+    secrets: Iterable[str] = (),
+    log_file: Path | None = None,
+    file_level: int = logging.DEBUG,
+) -> Path:
     """Configure the ``video_cleaner`` logger and return the path of this run's log file.
 
-    The file handler is always DEBUG. The console handler (stderr) is WARNING for
+    The log file is ``run-YYYYMMDD-HHMMSS.log`` in *log_dir*, or *log_file* when given
+    (``--log-file``; its folder is created, *log_dir* is then not). The file handler logs at
+    *file_level* (DEBUG unless the ``log_file_level`` setting says otherwise). The console
+    handler (stderr) is WARNING for
     ``verbosity < 0`` (-q), INFO for 0 and DEBUG for ``> 0`` (-v). Calling this again replaces
     the handlers installed by the previous call. The logger does not propagate, so records
     never reach un-redacted handlers on the root logger.
     """
     secret_list = [s for s in secrets if s]
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"run-{datetime.now():%Y%m%d-%H%M%S}.log"
+    default = log_dir / f"run-{datetime.now():%Y%m%d-%H%M%S}.log"
+    log_path = default if log_file is None else log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger(LOGGER_NAME)
     for old in [h for h in logger.handlers if getattr(h, _HANDLER_TAG, False)]:
@@ -91,7 +102,7 @@ def setup_logging(log_dir: Path, *, verbosity: int, secrets: Iterable[str] = ())
         old.close()
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(file_level)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     )

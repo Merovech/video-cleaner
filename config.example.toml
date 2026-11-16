@@ -51,3 +51,5 @@ completed_dir = 'D:\video-cleaner\completed'
 # heartbeat_s = 15.0
 # Progress line interval when output is not a TTY.
 # plain_progress_s = 30.0
+# Level of the per-run log file: DEBUG, INFO, WARNING or ERROR.
+# log_file_level = "DEBUG"

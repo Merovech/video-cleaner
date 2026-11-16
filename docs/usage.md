@@ -44,7 +44,8 @@ and VMAF stages are enabled.
 
 `survey`, `plan`, `calibrate` and `run` take `--config PATH` (default
 `%APPDATA%\video-cleaner\config.toml`), `-v`/`--verbose` (repeat for more console logging) and
-`-q`/`--quiet` (warnings only); `doctor`, `status` and `report` take `--config` only.
+`-q`/`--quiet` (warnings only) and `--log-file PATH` (this run's log goes there instead of
+`log_dir`); `doctor`, `status` and `report` take `--config` only.
 
 Exit codes: 0 success; 1 a run or calibration that stopped (including `held: Task 10b`) or a
 failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,
@@ -149,6 +150,7 @@ an error. Use TOML literal strings (single quotes) for Windows paths.
 | `preset` | `slow` | x265 preset. |
 | `heartbeat_s` | `15.0` | The console is never silent longer than this. |
 | `plain_progress_s` | `30.0` | Progress line interval when output is not a terminal. |
+| `log_file_level` | `DEBUG` | Level of the run log file (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 
 ## Logs
 

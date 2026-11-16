@@ -1,5 +1,6 @@
 """Command-line interface for video-cleaner."""
 
+import logging
 import os
 import sys
 from collections.abc import Iterator
@@ -52,6 +53,10 @@ VerboseOption = Annotated[
     int, typer.Option("--verbose", "-v", count=True, help="More console logging.")
 ]
 QuietOption = Annotated[bool, typer.Option("--quiet", "-q", help="Warnings only on the console.")]
+LogFileOption = Annotated[
+    Path | None,
+    typer.Option("--log-file", help="Write this run's log here instead of log_dir."),
+]
 
 
 def _check_tag(check: doctor_mod.Check) -> str:
@@ -96,9 +101,22 @@ def _load(config: Path | None) -> Settings:
         _fail(f"config error: {exc}")
 
 
-def _logging(settings: Settings, verbose: int, quiet: bool) -> Path:
-    """Start the run log; ``--quiet`` wins over ``-v``. Returns the log file."""
-    return setup_logging(settings.log_dir, verbosity=-1 if quiet else verbose)
+def _logging(settings: Settings, verbose: int, quiet: bool, log_file: Path | None) -> Path:
+    """Start the run log; ``--quiet`` wins over ``-v``. Returns the log file.
+
+    A ``--log-file`` under the library root is refused (exit 2) before it is created.
+    """
+    if log_file is not None:
+        try:
+            outputs_outside_library(settings, extra=(("log file", log_file),))
+        except OutputInLibrary as exc:
+            _fail(str(exc))
+    return setup_logging(
+        settings.log_dir,
+        verbosity=-1 if quiet else verbose,
+        log_file=log_file,
+        file_level=logging.getLevelName(settings.log_file_level),
+    )
 
 
 def _tools() -> Tools:
@@ -158,6 +176,7 @@ def survey(
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
+    log_file: LogFileOption = None,
 ) -> None:
     """Scan the library and probe every file (read-only)."""
     settings = _load(config)
@@ -166,7 +185,7 @@ def survey(
         _survey.check_outputs_outside(settings, surveyed)
     except _survey.SurveyError as exc:
         _fail(str(exc))
-    _logging(settings, verbose, quiet)
+    _logging(settings, verbose, quiet, log_file)
     tools = _tools()
     with _open_reporter(settings) as reporter:
         try:
@@ -238,11 +257,12 @@ def plan(
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
+    log_file: LogFileOption = None,
 ) -> None:
     """Write the plan (what happens to each file, and why) or acknowledge it."""
     settings = _load_outside_library(config)
     _require_state(settings)
-    _logging(settings, verbose, quiet)
+    _logging(settings, verbose, quiet, log_file)
     if retry is not None:
         if ack:
             _fail("give either --ack or --retry, not both")
@@ -334,6 +354,7 @@ def calibrate(
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
+    log_file: LogFileOption = None,
 ) -> None:
     """Calibrate CRF selection on sample clips, or approve the calibration."""
     settings = _load_outside_library(config)
@@ -353,7 +374,7 @@ def calibrate(
         typer.echo(CALIBRATION_HELD_MESSAGE, err=True)
         raise typer.Exit(code=1)
     _require_state(settings)
-    _logging(settings, verbose, quiet)
+    _logging(settings, verbose, quiet, log_file)
     tools = _tools()
     with _open_reporter(settings) as reporter:
         try:
@@ -405,6 +426,7 @@ def run(
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
+    log_file: LogFileOption = None,
 ) -> None:
     """Execute the acknowledged plan."""
     settings = _load_outside_library(config)
@@ -412,7 +434,7 @@ def run(
         deadline = _runner.deadline_from(until, max_hours, datetime.now())
     except ValueError as exc:
         _fail(str(exc))
-    log_path = _logging(settings, verbose, quiet)
+    log_path = _logging(settings, verbose, quiet, log_file)
     tools = _tools()
     with _open_reporter(settings) as reporter, power.keep_awake():
         try:

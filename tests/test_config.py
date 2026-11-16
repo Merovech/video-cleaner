@@ -245,3 +245,17 @@ def test_env_var_name_for_a_setting() -> None:
     from video_cleaner.config import env_var
 
     assert env_var("vmaf_target") == "VC_VMAF_TARGET"
+
+
+@pytest.mark.parametrize(
+    ("raw", "level"), [("DEBUG", "DEBUG"), ("info", "INFO"), ("Warning", "WARNING")]
+)
+def test_log_file_level_setting(tmp_path: Path, raw: str, level: str) -> None:
+    s = load_settings(None, _env(tmp_path, VC_LOG_FILE_LEVEL=raw))
+    assert s.log_file_level == level
+
+
+def test_log_file_level_default_and_rejects_unknown(tmp_path: Path) -> None:
+    assert load_settings(None, _env(tmp_path)).log_file_level == "DEBUG"
+    with pytest.raises(ConfigError, match="log_file_level"):
+        load_settings(None, _env(tmp_path, VC_LOG_FILE_LEVEL="LOUD"))

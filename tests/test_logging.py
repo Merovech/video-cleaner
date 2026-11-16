@@ -182,3 +182,18 @@ def test_bad_log_call_never_raises_and_still_redacts(
     assert "still-alive-marker" in content
     assert "topsecretvalue" not in err
     assert "topsecretvalue" not in content
+
+
+def test_log_file_option_and_file_level(tmp_path: Path) -> None:
+    target = tmp_path / "chosen" / "my.log"
+    path = setup_logging(tmp_path / "logs", verbosity=0, log_file=target, file_level=logging.INFO)
+    assert path == target
+    log = logging.getLogger(f"{LOGGER_NAME}.test")
+    log.debug("debug-line-marker")
+    log.info("info-line-marker")
+    for handler in logging.getLogger(LOGGER_NAME).handlers:
+        handler.flush()
+    content = target.read_text(encoding="utf-8")
+    assert "info-line-marker" in content
+    assert "debug-line-marker" not in content
+    assert not (tmp_path / "logs").exists()

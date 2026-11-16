@@ -35,6 +35,9 @@ X265_PRESETS = frozenset(
 )
 
 
+LOG_FILE_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
 class ConfigError(ValueError):
     """Raised for any invalid, unknown or missing configuration."""
 
@@ -48,16 +51,17 @@ class Settings:
     log_dir: Path
     scratch_cap_bytes: int = 2 * 10**12
     min_file_size: int = 0
-    bitrate_floor_kbps: int = 2500  # placeholder, set by calibration
+    bitrate_floor_kbps: int = 2500  # placeholder Ari sets; calibration does not change it
     vmaf_target: float = 95.0
     crf_min: int = 16
     crf_max: int = 24
     guard_mean_floor: float = 93.0
-    guard_worst_floor: float = 88.0  # placeholder, set by calibration
+    guard_worst_floor: float = 88.0  # placeholder Ari sets after reviewing the calibration
     min_saving: float = 0.10
     preset: str = "slow"
     heartbeat_s: float = 15.0
     plain_progress_s: float = 30.0
+    log_file_level: str = "DEBUG"
 
 
 def _to_int(name: str, value: object) -> int:
@@ -153,6 +157,10 @@ def _validate(values: Mapping[str, Any]) -> None:
     _require(values["heartbeat_s"] > 0, "heartbeat_s must be positive")
     _require(values["plain_progress_s"] > 0, "plain_progress_s must be positive")
     _require(
+        values["log_file_level"] in LOG_FILE_LEVELS,
+        f"log_file_level {values['log_file_level']!r} must be one of {', '.join(LOG_FILE_LEVELS)}",
+    )
+    _require(
         values["preset"] in X265_PRESETS,
         f"preset {values['preset']!r} is not an x265 preset ({', '.join(sorted(X265_PRESETS))})",
     )
@@ -243,5 +251,6 @@ def load_settings(
                 f"{f.name} is required: set it in the config file or as {env_var(f.name)}"
             )
 
+    values["log_file_level"] = str(values["log_file_level"]).strip().upper()
     _validate(values)
     return Settings(**values)
