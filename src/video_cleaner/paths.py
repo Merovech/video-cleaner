@@ -33,6 +33,13 @@ def name_key(path: Path | str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
+def name_under(path: Path | str, root: Path | str) -> bool:
+    """String-only `is_under`: for selection by scope, never for a safety guard."""
+    inner = name_key(path)
+    outer = name_key(root).rstrip("\\/")
+    return inner == outer or inner.startswith(outer + os.sep)
+
+
 def path_key(path: Path | str) -> str:
     """Comparable form of *path*: resolved, absolute, case- and separator-folded (does I/O)."""
     try:

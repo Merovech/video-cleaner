@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.config import Settings, default_config_path
-from video_cleaner.paths import library_overlaps, path_key
+from video_cleaner.paths import library_overlaps, name_key
 from video_cleaner.tools import ToolNotFound, _locate
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
@@ -353,8 +353,8 @@ def prune_logs(
     current = time.time() if now is None else now
     cutoff = current - keep_days * 86_400
     try:
-        skip = None if exclude is None else path_key(exclude)
-        candidates = [p for p in log_dir.glob(LOG_GLOB) if p.is_file() and path_key(p) != skip]
+        skip = None if exclude is None else name_key(exclude)
+        candidates = [p for p in log_dir.glob(LOG_GLOB) if p.is_file() and name_key(p) != skip]
         logs = sorted((p.stat().st_mtime, p.stat().st_size, p) for p in candidates)
     except OSError:
         return []

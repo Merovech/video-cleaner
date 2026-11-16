@@ -55,7 +55,14 @@ from video_cleaner.manifest import (
 )
 from video_cleaner.multipart import find_part_groups
 from video_cleaner.mux import build_mux_cmd
-from video_cleaner.paths import OutputInLibrary, is_under, outputs_outside_library, path_key
+from video_cleaner.paths import (
+    OutputInLibrary,
+    is_under,
+    name_key,
+    name_under,
+    outputs_outside_library,
+    path_key,
+)
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.scratch import (
@@ -303,14 +310,6 @@ def _delivery_part(target: Path) -> Path:
     return target.with_name(target.name + DELIVERY_SUFFIX)
 
 
-def _file_key(path: Path) -> str:
-    return os.path.normcase(os.path.abspath(path))
-
-
-def _same_file(a: Path, b: Path) -> bool:
-    return _file_key(a) == _file_key(b)
-
-
 def refuse_outputs_in_library(settings: Settings) -> None:
     """Raise `RunRefused` if anything a run writes would land under the library root, or if
     the library root lies inside a folder a run writes to or cleans
@@ -372,6 +371,7 @@ class _Runner:
         self.pipeline = pipeline
         self.deadline = deadline
         self.only = only
+        self.scope = None if only is None else self._scope_for(only)
         self.now = now
         try:
             self.scratch_root = prepare_tool_scratch(settings.scratch_dir)
@@ -389,15 +389,28 @@ class _Runner:
 
     # -- selection ------------------------------------------------------------------------
 
+    def _scope_for(self, only: Path) -> Path:
+        """*only* spelled the way the records are (under ``library_root``), resolved once.
+
+        `--path` may name the library through an alias (a mapped drive for the share); the
+        records use the library root's spelling. Resolving here, once, keeps the per-record
+        scope test string-only (no NAS round trip per record).
+        """
+        root = self.settings.library_root
+        if is_under(only, root):
+            relative = os.path.relpath(path_key(only), path_key(root))
+            return root if relative == os.curdir else root / relative
+        return only
+
     def _in_scope(self, rec: FileRecord) -> bool:
-        if self.only is None:
+        if self.scope is None:
             return True
-        return any(is_under(p, self.only) for p in (rec.path, *rec.parts))
+        return any(name_under(p, self.scope) for p in (rec.path, *rec.parts))
 
     def _wanted(self, rec: FileRecord) -> bool:
         return (
             rec.decision in _WORK_DECISIONS
-            and (path_key(rec.path), rec.size, rec.mtime) not in self.attempted
+            and (name_key(rec.path), rec.size, rec.mtime) not in self.attempted
             and self._in_scope(rec)
         )
 
@@ -428,7 +441,7 @@ class _Runner:
                 target = self._target(rec)
             except (ValueError, _Refused):
                 continue  # flagged with the reason when the record comes up
-            self.claims.setdefault(str(target).casefold(), []).append(rec.path)
+            self.claims.setdefault(name_key(target), []).append(rec.path)
 
     def _library_twin(self, rec: FileRecord, target: Path) -> Path | None:
         """The library file that *target* would later replace, unless it is one of *rec*'s own.
@@ -442,13 +455,12 @@ class _Runner:
             names = os.listdir(folder)
         except OSError:
             return None
-        wanted = relative.name.casefold()
-        own = {path_key(p) for p in (rec.path, *rec.parts)}
+        wanted = name_key(folder / relative.name)
+        own = {name_key(p) for p in (rec.path, *rec.parts)}
         for name in names:
-            if name.casefold() == wanted:
-                twin = folder / name
-                if path_key(twin) not in own:
-                    return twin
+            twin = folder / name
+            if name_key(twin) == wanted and wanted not in own:
+                return twin
         return None
 
     def _precheck(self, rec: FileRecord) -> Path:
@@ -458,9 +470,7 @@ class _Runner:
         except ValueError as exc:
             raise _Refused(str(exc)) from None
         others = [
-            p
-            for p in self.claims.get(str(target).casefold(), [])
-            if path_key(p) != path_key(rec.path)
+            p for p in self.claims.get(name_key(target), []) if name_key(p) != name_key(rec.path)
         ]
         if others:
             raise _Refused(f"output name collides with {', '.join(str(p) for p in others)}")
@@ -507,7 +517,7 @@ class _Runner:
         work.reserved.append(path)
 
     def _copy(self, src: Path, size: int, work: _Work) -> Path:
-        if self.prefetched is not None and path_key(self.prefetched) == path_key(src):
+        if self.prefetched is not None and name_key(self.prefetched) == name_key(src):
             self.prefetched = None
             self.reporter.stage(f"waiting for prefetch: {src.name}")
             result = self.prefetcher.result()
@@ -615,7 +625,8 @@ class _Runner:
         try:
             entries = self._read_manifest()
             write_manifest(
-                self._manifest_path, [e for e in entries if not _same_file(e.completed, target)]
+                self._manifest_path,
+                [e for e in entries if name_key(e.completed) != name_key(target)],
             )
         except (_ManifestTrouble, ManifestError, OSError) as exc:
             _log.warning("could not remove the manifest row of %s: %s", target, exc)
@@ -675,9 +686,9 @@ class _Runner:
         for entry in kept:
             if entry.completed.exists():
                 self._recover(entry)
-        delivered = {_file_key(e.completed) for e in kept}
+        delivered = {name_key(e.completed) for e in kept}
         for part in self.settings.completed_dir.rglob(_DELIVERY_GLOB):
-            if _file_key(part.with_name(part.name[: -len(DELIVERY_SUFFIX)])) in delivered:
+            if name_key(part.with_name(part.name[: -len(DELIVERY_SUFFIX)])) in delivered:
                 continue
             try:
                 part.unlink()
@@ -708,7 +719,7 @@ class _Runner:
         """The (size, mtime) each source had when it was planned."""
         out: list[tuple[int, float]] = []
         for src in sources:
-            if path_key(src) == path_key(rec.path):
+            if name_key(src) == name_key(rec.path):
                 out.append((rec.size, rec.mtime))
                 continue
             member = self.state.get(src)
@@ -774,8 +785,8 @@ class _Runner:
 
         manifest_path = self._manifest_path
         entries = self._read_manifest()
-        key = str(target).casefold()
-        if any(str(e.completed).casefold() == key for e in entries):
+        key = name_key(target)
+        if any(name_key(e.completed) == key for e in entries):
             raise _Refused(f"output {target} is already in the manifest")
         if target.exists():
             raise _Refused(f"output {target} already exists in the completed folder")
@@ -900,10 +911,10 @@ class _Runner:
 
     def process(self, rec: FileRecord) -> str:
         """Handle one record; returns a stop reason, or "" to carry on with the next file."""
-        self.attempted.add((path_key(rec.path), rec.size, rec.mtime))
+        self.attempted.add((name_key(rec.path), rec.size, rec.mtime))
         sources = rec.parts or (rec.path,)
-        if self.prefetched is not None and path_key(self.prefetched) not in {
-            path_key(p) for p in sources
+        if self.prefetched is not None and name_key(self.prefetched) not in {
+            name_key(p) for p in sources
         }:
             self.drop_prefetch()
         try:

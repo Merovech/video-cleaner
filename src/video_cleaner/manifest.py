@@ -21,6 +21,7 @@ from pathlib import Path, PureWindowsPath
 
 from video_cleaner.atomicio import csv_cell_value, write_csv_atomic
 from video_cleaner.config import Settings
+from video_cleaner.paths import name_key
 
 COMPLETED_SUFFIX = ".mkv"
 MANIFEST_COLUMNS: tuple[str, ...] = (
@@ -79,10 +80,6 @@ class ManifestEntry:
             )
 
 
-def _same(a: str, b: str) -> bool:
-    return os.path.normcase(a) == os.path.normcase(b)
-
-
 def _check_new_name(new_name: str) -> None:
     plain = (
         new_name not in ("", ".", "..")
@@ -108,8 +105,8 @@ def completed_path_for(settings: Settings, original: Path, *, new_name: str | No
     """
     root_parts = settings.library_root.parts
     parts = original.parts
-    inside = len(parts) > len(root_parts) and all(
-        _same(mine, theirs) for mine, theirs in zip(parts, root_parts, strict=False)
+    inside = len(parts) > len(root_parts) and name_key(Path(*parts[: len(root_parts)])) == name_key(
+        settings.library_root
     )
     if not inside:
         raise ValueError(f"{original} is not under the library root {settings.library_root}")
@@ -158,7 +155,7 @@ def _rows(entries: Sequence[ManifestEntry]) -> list[list[str]]:
     seen: set[str] = set()
     for entry in entries:
         completed = str(entry.completed)
-        key = os.path.normcase(completed)
+        key = name_key(completed)
         if key in seen:
             raise ManifestError(f"more than one entry for the completed file {completed}")
         seen.add(key)
@@ -300,7 +297,7 @@ def read_manifest(path: Path) -> list[ManifestEntry]:
                     original = _parse_path("original", row["original"])
                     size = _parse_int("original_size", row["original_size"])
                     mtime = _parse_float("original_mtime", row["original_mtime"])
-                    key = os.path.normcase(row["completed"])
+                    key = name_key(row["completed"])
                     group = groups.get(key)
                     if group is None:
                         group = groups[key] = _new_group(row)

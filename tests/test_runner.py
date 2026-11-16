@@ -2038,3 +2038,24 @@ def test_unmarked_tool_folder_is_never_swept(settings: Settings, state: State) -
         _run(settings, state, fakes)
     assert keep.exists()
     assert fakes.calls == []
+
+
+def test_scope_selection_does_no_path_resolution_per_record(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selecting records is string-only: no NAS round trip per record and per pick."""
+    wanted = _source(settings, "Films/a.avi")
+    _plan(state, wanted)
+    for n in range(60):
+        _plan(state, _source(settings, f"Other/{n:02d}.avi"))
+    calls: list[str] = []
+    real = paths_module._resolve
+
+    def counting(p: str) -> str:
+        calls.append(str(p))
+        return real(p)
+
+    monkeypatch.setattr(paths_module, "_resolve", counting)
+    summary = _run(settings, state, Fakes(), only=settings.library_root / "Films")
+    assert summary.completed == 1
+    assert not any("Other" in c for c in calls)

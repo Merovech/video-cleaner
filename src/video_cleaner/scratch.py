@@ -24,7 +24,8 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_cleaner.paths import path_key as _key
+from video_cleaner.paths import is_under
+from video_cleaner.paths import name_key as _key
 from video_cleaner.progress import Progress, Reporter
 
 _log = logging.getLogger(__name__)
@@ -258,18 +259,17 @@ class ScratchManager:
         Refuses anything outside the scratch root: this is the only place that deletes a
         caller-supplied path, and it must never reach the library.
         """
-        key = _key(path)
-        root = _key(self.root)
-        if not key.startswith(root.rstrip("\\/") + os.sep):
+        if not is_under(path, self.root) or _key(path) == _key(self.root):
             raise ValueError(f"refusing to delete {path}: outside the scratch root {self.root}")
+        key = _key(path)
         with self._lock:
             try:
-                size = os.stat(key).st_size
+                size = os.stat(path).st_size
             except OSError:
                 size = 0
             # A failed delete propagates and keeps the reservation: the bytes are still there.
-            Path(key).unlink(missing_ok=True)
-            Path(key + _PART_SUFFIX).unlink(missing_ok=True)
+            Path(path).unlink(missing_ok=True)
+            Path(path).with_name(Path(path).name + _PART_SUFFIX).unlink(missing_ok=True)
             if key in self._bound:
                 del self._bound[key]
             else:
