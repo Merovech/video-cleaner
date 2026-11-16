@@ -712,18 +712,22 @@ class _Runner:
     # -- one file -------------------------------------------------------------------------
 
     def _expected(self, rec: FileRecord, sources: Sequence[Path]) -> list[tuple[int, float]]:
-        """The (size, mtime) each source had when it was planned."""
+        """The (size, mtime) each source had when it was planned.
+
+        A multi-part member with no live record (missing, or STALE: it changed since the
+        survey) raises `_SourceStale`: its planned bytes are unknown, and a fresh stat would
+        silently accept bytes nobody planned.
+        """
         out: list[tuple[int, float]] = []
         for src in sources:
             if name_key(src) == name_key(rec.path):
                 out.append((rec.size, rec.mtime))
                 continue
             member = self.state.get(src)
-            if member is not None and member.status is not Status.STALE:
-                out.append((member.size, member.mtime))
-            else:
-                st = os.stat(src)
-                out.append((st.st_size, st.st_mtime))
+            if member is None or member.status is Status.STALE:
+                state = "missing" if member is None else "stale"
+                raise _SourceStale(f"part {src} has no live survey record ({state})")
+            out.append((member.size, member.mtime))
         return out
 
     def _assert_unchanged(

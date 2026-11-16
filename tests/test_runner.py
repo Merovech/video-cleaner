@@ -7,6 +7,7 @@ No ffmpeg, ffprobe or mkvmerge process is started here.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import stat
@@ -306,14 +307,22 @@ class Fakes:
         self.calls.append(("window_scores", source.path, output))
         return self.scores
 
+    def _probe_encoded(self, path: Path, tools: Tools, reporter: Reporter) -> MediaInfo:
+        """What the probe of an encoded output shows: 10-bit HEVC (like build_x265_cmd)."""
+        info = self.probe(path, tools, reporter)
+        assert info.video is not None
+        video = dataclasses.replace(info.video, codec="hevc", pix_fmt="yuv420p10le")
+        return dataclasses.replace(info, video=video)
+
     def verify(
         self, tools: Tools, original: MediaInfo, output: Path, reporter: Reporter, **kw: Any
     ) -> VerifyResult:
         self.calls.append(("verify", original.path, output, kw))
         if self.verify_result is not None:
             return self.verify_result
+        probe_fn = self._probe_encoded if kw.get("encoded") else self.probe
         return verify_output(
-            tools, original, output, reporter, probe_fn=self.probe, decode_fn=_no_errors, **kw
+            tools, original, output, reporter, probe_fn=probe_fn, decode_fn=_no_errors, **kw
         )
 
     def pipeline(self) -> Pipeline:
@@ -630,6 +639,7 @@ def test_multi_part_remux_delivers_the_appended_file(settings: Settings, state: 
     pt1 = _source(settings, "Epic cd1.mkv", size=1000)
     pt2 = _source(settings, "Epic cd2.mkv", size=1000)
     _plan(state, pt1, decision="remux", parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)
     fakes = Fakes()
     fakes.codec = "hevc"  # already efficient: the combined file is only joined
     summary = _run(settings, state, fakes)
@@ -1089,6 +1099,7 @@ def test_run_never_writes_under_library_root(settings: Settings, state: State) -
     _plan(state, remux, decision="remux", est=0)
     _plan(state, low, est=700)
     _plan(state, pt1, est=600, parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)  # survey records every member part
     before = _tree(settings.library_root)
     fakes = Fakes()
     fakes.fail["probe"] = lambda p: ProbeError(p, "bad") if _named(p, "bad.avi") else None
@@ -2095,3 +2106,23 @@ def test_cli_run_keeps_the_machine_awake_only_while_running(
     result, _ = _invoke_run(tmp_path, monkeypatch, _summary())
     assert result.exit_code == 0, result.output
     assert calls == [power.ES_CONTINUOUS | power.ES_SYSTEM_REQUIRED, power.ES_CONTINUOUS]
+
+
+@pytest.mark.parametrize("member_state", ["missing", "stale"])
+def test_multi_part_member_without_a_live_record_is_stale(
+    settings: Settings, state: State, member_state: str
+) -> None:
+    pt1 = _source(settings, "Epic pt1.avi", size=2000)
+    pt2 = _source(settings, "Epic pt2.avi", size=3000)
+    _plan(state, pt1, parts=(pt1, pt2))
+    if member_state == "stale":
+        _plan(state, pt2, decision="leave_alone", est=0)
+        state.upsert_file(  # pt2 re-surveyed with other bytes, then that record superseded too
+            _info(pt2, 1, 1.0), decision="leave_alone", reasons=(), est_saving_bytes=0
+        )
+        state.set_status(pt2, Status.STALE)
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 0
+    assert _status(state, pt1).status is Status.STALE
+    assert "copy" not in fakes.names()  # never falls back to a fresh stat of the part

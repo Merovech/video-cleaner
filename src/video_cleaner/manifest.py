@@ -78,6 +78,13 @@ class ManifestEntry:
             raise ValueError(
                 f"original_mtimes has {len(self.original_mtimes)} value(s) for {count} original(s)"
             )
+        # The reader refuses non-finite numbers, so the writer must never produce them.
+        if not all(math.isfinite(m) for m in self.original_mtimes):
+            raise ValueError(f"original_mtimes must be finite, got {self.original_mtimes!r}")
+        for name in ("vmaf_mean", "vmaf_worst"):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value!r}")
 
 
 def _check_new_name(new_name: str) -> None:

@@ -2,8 +2,9 @@
 
 `verify_output` probes the produced file and checks it against the original: duration within
 1% + 2 s, a video stream, the same number of audio and subtitle streams, chapters, attachments
-(cover art) and extra video streams kept, a clean full decode, and, for an encode, a size at
-least ``min_saving`` smaller than the original. Every failed check is named in the reason.
+(cover art) and extra video streams kept, a clean full decode, and, for an encode, 10-bit HEVC
+video and a size at least ``min_saving`` smaller than the original. Every failed check is
+named in the reason.
 """
 
 from __future__ import annotations
@@ -18,6 +19,9 @@ from video_cleaner.tools import Tools, run_tool
 
 DURATION_TOLERANCE_FRACTION = 0.01
 DURATION_TOLERANCE_S = 2.0
+ENCODED_CODEC = "hevc"
+# What build_x265_cmd writes (yuv420p10le); any 10-bit format is accepted.
+ENCODED_BIT_DEPTH_MARK = "10"
 
 ProbeFn = Callable[[Path, Tools, Reporter], MediaInfo]
 # Returns the decode errors as text; "" means the file decoded cleanly.
@@ -121,6 +125,11 @@ def verify_output(
             f"by more than {tolerance:.1f} s"
         )
     problems.extend(_count_problems(original, out))
+    if encoded and out.video is not None:
+        if out.video.codec.lower() != ENCODED_CODEC:
+            problems.append(f"encoded video is codec {out.video.codec}, expected {ENCODED_CODEC}")
+        if ENCODED_BIT_DEPTH_MARK not in out.video.pix_fmt:
+            problems.append(f"encoded video has pixel format {out.video.pix_fmt}, expected 10-bit")
     if not problems:
         errors = decode_fn(tools, output, reporter)
         if errors:

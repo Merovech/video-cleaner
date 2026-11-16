@@ -45,6 +45,7 @@ def _info(
     size: int = 4 * GIB,
     duration_s: float = 6000.0,
     codec: str = "h264",
+    pix_fmt: str = "yuv420p",
     video: bool = True,
     audio: int = 2,
     subtitles: int = 1,
@@ -62,7 +63,7 @@ def _info(
             codec=codec,
             width=1920,
             height=1080,
-            pix_fmt="yuv420p",
+            pix_fmt=pix_fmt,
             fps=23.976,
             bit_rate=None,
             transfer="bt709",
@@ -122,7 +123,7 @@ def _verify(out: MediaInfo, *, encoded: bool = True, **kwargs: Any) -> VerifyRes
 
 
 def _good_output(**changes: Any) -> MediaInfo:
-    base = _info(OUTPUT, size=2 * GIB, codec="hevc")
+    base = _info(OUTPUT, size=2 * GIB, codec="hevc", pix_fmt="yuv420p10le")
     return dataclasses.replace(base, **changes)
 
 
@@ -302,3 +303,22 @@ def test_decode_errors_reports_stderr_and_exit_code(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(verify_module, "run_tool", lambda cmd, **kw: next(results))
     assert decode_errors(TOOLS, OUTPUT, REPORTER) == "error while decoding MB 1 2"
     assert decode_errors(TOOLS, OUTPUT, REPORTER) == "ffmpeg exited with code 1"
+
+
+@pytest.mark.parametrize(
+    ("codec", "pix_fmt", "problem"),
+    [
+        ("h264", "yuv420p10le", "codec h264"),
+        ("hevc", "yuv420p", "pixel format yuv420p"),
+    ],
+)
+def test_verify_requires_10_bit_hevc_for_an_encode(codec: str, pix_fmt: str, problem: str) -> None:
+    out = _info(OUTPUT, size=2 * GIB, codec=codec, pix_fmt=pix_fmt)
+    result = _verify(out)
+    assert not result.ok and not result.too_large
+    assert problem in result.reason
+
+
+def test_verify_remux_keeps_whatever_video_the_source_had() -> None:
+    out = _info(OUTPUT, size=4 * GIB, codec="h264", pix_fmt="yuv420p")
+    assert _verify(out, encoded=False).ok

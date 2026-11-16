@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import errno
 import os
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -779,3 +781,12 @@ def test_write_manifest_flushes_to_disk(tmp_path: Path, monkeypatch: pytest.Monk
         tmp_path / "manifest.csv", [make_entry((tmp_path / "a.avi",), tmp_path / "a.mkv")]
     )
     assert len(synced) == 1
+
+
+@pytest.mark.parametrize("field", ["original_mtimes", "vmaf_mean", "vmaf_worst"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_entry_rejects_non_finite_numbers(tmp_path: Path, field: str, bad: float) -> None:
+    entry = make_entry((tmp_path / "a.avi",), tmp_path / "a.mkv")
+    value: Any = (bad,) if field == "original_mtimes" else bad
+    with pytest.raises(ValueError, match=field):
+        dataclasses.replace(entry, **{field: value})
