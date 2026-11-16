@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 _PLAN_HASH_KEY = "plan_ack_hash"
 _CALIBRATION_KEY = "calibration"
+_CALIBRATION_SWEPT_KEY = "calibration_swept_at"
 # The only text interpolated into SQL (the `nosec B608` lines) is this constant and runs of
 # "?" placeholders; every value is bound as a parameter.
 _COLUMNS = "path, size, mtime, status, decision, reasons, est_saving_bytes, parts, note, movie_hash"
@@ -537,6 +538,15 @@ class State:
             self._event(
                 conn, f"calibration approved: vmaf_target={float(vmaf_target)} crf_max={crf_max}"
             )
+
+    def record_calibration_sweep(self) -> None:
+        """Note (no event line) that a calibration sweep finished; approval requires one."""
+        with self._tx(write=True) as conn:
+            self._set_meta(conn, _CALIBRATION_SWEPT_KEY, _now())
+
+    def calibration_swept(self) -> str | None:
+        """When the last calibration sweep finished (ISO timestamp), or None if never."""
+        return self._meta(_CALIBRATION_SWEPT_KEY)
 
     def calibration(self) -> tuple[float, int] | None:
         """The approved ``(vmaf_target, crf_max)``, or None before `approve_calibration`."""

@@ -234,8 +234,9 @@ def test_calibrate_table_has_size_and_vmaf_per_crf(tmp_path: Path) -> None:
         rows = run_calibration(
             settings, TOOLS, state, NullReporter(), samples=2, engine=fake.engine()
         )
-        assert state.events(1000) == events  # the sweep stores nothing; approval is separate
+        assert state.events(1000) == events  # the sweep stores no event; approval is separate
         assert state.calibration() is None
+        assert state.calibration_swept() is not None  # what `calibrate --approve` requires
     assert CALIBRATION_CRFS == (17, 20, 23, 26)
     assert [(r.sample.name, r.crf) for r in rows] == [
         (name, crf) for name in ("Small.avi", "Big.avi") for crf in CALIBRATION_CRFS
@@ -330,8 +331,15 @@ def test_cli_calibrate_runs_with_an_engine(tmp_path: Path, monkeypatch: pytest.M
     assert "calibrate --approve" in result.output
 
 
+def _swept(tmp_path: Path) -> None:
+    """A state database in which a calibration sweep has run."""
+    with State.open(tmp_settings(tmp_path).state_db) as state:
+        state.record_calibration_sweep()
+
+
 def test_cli_calibrate_approve_stores_values(tmp_path: Path) -> None:
     cfg = write_config(tmp_path)
+    _swept(tmp_path)
     result = _invoke(
         "calibrate", "--approve", "--vmaf-target", "94.5", "--crf-max", "23", "--config", str(cfg)
     )
@@ -358,6 +366,7 @@ def test_cli_calibrate_approve_validates(tmp_path: Path, vmaf: str, crf: str) ->
 @pytest.mark.parametrize("vmaf", ["93", "100"])
 def test_cli_calibrate_approve_accepts_bounds(tmp_path: Path, vmaf: str) -> None:
     cfg = write_config(tmp_path)
+    _swept(tmp_path)
     for crf in ("16", "51"):
         result = _invoke(
             "calibrate", "--approve", "--vmaf-target", vmaf, "--crf-max", crf, "--config", str(cfg)
@@ -508,3 +517,34 @@ def test_calibration_never_removes_a_preexisting_scratch_folder(tmp_path: Path) 
             settings, TOOLS, state, NullReporter(), samples=1, engine=FakeEngine().engine()
         )
     assert (foreign / "mine.txt").exists()
+
+
+def test_cli_calibrate_approve_needs_a_state_database(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    result = _invoke(
+        "calibrate", "--approve", "--vmaf-target", "95", "--crf-max", "23", "--config", str(cfg)
+    )
+    assert result.exit_code == 2
+    assert "survey" in result.output
+    assert not (tmp_path / "appdata" / "state.db").exists()  # never creates an empty one
+
+
+def test_cli_calibrate_approve_needs_a_recorded_sweep(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    with State.open(tmp_settings(tmp_path).state_db):
+        pass  # surveyed, never calibrated
+    result = _invoke(
+        "calibrate", "--approve", "--vmaf-target", "95", "--crf-max", "23", "--config", str(cfg)
+    )
+    assert result.exit_code == 2
+    assert "calibrate --samples" in result.output
+    with State.open(tmp_settings(tmp_path).state_db) as state:
+        assert state.calibration() is None
+
+
+def test_state_records_the_calibration_sweep(tmp_path: Path) -> None:
+    with State.open(tmp_path / "s.db") as state:
+        assert state.calibration_swept() is None
+        state.record_calibration_sweep()
+        swept = state.calibration_swept()
+    assert swept is not None and swept[:2] == "20"  # an ISO timestamp

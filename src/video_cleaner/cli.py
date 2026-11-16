@@ -299,8 +299,14 @@ def _approve_calibration(
             f"--crf-max must be between crf_min ({settings.crf_min}) and "
             f"{X265_CRF_MAX}, got {crf_max}"
         )
+    _require_state(settings)  # never creates an empty database
     try:
         with State.open(settings.state_db) as state:
+            if state.calibration_swept() is None:
+                _fail(
+                    "no calibration sweep has been run: run `calibrate --samples N` and review "
+                    "the table before approving"
+                )
             state.approve_calibration(vmaf_target, crf_max)
     except StateError as exc:
         _fail(str(exc))

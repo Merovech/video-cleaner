@@ -260,7 +260,9 @@ def run_calibration(
     Raises `NotImplementedError` (held) before touching anything while a stage of *engine*
     is still held, `RunRefused` if an output folder is under the library root, `AlreadyRunning`
     while a run or another calibration holds the single-instance lock, and
-    `CalibrationError` when there is nothing to sample or a score is unusable. Work files go to
+    `CalibrationError` when there is nothing to sample or a score is unusable. A finished sweep
+    is recorded in *state* (`State.record_calibration_sweep`, no event): `calibrate --approve`
+    requires one. Work files go to
     ``<scratch>/.video-cleaner/calibration`` (the tool-owned scratch folder) and are removed
     after each sample; nothing is stored in *state*.
     """
@@ -308,5 +310,6 @@ def _calibrate_locked(
         write_text_atomic(table, format_calibration_table(rows))
     except OSError as exc:
         raise CalibrationError(f"cannot write {table}: {exc}") from exc
+    state.record_calibration_sweep()
     _log.info("calibration of %d sample(s) written", len(picked))
     return rows
