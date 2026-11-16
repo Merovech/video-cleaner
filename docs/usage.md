@@ -29,18 +29,33 @@ activated virtual environment). `--help` works on every command.
 
 | Command | What it does |
 |---|---|
-| `doctor [--config PATH]` | Checks the environment and prints one line per check: `[ OK ]`, `[WARN]` (informational check failed) or `[FAIL]` (required check failed). Also prunes old run logs. Exit code 0 when all required checks pass, 1 otherwise, 2 for a configuration error. |
-| `survey` | Scans the library read-only and probes every file (codec, resolution, bitrate, HDR, Dolby Vision, subtitles). |
-| `plan` | Dry run: decides per file what will happen (re-encode, remux, leave alone, skip and flag) and projects the savings. The plan must be acknowledged before `run`. |
-| `calibrate` | Runs sample encodes to set the CRF search and the quality guard thresholds. Its results must be approved before `run`. |
-| `run [--until HH:MM] [--max-hours N] [--path X]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. |
-| `status` | Shows the progress of the current or last run. |
-| `report` | Summarises the results of a run. |
+| `doctor` | Checks the environment and prints one line per check: `[ OK ]`, `[WARN]` (informational check failed) or `[FAIL]` (required check failed). Also prunes old run logs. Exit code 0 when all required checks pass, 1 otherwise. |
+| `survey [--root X]` | Scans the library (or only folder `X`) read-only and probes every file (codec, resolution, bitrate, HDR, Dolby Vision, subtitles) and stores its OpenSubtitles movie hash. Writes `survey.csv` beside the state database. |
+| `plan [--ack] [--retry PATH]` | Dry run: decides per file what will happen (re-encode, remux, leave alone, skip and flag) and projects the savings. Writes `plan.csv` and `plan.hash` beside the state database. `--ack` acknowledges the plan last written (its hash must still match the current state). `--retry PATH` puts a file a run left alone or flagged back in the queue. |
+| `calibrate --samples N` | Encodes N sample files at CRF 17/20/23/26, scores them with VMAF and writes `calibration.txt` beside the state database and side-by-side clips to `completed_dir\calibration`. |
+| `calibrate --approve --vmaf-target X --crf-max Y` | Approves a VMAF target (`guard_mean_floor` to 100) and a CRF ceiling (`crf_min` to 51). A run uses these instead of the config's `vmaf_target` and `crf_max`. |
+| `run [--until HH:MM] [--max-hours N] [--path X]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. |
+| `status` | Shows the number of files per status, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
+| `report [--output FILE]` | Writes the results so far to `report.csv` beside the state database (or `FILE`) and prints a summary. |
+
+**Current state (Phase 1, hold):** `doctor`, `survey`, `plan`, `status` and `report` work.
+`run` and `calibrate --samples` refuse with `held: Task 10b` (exit 1) until the encode, CRF search
+and VMAF stages are enabled.
+
+Every command except `doctor` also takes `--config PATH` (default
+`%APPDATA%\video-cleaner\config.toml`), `-v`/`--verbose` (repeat for more console logging) and
+`-q`/`--quiet` (warnings only); `doctor`, `status` and `report` take `--config` only.
+
+Exit codes: 0 success; 1 a run or calibration that stopped (including `held: Task 10b`) or a
+failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,
+an output overlapping the library, another run active, missing state database) or a
+configuration error; 130 interrupted with Ctrl+C.
 
 `doctor` checks: Python 3.11 or 3.12; ffmpeg found and built with `libx265` and `libvmaf`
 (`hevc_nvenc` is informational); ffprobe and mkvmerge found; an NVIDIA GPU visible
 (informational); free space on the scratch drive at least `scratch_cap_bytes`; `library_root`
-readable; `completed_dir` and `scratch_dir` writable and not inside the library; the config
+readable; the state database, log folder, `completed_dir` and `scratch_dir` neither inside the
+library nor containing it ("library overlap"); `completed_dir` and `scratch_dir` writable; the config
 file not readable by other users (informational); `keyring` importable (informational, needed
 from Phase 2). Tools are found through `VC_FFMPEG` / `VC_FFPROBE` / `VC_MKVMERGE`, then `PATH`,
 then the default winget and MKVToolNix install folders.
@@ -64,9 +79,38 @@ then the default winget and MKVToolNix install folders.
    replaced originals' space until they are destroyed, so the saving is realised only after
    old snapshots are deleted.
 5. **`run` is refused until a `plan` has been acknowledged and the calibration approved.**
+   The acknowledgement covers the plan as it was reviewed: after any re-survey, or after a run
+   found a changed (stale) original, run `plan`, review it and `plan --ack` again. The approved
+   `vmaf_target` and `crf_max` override the config values for every run.
+6. **One `run` or `calibrate` at a time.** A second one is refused (exit 2) with the process ID of
+   the one holding `video-cleaner.lock` beside the state database. The lock is released by the
+   operating system when the process ends, so a crash never leaves it stuck.
 
-Reruns skip files that are already done: state is keyed by path, size and modification time,
-so an overwritten original is seen as already HEVC and left alone.
+### The manifest and the completed folder
+
+`manifest.csv` accumulates: every run appends the files it delivered, and rows are never removed
+except to repair an interrupted delivery (see below). `original_mtime` is the original's
+modification time as a float of seconds since the epoch (what `os.stat` reports), so compare it
+numerically, not as a date string. After you have overwritten the originals of some rows on the
+NAS, you may move or delete those completed files; the rows can stay (a row whose record is
+completed and whose file is gone is left as history) or you can archive the manifest and start a
+new one between runs. `completed_dir\calibration` holds calibration clips for viewing only:
+never copy it to the NAS.
+
+A file is delivered as `<name>.mkv.part`, its manifest row is written, and only then is it
+renamed to `<name>.mkv`; a rename never replaces an existing file. If a run is killed in
+between, the next run finishes the rename, drops a row that has no file at all, removes a
+`*.mkv.part` that has no row, and marks the file completed when its delivered output is complete.
+
+### Scratch
+
+All scratch work goes to `scratch_dir\.video-cleaner`, a folder the tool creates with a marker
+file. Only that folder is swept and counted toward `scratch_cap_bytes`, so `scratch_dir` may be a
+shared folder; a dedicated folder is still recommended.
+
+Reruns skip files that are already done: state is keyed by path, size and modification time.
+An overwritten original is seen as already HEVC and left alone only after a re-survey (which
+also requires `plan` and `plan --ack` again); until then the old record stays completed.
 
 A run can also decide to leave a file alone or flag it (projected saving below `min_saving`,
 quality guard or verification failure, output name collision). A re-survey of the unchanged
@@ -84,17 +128,17 @@ an error. Use TOML literal strings (single quotes) for Windows paths.
 | Setting | Default | Meaning |
 |---|---|---|
 | `library_root` | required | Library root, read-only (for example `'\\nas\media'`). |
-| `scratch_dir` | required | Local working area for copies and encodes. |
+| `scratch_dir` | required | Local working area; the tool works only in its `.video-cleaner` subfolder. A dedicated folder is recommended. |
 | `completed_dir` | required | Local folder for finished files and `manifest.csv`. |
 | `state_db` | `%LOCALAPPDATA%\video-cleaner\state.db` | State database. |
 | `log_dir` | `%LOCALAPPDATA%\video-cleaner\logs` | Per-run log files. |
 | `scratch_cap_bytes` | `2000000000000` (2 TB) | Maximum scratch use; `doctor` requires this much free space. |
-| `min_file_size` | `0` | Ignore files smaller than this many bytes. |
-| `bitrate_floor_kbps` | `2500` | Skip files below this video bitrate (set by calibration). |
-| `vmaf_target` | `95.0` | VMAF the per-file CRF search aims for. |
-| `crf_min` / `crf_max` | `16` / `24` | Clamp for the chosen CRF. |
+| `min_file_size` | `0` | Files smaller than this many bytes are not re-encoded (they can still be remuxed as part of a multi-part group). |
+| `bitrate_floor_kbps` | `2500` | Files whose overall container bitrate (video plus audio) is below this are not re-encoded. A placeholder you set in the config; calibration does not change it. |
+| `vmaf_target` | `95.0` | VMAF the per-file CRF search aims for. Overridden by the approved calibration. |
+| `crf_min` / `crf_max` | `16` / `24` | Clamp for the chosen CRF. `crf_max` is overridden by the approved calibration. |
 | `guard_mean_floor` | `93.0` | Post-encode guard: minimum mean VMAF over the sample windows. |
-| `guard_worst_floor` | `88.0` | Post-encode guard: minimum worst-window VMAF (set by calibration). |
+| `guard_worst_floor` | `88.0` | Post-encode guard: minimum worst-window VMAF. A placeholder you set in the config after reviewing the calibration table; calibration does not change it. |
 | `min_saving` | `0.10` | Keep the output only if it is at least this fraction smaller. |
 | `preset` | `slow` | x265 preset. |
 | `heartbeat_s` | `15.0` | The console is never silent longer than this. |

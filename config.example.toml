@@ -12,7 +12,8 @@
 # --- Paths -------------------------------------------------------------------------
 # Read-only library root (the tool never writes here). Required.
 library_root = '\\nas\media'
-# Scratch area for working copies and encodes. Required.
+# Scratch area for working copies and encodes. Required. The tool works only inside its own
+# marked subfolder <scratch_dir>\.video-cleaner; a dedicated folder is still recommended.
 scratch_dir = 'D:\video-cleaner\scratch'
 # Where accepted re-encodes are placed, mirroring the source relative path. Required.
 completed_dir = 'D:\video-cleaner\completed'
@@ -24,19 +25,22 @@ completed_dir = 'D:\video-cleaner\completed'
 # --- Limits and thresholds (values shown are the defaults) -----------------------------
 # Scratch cap in bytes (default 2 TB).
 # scratch_cap_bytes = 2000000000000
-# Ignore files smaller than this many bytes.
+# Files smaller than this many bytes are not re-encoded (a multi-part group can still be remuxed).
 # min_file_size = 0
-# Skip files whose bitrate is below this floor (kbps). Placeholder until calibration.
+# Files whose overall container bitrate (video + audio, kbps) is below this floor are not
+# re-encoded. A placeholder you set here; calibration does not change it.
 # bitrate_floor_kbps = 2500
 
 # --- Quality ---------------------------------------------------------------------------
 # Per-file CRF is searched to reach this VMAF, clamped to crf_min..crf_max.
+# vmaf_target and crf_max are overridden by the calibration approved with
+# `calibrate --approve`.
 # vmaf_target = 95.0
 # crf_min = 16
 # crf_max = 24
 # Post-encode guard: mean VMAF over the sample windows, and the worst window.
 # guard_mean_floor = 93.0
-# guard_worst_floor = 88.0   # placeholder until calibration
+# guard_worst_floor = 88.0   # placeholder you set after reviewing the calibration table
 # Output is kept only if it is at least this fraction smaller (0.10 = 10%).
 # min_saving = 0.10
 # x265 preset.

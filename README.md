@@ -3,8 +3,9 @@
 A Python command-line tool that re-encodes a video library to HEVC (x265) to reclaim disk space,
 without ever modifying the source library.
 
-Status: early development (Phase 1 foundation). `doctor` works; `survey`, `plan`, `calibrate`,
-`run`, `status` and `report` are being built. See [docs/usage.md](docs/usage.md) for the
+Status: early development (Phase 1 foundation). `doctor`, `survey`, `plan`, `status` and
+`report` work. `run` and `calibrate --samples` refuse with `held: Task 10b` (exit 1) until the
+encode, CRF search and VMAF stages are enabled. See [docs/usage.md](docs/usage.md) for the
 commands, the run model, all settings and where logs go.
 
 ## Setup (Windows)
@@ -22,7 +23,9 @@ creates a private `%APPDATA%\video-cleaner\config.toml` from `config.example.tom
 - The library root is read-only: the tool never writes to, renames or deletes anything there.
 - A re-encode is accepted only if the result is at least 10% smaller; otherwise the original stays.
 - Audio, chapters, attachments and all audio/subtitle tracks are copied untouched.
-- HDR, Dolby Vision, interlaced, 4K, already-HEVC/AV1 and low-bitrate files are flagged and skipped.
+- 4K, already-HEVC/AV1, low-bitrate and small files are left alone (not re-encoded).
+- Encode candidates that are HDR, Dolby Vision, interlaced or have several video streams are
+  flagged and skipped for review.
 
 ## Requirements
 
