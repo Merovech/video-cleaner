@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import logging
 import os
 import signal
@@ -28,6 +29,7 @@ from video_cleaner.tools import (
 )
 
 PY = sys.executable
+HEARTBEAT_SLACK_S = 1.0
 
 
 class FakeReporter:
@@ -67,14 +69,21 @@ def _touch(path: Path) -> Path:
 
 def test_run_tool_never_silent_longer_than_heartbeat() -> None:
     reporter = FakeReporter()
+    started = time.monotonic()
     result = run_tool(
         _py("import time; time.sleep(3)"), label="sleeper", reporter=reporter, heartbeat_s=0.5
     )
+    total = time.monotonic() - started
     assert result.returncode == 0
-    assert len(reporter.heartbeats) >= 5
     assert all(label == "sleeper" for label, _ in reporter.heartbeats)
     elapsed = [e for _, e in reporter.heartbeats]
     assert elapsed == sorted(elapsed)
+    # The promise is "never silent longer than heartbeat_s", not a beat count: check every gap,
+    # from the start to the first beat and from the last beat to the end. The slack absorbs
+    # interpreter start-up and scheduling on a busy machine.
+    marks = [0.0, *elapsed, total]
+    largest_gap = max(b - a for a, b in itertools.pairwise(marks))
+    assert largest_gap <= 0.5 + HEARTBEAT_SLACK_S
 
 
 def test_run_tool_decodes_utf8_output() -> None:

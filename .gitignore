@@ -1,5 +1,6 @@
 # Secrets and local config
 .env
+.env.*
 config.toml
 
 # State, logs, outputs
