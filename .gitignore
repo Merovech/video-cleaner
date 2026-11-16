@@ -1,0 +1,35 @@
+# Secrets and local config
+.env
+config.toml
+
+# State, logs, outputs
+*.db
+*.sqlite
+*.log
+logs/
+completed/
+scratch/
+tmp/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Controller workspace
+.superpowers/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

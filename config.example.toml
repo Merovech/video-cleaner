@@ -1,0 +1,17 @@
+# video-cleaner example configuration.
+#
+# Copy to %APPDATA%\video-cleaner\config.toml and edit. The real config file is git-ignored.
+# Any value can be overridden by an environment variable named VC_<SECTION>_<KEY>
+# (for example VC_PATHS_SCRATCH). Placeholder values below are examples only.
+
+[paths]
+# Read-only library root (the tool never writes here).
+library = '\nas\media'
+# Scratch area for working copies and encodes.
+scratch = 'D:\video-cleaner\scratch'
+# Where accepted re-encodes are placed, mirroring the source relative path.
+completed = 'D:\video-cleaner\completed'
+
+[limits]
+# Scratch cap in terabytes.
+scratch_cap_tb = 2.0
