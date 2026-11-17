@@ -34,16 +34,21 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg mkvtoolnix
 
       - name: Install ffmpeg (Windows)
         if: runner.os == 'Windows'
-        run: choco install ffmpeg-full -y --no-progress
+        run: choco install ffmpeg-full mkvtoolnix -y --no-progress
 
       - name: Check ffmpeg has libx265 and libvmaf
         run: |
           ffmpeg -hide_banner -encoders | grep libx265
-          ffmpeg -hide_banner -filters | grep libvmaf
+          # Ubuntu's packaged ffmpeg has no libvmaf. Nothing run in CI needs it until the real
+          # VMAF code (Task 10b) lands, so it is only a warning on Linux and a failure on Windows.
+          if ! ffmpeg -hide_banner -filters | grep libvmaf; then
+            if [ "$RUNNER_OS" = "Windows" ]; then exit 1; fi
+            echo "::warning::this ffmpeg build has no libvmaf; VMAF tests cannot run on this runner"
+          fi
 
       - name: Ruff lint
         run: uv run ruff check .
