@@ -656,16 +656,27 @@ class _Runner:
         note = f"{entry.action}: saved {saved} bytes ({RECOVERED_NOTE})"
         self._finish(rec, _Outcome(Status.COMPLETED, note, saved))
 
-    def _delivered_earlier(self, entry: ManifestEntry) -> bool:
+    def _delivery_interrupted(self, entry: ManifestEntry) -> bool:
+        """True if a killed run left the record of exactly this *entry*'s original unfinished.
+
+        Only then is a row without a file a half-made delivery. Any other state (completed, an
+        overwritten and re-surveyed original with a new key, no record) means the row is history.
+        """
         rec = self.state.get(entry.original[0])
-        return rec is not None and rec.status is Status.COMPLETED
+        return (
+            rec is not None
+            and (rec.size, rec.mtime) == (entry.original_sizes[0], entry.original_mtimes[0])
+            and rec.status in (Status.RETRY, *IN_PROGRESS)
+        )
 
     def reconcile(self) -> str:
         """Repair what a run killed during delivery left behind. Returns a stop reason or "".
 
         A manifest row whose target is missing but whose ``.part`` exists gets the rename
-        finished; a row with neither file is dropped unless its record is already COMPLETED (a
-        delivery the owner has since moved away); a delivered target whose record a killed run
+        finished; a row with neither file is dropped only when the record of exactly that original
+        (same path, size and mtime) was left in progress or RETRY by a killed run; any other row
+        is history (a delivery the owner moved away, or an original overwritten and re-surveyed);
+        a delivered target whose record a killed run
         left in progress or RETRY is marked COMPLETED; and a ``*.mkv.part`` with no row is
         removed. Nothing else in the completed folder is touched.
         """
@@ -683,7 +694,7 @@ class _Runner:
                     _log.info("finished the interrupted delivery of %s", target)
                 except OSError as exc:
                     _log.warning("could not finish the delivery of %s: %s", target, exc)
-            if target.exists() or part.exists() or self._delivered_earlier(entry):
+            if target.exists() or part.exists() or not self._delivery_interrupted(entry):
                 kept.append(entry)
             else:
                 _log.warning("dropped the manifest row of %s: no output was delivered", target)

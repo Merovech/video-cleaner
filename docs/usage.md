@@ -100,14 +100,15 @@ modification time as a float of seconds since the epoch (what `os.stat` reports)
 numerically, not as a date string. `video-cleaner report` does this check for you: it prints
 `yes`/`no`/`unknown` per completed file and writes it to the `original_unchanged` column of
 `report.csv`; only a `yes` file may replace its original(s). After you have overwritten the originals of some rows on the
-NAS, you may move or delete those completed files; the rows can stay (a row whose record is
-completed and whose file is gone is left as history) or you can archive the manifest and start a
+NAS, you may move or delete those completed files; the rows can stay (a row whose file is gone is left as
+history, even after you overwrite the original and re-survey it) or you can archive the manifest and start a
 new one between runs. `completed_dir\calibration` holds calibration clips for viewing only:
 never copy it to the NAS.
 
 A file is delivered as `<name>.mkv.part`, its manifest row is written, and only then is it
 renamed to `<name>.mkv`; a rename never replaces an existing file. If a run is killed in
-between, the next run finishes the rename, drops a row that has no file at all, removes a
+between, the next run finishes the rename, drops a row that has no file at all only if that
+original's record was left unfinished, removes a
 `*.mkv.part` that has no row, and marks the file completed when its delivered output is complete.
 
 ### Scratch

@@ -1996,6 +1996,30 @@ def test_startup_reconciles_manifest_and_completed_folder(settings: Settings, st
     assert foreign.exists()
 
 
+def test_reconcile_keeps_history_after_overwrite_and_resurvey(
+    settings: Settings, state: State
+) -> None:
+    """A delivered row stays after the owner overwrote the original and re-surveyed it."""
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    assert _run(settings, state, Fakes()).completed == 1
+    folder = settings.completed_dir
+    before = read_manifest(folder / "manifest.csv")
+    assert len(before) == 1
+    # The owner overwrites the original with the delivered file, moves it away, and re-surveys:
+    # the path now has a new size and mtime, so the old record is replaced by a LEFT_ALONE one.
+    before[0].completed.unlink()
+    src.write_bytes(b"h" * 321)
+    _plan(state, src, decision="leave_alone", est=0)
+    assert _status(state, src).status is Status.LEFT_ALONE
+
+    fakes = Fakes()
+    fakes.fail["copy"] = lambda p: ToolNotFound("stop")  # stop before any real work
+    _run(settings, state, fakes)
+
+    assert read_manifest(folder / "manifest.csv") == before
+
+
 def test_failed_final_rename_leaves_no_row_and_no_part(
     settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
 ) -> None:
