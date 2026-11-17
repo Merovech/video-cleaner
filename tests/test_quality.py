@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -105,6 +106,8 @@ def test_vmaf_cmd_distorted_first_reference_second_normalised() -> None:
     assert "log_fmt=json" in graph
     assert "n_threads=8" in graph
     assert "shortest=1" in graph
+    # pair frames by nearest timestamp: Matroska 1 ms rounding must not shift a frame
+    assert "ts_sync_mode=nearest" in graph
     # only video is scored, nothing is written but the log
     assert cmd[-3:] == ["-f", "null", "-"]
     for flag in ("-an", "-sn", "-dn"):
@@ -320,3 +323,35 @@ def test_real_vmaf_identical_is_about_100_and_degraded_is_much_lower(tmp_path: P
     assert windowed > 99.0
     assert not any(p.suffix == ".json" for p in work.iterdir())
     shutil.rmtree(work)
+
+
+@pytest.mark.integration
+def test_real_vmaf_pairs_frames_despite_matroska_timestamp_jitter(tmp_path: Path) -> None:
+    """A 23.976 fps MKV has 41/42 ms frame steps; a re-encode may round some the other way.
+
+    libvmaf's default frame sync pairs a distorted frame with the reference frame at or before
+    its timestamp, so a frame 1 ms early is paired with the previous frame and scores near 0.
+    Measured on a real film: a near-lossless encode scored 85.9 instead of 99. Here the
+    reference carries rounded-up millisecond timestamps (an mkvmerge timestamp file) and the
+    near-lossless copy ffmpeg's rounded ones; default pairing scored it 73.8.
+    """
+    tools = vmaf_tools()
+    base = make_clip(tools, tmp_path / "base.mkv", duration_s=4.0, rate="24000/1001")
+    stamps = tmp_path / "timestamps.txt"
+    frames = range(96)  # 4 s at 23.976 fps
+    stamps.write_text(
+        "# timestamp format v2\n" + "".join(f"{math.ceil(i * 1001 / 24)}\n" for i in frames),
+        encoding="utf-8",
+    )
+    ref = tmp_path / "ref.mkv"
+    near_lossless = tmp_path / "near-lossless.mkv"
+    for cmd in (
+        [str(tools.mkvmerge), "-q", "-o", str(ref), "--timestamps", f"0:{stamps}", str(base)],
+        [
+            str(tools.ffmpeg), "-nostdin", "-v", "error", "-y", "-i", str(base),
+            "-map", "0:v", "-c:v", "libx264", "-crf", "4", str(near_lossless),
+        ],
+    ):  # fmt: skip
+        subprocess.run(cmd, check=True)  # noqa: S603 - fixed argument list
+    score = vmaf_mean(tools, near_lossless, ref, tmp_path / "work", RecordingReporter())
+    assert score > 97.0

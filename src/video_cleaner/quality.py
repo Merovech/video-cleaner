@@ -92,9 +92,15 @@ def build_vmaf_cmd(
     Each input may be cut to a window (``-ss``/``-t`` before its ``-i``). Both are reset to
     start at timestamp zero and converted to `VMAF_PIX_FMT`, and the distorted one is scaled
     to the reference's size, so a different size, pixel format or start time never skews or
-    breaks the score. ``libvmaf`` writes a JSON log to *log_name*, which must be a bare file
-    name: the command is run with the work folder as ``cwd``, because an absolute Windows path
-    carries a drive colon that the filtergraph parser splits on.
+    breaks the score. Frames are paired by the nearest timestamp (``ts_sync_mode=nearest``):
+    Matroska stores milliseconds, so a 23.976 fps source and its encode can round a frame's
+    time differently by 1 ms, and libvmaf's default (the reference frame at or before) then
+    scores that frame against its predecessor; measured on a real film, a near-lossless encode
+    scored 85.9 instead of 99.
+
+    ``libvmaf`` writes a JSON log to *log_name*, which must be a bare file name: the command is
+    run with the work folder as ``cwd``, because an absolute Windows path carries a drive colon
+    that the filtergraph parser splits on.
     """
     if not log_name or any(ch in log_name for ch in "/\\:"):
         raise ValueError(f"the VMAF log must be a bare file name, got {log_name!r}")
@@ -104,7 +110,7 @@ def build_vmaf_cmd(
         f"[1:V:0]setpts=PTS-STARTPTS,format={fmt},split[ref_size][ref];"
         "[dist][ref_size]scale=w=rw:h=rh:flags=bicubic[dist_sized];"
         f"[dist_sized][ref]libvmaf=log_fmt=json:log_path={log_name}:"
-        f"n_threads={n_threads}:shortest=1"
+        f"n_threads={n_threads}:shortest=1:ts_sync_mode=nearest"
     )
     return [
         str(tools.ffmpeg),

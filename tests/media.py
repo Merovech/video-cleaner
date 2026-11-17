@@ -72,9 +72,13 @@ def make_clip(
     *,
     duration_s: float = 6.0,
     size: str = "320x240",
+    rate: str = "24",
     rich: bool = False,
 ) -> Path:
     """Write an H.264 + AAC MKV of `testsrc2` and a sine to *path*, with two chapters.
+
+    *rate* is the frame rate; ``24000/1001`` gives the jittery 1 ms Matroska timestamps of
+    real 23.976 fps films.
 
     The video is high-bitrate (x264 CRF 12) so an x265 encode of it is far smaller. With
     *rich*, mkvmerge adds an SRT subtitle, an mjpeg cover attachment (``cover.jpg``) and a font
@@ -96,7 +100,7 @@ def make_clip(
         _run(
             [
                 str(tools.ffmpeg), "-nostdin", "-v", "error", "-y",
-                "-f", "lavfi", "-i", f"testsrc2=s={size}:r=24:d={duration_s}",
+                "-f", "lavfi", "-i", f"testsrc2=s={size}:r={rate}:d={duration_s}",
                 "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration_s}",
                 "-i", str(chapters),
                 "-map", "0:v", "-map", "1:a", "-map_metadata", "2", "-map_chapters", "2",
