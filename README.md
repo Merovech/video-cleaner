@@ -3,10 +3,10 @@
 A Python command-line tool that re-encodes a video library to HEVC (x265) to reclaim disk space,
 without ever modifying the source library.
 
-Status: early development (Phase 1 foundation). `doctor`, `survey`, `plan`, `status` and
-`report` work. `run` and `calibrate --samples` refuse with `held: Task 10b` (exit 1) until the
-encode, CRF search and VMAF stages are enabled. See [docs/usage.md](docs/usage.md) for the
-commands, the run model, all settings and where logs go.
+Status: early development (Phase 1). `doctor`, `survey`, `plan`, `calibrate`, `run`, `status`
+and `report` work: `run` encodes with x265 at a per-file CRF found by a VMAF sample search and
+keeps an output only if it passes the VMAF guard and is at least 10% smaller. See
+[docs/usage.md](docs/usage.md) for the commands, the run model, all settings and where logs go.
 
 ## Setup (Windows)
 

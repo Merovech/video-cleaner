@@ -43,8 +43,9 @@ jobs:
       - name: Check ffmpeg has libx265 and libvmaf
         run: |
           ffmpeg -hide_banner -encoders | grep libx265
-          # Ubuntu's packaged ffmpeg has no libvmaf. Nothing run in CI needs it until the real
-          # VMAF code (Task 10b) lands, so it is only a warning on Linux and a failure on Windows.
+          # Ubuntu's packaged ffmpeg has no libvmaf: the VMAF integration tests skip themselves
+          # there (tests/media.py vmaf_tools), so it is a warning on Linux and a failure on
+          # Windows, where those tests must run.
           if ! ffmpeg -hide_banner -filters | grep libvmaf; then
             if [ "$RUNNER_OS" = "Windows" ]; then exit 1; fi
             echo "::warning::this ffmpeg build has no libvmaf; VMAF tests cannot run on this runner"

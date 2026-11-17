@@ -6,9 +6,10 @@ written so Ari can also judge by eye. The table goes to ``calibration.txt`` besi
 database and the clips to ``<completed>/calibration``. Ari then approves a VMAF target and a CRF
 ceiling with ``calibrate --approve``; `run` refuses to start until he has.
 
-The real work (encode, VMAF, side-by-side) is injected through `CalibrationEngine`. Its defaults
-are held until Task 10b and raise ``NotImplementedError(HELD_REASON)``; `run_calibration`
-refuses a held engine before touching anything.
+The real work (encode, VMAF, side-by-side) is injected through `CalibrationEngine`; its defaults
+are the real `encode_sample`, `score_windows` and `make_sidebyside`. Calibration reads each
+sample's library file directly and read-only (ruling R18: ffprobe and ``-ss`` input seeks, no copy
+through scratch); it writes only to ``<completed>/calibration`` and the tool scratch folder.
 """
 
 from __future__ import annotations
@@ -16,21 +17,32 @@ from __future__ import annotations
 import logging
 import math
 import shutil
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from video_cleaner import quality
 from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action
-from video_cleaner.held import HELD_REASON, held_stages
+from video_cleaner.encode import (
+    SAMPLE_WINDOW_COUNT,
+    SAMPLE_WINDOW_S,
+    EncodeError,
+    WindowEncode,
+    encode_windows,
+    measure_windows,
+    sample_windows,
+)
 from video_cleaner.instancelock import instance_lock, lock_path_for
-from video_cleaner.progress import Reporter
+from video_cleaner.probe import ProbeError, probe
+from video_cleaner.progress import Progress, Reporter, parse_ffmpeg_progress
+from video_cleaner.quality import VmafError
 from video_cleaner.runner import refuse_outputs_in_library
 from video_cleaner.scratch import ScratchNotOurs, prepare_tool_scratch
-from video_cleaner.state import FileRecord, State, Status
-from video_cleaner.tools import Tools
+from video_cleaner.state import FileRecord, State
+from video_cleaner.tools import ToolFailed, ToolNotFound, ToolOutputError, Tools, run_tool
 
 _log = logging.getLogger(__name__)
 
@@ -40,6 +52,16 @@ CLIPS_FOLDER = "calibration"
 SIDEBYSIDE_HEIGHT = 720
 SIDEBYSIDE_CRF = 18
 VMAF_TARGET_RANGE = (50.0, 100.0)
+# What the real engine raises for one sample; `run_calibration` turns them into CalibrationError.
+_ENGINE_ERRORS = (
+    EncodeError,
+    VmafError,
+    ProbeError,
+    ToolFailed,
+    ToolOutputError,
+    ToolNotFound,
+    OSError,
+)
 
 
 class CalibrationError(Exception):
@@ -48,13 +70,20 @@ class CalibrationError(Exception):
 
 @dataclass(frozen=True)
 class SampleEncode:
-    """One sample encoded at one CRF: the encode, the bytes in and out, the window used."""
+    """One sample encoded at one CRF (ruling R17): one record per sample window."""
 
-    encoded: Path
-    source_bytes: int
-    encoded_bytes: int
-    start_s: float
-    length_s: float
+    crf: int
+    windows: tuple[WindowEncode, ...]
+
+    @property
+    def source_bytes(self) -> int:
+        """Source video bytes of all windows together."""
+        return sum(w.source_bytes for w in self.windows)
+
+    @property
+    def encoded_bytes(self) -> int:
+        """Encoded bytes of all windows together."""
+        return sum(w.encoded_bytes for w in self.windows)
 
 
 @dataclass(frozen=True)
@@ -73,73 +102,109 @@ ScoreWindows = Callable[
 MakeSideBySide = Callable[[Tools, FileRecord, SampleEncode, Path, Reporter], None]
 
 
-def held_encode_sample(
+def encode_sample(
     tools: Tools,
     settings: Settings,
     sample: FileRecord,
     crf: int,
     workdir: Path,
     reporter: Reporter,
+    *,
+    window_count: int = SAMPLE_WINDOW_COUNT,
+    window_length_s: float = SAMPLE_WINDOW_S,
 ) -> SampleEncode:
-    """Encode the sample windows of *sample* at *crf* into *workdir*. HELD until Task 10b."""
-    raise NotImplementedError(HELD_REASON)
+    """Encode the sample windows of the library file *sample* at *crf* into *workdir*.
+
+    The library file is probed and read in place, read-only (R18): ffprobe for the duration
+    and the windows' source bytes, ffmpeg ``-ss`` input seeks for the encodes, which use the
+    run's preset and pixel format (`encode.encode_windows`). The windows are those of the CRF
+    search (`encode.sample_windows`); *window_count* and *window_length_s* exist for tests.
+    """
+    info = probe(sample.path, tools, reporter)
+    spans = sample_windows(info.duration_s, window_count, window_length_s)
+    if not spans:
+        raise CalibrationError(
+            f"{sample.path.name}: no sample windows (duration {info.duration_s!r} s)"
+        )
+    windows = measure_windows(tools, sample.path, spans, reporter)
+    encodes = encode_windows(tools, settings, sample.path, crf, windows, workdir, reporter)
+    return SampleEncode(crf, encodes)
 
 
-def held_score_windows(
+def score_windows(
     tools: Tools,
     settings: Settings,
     sample: FileRecord,
     encoded: SampleEncode,
     workdir: Path,
     reporter: Reporter,
-) -> Sequence[float]:
-    """VMAF of each encoded window against its source cut. HELD until Task 10b."""
-    raise NotImplementedError(HELD_REASON)
+) -> list[float]:
+    """VMAF of each encoded window against the same window of the library file, in order."""
+    return [
+        quality.vmaf_mean(
+            tools,
+            window.encoded,
+            sample.path,
+            workdir,
+            reporter,
+            reference_start_s=window.start_s,
+            reference_length_s=window.length_s,
+        )
+        for window in encoded.windows
+    ]
 
 
-def held_make_sidebyside(
+def make_sidebyside(
     tools: Tools, sample: FileRecord, encoded: SampleEncode, dst: Path, reporter: Reporter
 ) -> None:
-    """Run `build_sidebyside_cmd` for *encoded* into *dst*. HELD until Task 10b."""
-    raise NotImplementedError(HELD_REASON)
+    """Write the side-by-side clip of the middle window of *encoded* to *dst*.
 
+    The original window is cut from the library file; the encoded window already is that
+    window. ffmpeg's stderr log stays in the scratch work folder, beside the encode, so
+    nothing but the clip lands in the completed folder.
+    """
+    window = encoded.windows[len(encoded.windows) // 2]
+    cmd = build_sidebyside_cmd(
+        tools, sample.path, window.encoded, dst, window.start_s, window.length_s
+    )
 
-_HELD: tuple[object, ...] = (held_encode_sample, held_score_windows, held_make_sidebyside)
+    def parser(lines: Iterable[str]) -> Iterator[Progress]:
+        return parse_ffmpeg_progress(lines, window.length_s)
+
+    run_tool(
+        cmd,
+        label=f"side-by-side {dst.name}",
+        reporter=reporter,
+        parser=parser,
+        stderr_log=window.encoded.with_name(f"{dst.stem}.stderr.log"),
+    )
 
 
 @dataclass
 class CalibrationEngine:
     """The real work of a calibration; tests inject fakes."""
 
-    encode_sample: EncodeSample = held_encode_sample
-    score_windows: ScoreWindows = held_score_windows
-    make_sidebyside: MakeSideBySide = held_make_sidebyside
-
-    def held_stages(self) -> list[str]:
-        """Names of the stages that are still held stubs."""
-        stages = {
-            "encode_sample": self.encode_sample,
-            "score_windows": self.score_windows,
-            "make_sidebyside": self.make_sidebyside,
-        }
-        return held_stages(stages, _HELD)
+    encode_sample: EncodeSample = encode_sample
+    score_windows: ScoreWindows = score_windows
+    make_sidebyside: MakeSideBySide = make_sidebyside
 
 
 def default_engine() -> CalibrationEngine:
-    """The engine the `calibrate` command uses (held until Task 10b)."""
+    """The engine the `calibrate` command uses: the real encode, VMAF and side-by-side."""
     return CalibrationEngine()
 
 
 def select_samples(records: Sequence[FileRecord], n: int) -> list[FileRecord]:
-    """At most *n* live encode candidates spread evenly over the size range.
+    """At most *n* encode candidates of *records* spread evenly over the size range.
 
-    Deterministic: candidates are sorted by (size, path) and the picks are evenly spaced from
-    the smallest to the largest; one pick is the median.
+    *records* are live records (`State.records()` leaves STALE ones out). Deterministic:
+    candidates are sorted by (size, path) and the picks are evenly spaced from the smallest to
+    the largest; one pick is the median.
     """
     if n < 1:
         raise ValueError(f"the number of samples must be at least 1, got {n}")
     candidates = sorted(
-        (r for r in records if r.decision == Action.ENCODE.value and r.status is not Status.STALE),
+        (r for r in records if r.decision == Action.ENCODE.value),
         key=lambda r: (r.size, r.path.as_posix()),
     )
     if len(candidates) <= n:
@@ -167,8 +232,10 @@ def build_sidebyside_cmd(
 ) -> list[str]:
     """ffmpeg argument list for a side-by-side clip: *original* left, *encoded* right.
 
-    Both inputs are cut with ``-ss``/``-t`` before their ``-i``, scaled to the same *height*
-    and stacked. No audio. The clip is 8-bit H.264 (CRF 18) so any player can show it.
+    *original* is cut to the window with ``-ss``/``-t`` before its ``-i``; *encoded* is the
+    encoded sample of that window, so it starts at zero and is only limited to the same length.
+    Both are scaled to the same *height* and stacked. No audio. The clip is 8-bit H.264
+    (CRF 18) so any player can show it.
     """
     if not (math.isfinite(start_s) and start_s >= 0):
         raise ValueError(f"start_s must be a non-negative number, got {start_s!r}")
@@ -176,17 +243,20 @@ def build_sidebyside_cmd(
         raise ValueError(f"length_s must be a positive number, got {length_s!r}")
     if height < 2 or height % 2:
         raise ValueError(f"height must be an even number of at least 2, got {height}")
-    window = ["-ss", _seconds(start_s), "-t", _seconds(length_s)]
+    length = ["-t", _seconds(length_s)]
     graph = (
         f"[0:V:0]scale=-2:{height}[left];[1:V:0]scale=-2:{height}[right];"
         "[left][right]hstack=inputs=2[v]"
     )
     return [
         str(tools.ffmpeg),
-        *window,
+        "-nostdin",
+        "-ss",
+        _seconds(start_s),
+        *length,
         "-i",
         str(original),
-        *window,
+        *length,
         "-i",
         str(encoded),
         "-filter_complex",
@@ -200,6 +270,9 @@ def build_sidebyside_cmd(
         str(SIDEBYSIDE_CRF),
         "-pix_fmt",
         "yuv420p",
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-y",
         str(dst),
     ]
@@ -236,6 +309,11 @@ def _row(
 ) -> CalibrationRow:
     if not scores or not all(math.isfinite(s) for s in scores):
         raise CalibrationError(f"no usable VMAF scores for {sample.path} at CRF {crf}")
+    if len(scores) != len(encoded.windows):
+        raise CalibrationError(
+            f"{len(scores)} VMAF score(s) for {len(encoded.windows)} windows of {sample.path} "
+            f"at CRF {crf}: one per window is required"
+        )
     if encoded.source_bytes <= 0:
         raise CalibrationError(f"the sample of {sample.path} at CRF {crf} has no source bytes")
     return CalibrationRow(
@@ -270,18 +348,15 @@ def run_calibration(
     sweep never mixes with (or deletes) an earlier one. A folder that cannot be created is a
     `CalibrationError`.
 
-    Raises `NotImplementedError` (held) before touching anything while a stage of *engine*
-    is still held, `RunRefused` if an output folder is under the library root, `AlreadyRunning`
-    while a run or another calibration holds the single-instance lock, and
-    `CalibrationError` when there is nothing to sample or a score is unusable. A finished sweep
+    Raises `RunRefused` if an output folder is under the library root, `AlreadyRunning` while a
+    run or another calibration holds the single-instance lock, and `CalibrationError` when there
+    is nothing to sample, the scratch folder cannot be used, a score is unusable or the engine
+    fails (an encode, probe, VMAF or tool error, chained as the cause). A finished sweep
     is recorded in *state* (`State.record_calibration_sweep`, no event): `calibrate --approve`
     requires one. Work files go to
     ``<scratch>/.video-cleaner/calibration`` (the tool-owned scratch folder) and are removed
     after each sample; nothing is stored in *state*.
     """
-    held = engine.held_stages()
-    if held:
-        raise NotImplementedError(HELD_REASON)
     refuse_outputs_in_library(settings)
     with instance_lock(lock_path_for(settings.state_db)):
         return _calibrate_locked(settings, tools, state, reporter, samples, engine, stamp())
@@ -303,6 +378,10 @@ def _calibrate_locked(
         work_root = prepare_tool_scratch(settings.scratch_dir) / CLIPS_FOLDER
     except ScratchNotOurs as exc:
         raise CalibrationError(str(exc)) from None
+    except OSError as exc:
+        raise CalibrationError(
+            f"cannot use the scratch folder {settings.scratch_dir}: {exc}"
+        ) from exc
     clips = settings.completed_dir / CLIPS_FOLDER / run_name
     _make_folder(clips)
     rows: list[CalibrationRow] = []
@@ -312,11 +391,16 @@ def _calibrate_locked(
             for crf in CALIBRATION_CRFS:
                 reporter.stage(f"calibrate {index}/{len(picked)} CRF {crf}: {sample.path.name}")
                 _make_folder(workdir)
-                encoded = engine.encode_sample(tools, settings, sample, crf, workdir, reporter)
-                scores = engine.score_windows(tools, settings, sample, encoded, workdir, reporter)
-                rows.append(_row(sample, crf, encoded, scores))
                 clip = clips / f"{index:02d}-{sample.path.stem}-crf{crf}.mp4"
-                engine.make_sidebyside(tools, sample, encoded, clip, reporter)
+                try:
+                    encoded = engine.encode_sample(tools, settings, sample, crf, workdir, reporter)
+                    scores = engine.score_windows(
+                        tools, settings, sample, encoded, workdir, reporter
+                    )
+                    rows.append(_row(sample, crf, encoded, scores))
+                    engine.make_sidebyside(tools, sample, encoded, clip, reporter)
+                except _ENGINE_ERRORS as exc:
+                    raise CalibrationError(f"{sample.path.name} at CRF {crf}: {exc}") from exc
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
     table = settings.state_db.parent / CALIBRATION_TXT
