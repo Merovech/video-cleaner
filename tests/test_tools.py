@@ -536,8 +536,8 @@ def test_locate_tools_names_the_first_missing_tool(tmp_path: Path) -> None:
 
 # --- integration (real machine) -------------------------------------------------------------
 
-_REAL_FFMPEG_BIN = Path(
-    "C:/Users/user/AppData/Local/Microsoft/WinGet/Packages/"
+_REAL_FFMPEG_BIN = Path(os.environ.get("LOCALAPPDATA", "")) / (
+    "Microsoft/WinGet/Packages/"
     "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-9.0.2-full_build/bin"
 )
 _REAL_MKVMERGE = Path("C:/Program Files/MKVToolNix/mkvmerge.exe")
