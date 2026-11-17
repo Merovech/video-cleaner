@@ -31,8 +31,14 @@ def test_mux_cmd_new_video_contributes_only_its_video_track() -> None:
     cmd = build_mux_cmd(_tools(), Path("out.mkv"), [Path("src.mkv")], Path("video.mkv"))
     video_at = cmd.index(str(Path("video.mkv")))
     # mkvmerge options apply to the file that follows them
-    assert cmd[video_at - 3 : video_at] == ["--no-chapters", "--no-global-tags", "--no-attachments"]
-    for flag in ("--no-chapters", "--no-global-tags", "--no-attachments"):
+    assert cmd[video_at - 4 : video_at] == [
+        "--no-chapters",
+        "--no-global-tags",
+        "--no-track-tags",
+        "--no-attachments",
+    ]
+    # R21: the intermediate's track statistics tags never reach the output
+    for flag in ("--no-chapters", "--no-global-tags", "--no-track-tags", "--no-attachments"):
         assert cmd.count(flag) == 1
 
 
@@ -50,6 +56,23 @@ def test_mux_cmd_keeps_everything_else_from_the_source() -> None:
         "--no-track-tags",
     ):
         assert dropping not in cmd
+
+
+def test_mux_cmd_with_new_video_exact() -> None:
+    cmd = build_mux_cmd(_tools(), Path("out.mkv"), [Path("src.mkv")], Path("video.mkv"))
+    assert cmd == [
+        str(MKVMERGE),
+        "--gui-mode",
+        "-o",
+        str(Path("out.mkv")),
+        "--no-chapters",
+        "--no-global-tags",
+        "--no-track-tags",
+        "--no-attachments",
+        str(Path("video.mkv")),
+        "--no-video",
+        str(Path("src.mkv")),
+    ]
 
 
 def test_mux_cmd_appends_parts_with_plus() -> None:

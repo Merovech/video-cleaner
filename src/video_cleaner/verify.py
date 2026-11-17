@@ -20,8 +20,9 @@ from video_cleaner.tools import Tools, run_tool
 DURATION_TOLERANCE_FRACTION = 0.01
 DURATION_TOLERANCE_S = 2.0
 ENCODED_CODEC = "hevc"
-# What build_x265_cmd writes (yuv420p10le); any 10-bit format is accepted.
-ENCODED_BIT_DEPTH_MARK = "10"
+# What build_x265_cmd writes is yuv420p10le; these 10-bit formats are accepted. An explicit set,
+# not a substring test: "10" also occurs in the 8-bit yuv410p.
+TEN_BIT_PIX_FMTS = frozenset({"yuv420p10le", "yuv420p10be", "yuv422p10le", "yuv444p10le", "p010le"})
 
 ProbeFn = Callable[[Path, Tools, Reporter], MediaInfo]
 # Returns the decode errors as text; "" means the file decoded cleanly.
@@ -128,7 +129,7 @@ def verify_output(
     if encoded and out.video is not None:
         if out.video.codec.lower() != ENCODED_CODEC:
             problems.append(f"encoded video is codec {out.video.codec}, expected {ENCODED_CODEC}")
-        if ENCODED_BIT_DEPTH_MARK not in out.video.pix_fmt:
+        if out.video.pix_fmt not in TEN_BIT_PIX_FMTS:
             problems.append(f"encoded video has pixel format {out.video.pix_fmt}, expected 10-bit")
     if not problems:
         errors = decode_fn(tools, output, reporter)

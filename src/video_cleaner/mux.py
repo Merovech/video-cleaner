@@ -13,10 +13,11 @@ def build_mux_cmd(
 ) -> list[str]:
     """mkvmerge argument list (no shell). ``--gui-mode`` makes progress print ``#GUI#progress N%``.
 
-    With *new_video*: it is preceded by ``--no-chapters --no-global-tags --no-attachments``
-    (mkvmerge options apply to the file that follows them), so it contributes only its video
-    track; the single source follows with ``--no-video``, so every audio and subtitle track,
-    the chapters, the global tags and all attachments (cover art included) come from the
+    With *new_video*: it is preceded by ``--no-chapters --no-global-tags --no-track-tags
+    --no-attachments`` (mkvmerge options apply to the file that follows them), so it contributes
+    only its video track, without the encoder's statistics tags; the single source follows
+    with ``--no-video``, so every audio and subtitle track, the chapters, the global tags and
+    all attachments (cover art included) come from the
     source by mkvmerge's defaults, with exactly one chapter edition. Several sources together
     with *new_video* are refused rather than guessed at.
 
@@ -38,6 +39,7 @@ def build_mux_cmd(
             *cmd,
             "--no-chapters",
             "--no-global-tags",
+            "--no-track-tags",
             "--no-attachments",
             str(new_video),
             "--no-video",
