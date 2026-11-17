@@ -548,12 +548,31 @@ class State:
         return self._meta(_CALIBRATION_SWEPT_KEY)
 
     def calibration(self) -> tuple[float, int] | None:
-        """The approved ``(vmaf_target, crf_max)``, or None before `approve_calibration`."""
+        """The approved ``(vmaf_target, crf_max)``, or None before `approve_calibration`.
+
+        A stored value that is not what `approve_calibration` writes (not JSON, a missing key,
+        a non-finite target, a CRF that is not an integer) raises `StateError`.
+        """
         raw = self._meta(_CALIBRATION_KEY)
         if raw is None:
             return None
-        data = json.loads(raw)
-        return float(data["vmaf_target"]), int(data["crf_max"])
+        try:
+            data = json.loads(raw)
+            vmaf_target, crf_max = data["vmaf_target"], data["crf_max"]
+        except (ValueError, TypeError, KeyError) as exc:
+            raise StateError(f"the stored calibration is unreadable: {exc}") from None
+        target_ok = (
+            isinstance(vmaf_target, int | float)
+            and not isinstance(vmaf_target, bool)
+            and math.isfinite(vmaf_target)
+        )
+        crf_ok = isinstance(crf_max, int) and not isinstance(crf_max, bool)
+        if not (target_ok and crf_ok):
+            raise StateError(
+                f"the stored calibration is unreadable: vmaf_target {vmaf_target!r}, "
+                f"crf_max {crf_max!r}; approve it again with `calibrate --approve`"
+            )
+        return float(vmaf_target), int(crf_max)
 
     def events(self, limit: int = 100) -> list[str]:
         """The most recent event lines, newest first, each prefixed with an ISO timestamp."""

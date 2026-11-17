@@ -600,6 +600,30 @@ def test_approve_calibration_stores_values_and_one_event(state: State) -> None:
     assert state.calibration() == (94.0, 22)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not json",
+        "[]",
+        "{}",
+        '{"vmaf_target": "x", "crf_max": 23}',
+        '{"vmaf_target": 95.0, "crf_max": "high"}',
+        '{"vmaf_target": NaN, "crf_max": 23}',
+        '{"vmaf_target": 95.0, "crf_max": 23.5}',
+        '{"vmaf_target": 95.0, "crf_max": true}',
+    ],
+)
+def test_corrupt_stored_calibration_is_a_state_error(tmp_path: Path, raw: str) -> None:
+    db = tmp_path / "s.db"
+    State.open(db).close()
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES ('calibration', ?)", (raw,))
+    conn.close()
+    with State.open(db) as state, pytest.raises(StateError, match="calibration"):
+        state.calibration()
+
+
 def test_calibration_survives_reopen(tmp_path: Path) -> None:
     db = tmp_path / "s.db"
     with State.open(db) as s:
