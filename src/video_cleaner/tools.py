@@ -28,6 +28,9 @@ _log = logging.getLogger("video_cleaner.tools")
 STDOUT_CAP_CHARS = 1_000_000
 STDERR_TAIL_CHARS = 4_096
 _TERMINATE_GRACE_S = 5.0
+# `Popen.wait()` with no timeout blocks in one uninterruptible call on Windows, so Ctrl+C would
+# only be seen when the child exits; waiting in short slices lets KeyboardInterrupt through.
+_WAIT_SLICE_S = 0.2
 _DEFAULT_JOIN_TIMEOUT_S = 5.0
 _EXECUTABLE_SUFFIXES = ("", ".exe")
 
@@ -293,6 +296,15 @@ def _heartbeat_loop(
             _log.exception("heartbeat failed")
 
 
+def _wait_interruptibly(proc: subprocess.Popen[str]) -> int:
+    """`proc.wait()` in slices of `_WAIT_SLICE_S`, so a KeyboardInterrupt is never stuck."""
+    while True:
+        try:
+            return proc.wait(timeout=_WAIT_SLICE_S)
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _stop_process(proc: subprocess.Popen[str]) -> None:
     if proc.poll() is not None:
         return
@@ -415,7 +427,7 @@ def run_tool(
     try:
         for thread in (*readers, beat):
             thread.start()
-        returncode = proc.wait()
+        returncode = _wait_interruptibly(proc)
     except BaseException:
         _stop_process(proc)
         raise
