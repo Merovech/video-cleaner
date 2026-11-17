@@ -17,9 +17,12 @@ library_root = '\\nas\media'
 scratch_dir = 'D:\video-cleaner\scratch'
 # Where accepted re-encodes are placed, mirroring the source relative path. Required.
 completed_dir = 'D:\video-cleaner\completed'
-# State database. Default: %LOCALAPPDATA%\video-cleaner\state.db
+# The two defaults below live in your LOCALAPPDATA folder (C:\Users\you\AppData\Local on a
+# typical Windows install). Environment variables such as %LOCALAPPDATA% are not expanded in
+# this file, so an override must be written as a full path.
+# State database. Default: C:\Users\you\AppData\Local\video-cleaner\state.db
 # state_db = 'C:\Users\you\AppData\Local\video-cleaner\state.db'
-# Per-run DEBUG logs. Default: %LOCALAPPDATA%\video-cleaner\logs
+# Per-run DEBUG logs. Default: C:\Users\you\AppData\Local\video-cleaner\logs
 # log_dir = 'C:\Users\you\AppData\Local\video-cleaner\logs'
 
 # --- Limits and thresholds (values shown are the defaults) -----------------------------
