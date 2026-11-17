@@ -11,6 +11,7 @@ import dataclasses
 import os
 import re
 import stat
+import sys
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -984,6 +985,14 @@ def test_superseded_record_never_gets_results(settings: Settings, state: State) 
 # --- collisions ----------------------------------------------------------------------------
 
 
+# The library is a case-insensitive Windows/SMB share; name keys fold case only on Windows
+# (os.path.normcase), so collisions that differ only in case are detected there only.
+windows_only_case = pytest.mark.skipif(
+    sys.platform != "win32", reason="case-only name collisions are folded on Windows only"
+)
+
+
+@windows_only_case
 def test_output_name_collision_flags_both(settings: Settings, state: State) -> None:
     avi = _source(settings, "Clips/Clip.avi")
     mp4 = _source(settings, "Clips/clip.MP4")
@@ -1626,6 +1635,7 @@ def test_combined_name_colliding_with_library_file_is_flagged(
     assert fakes.calls == []
 
 
+@windows_only_case
 def test_mkv_name_colliding_with_left_alone_library_file_is_flagged(
     settings: Settings, state: State
 ) -> None:

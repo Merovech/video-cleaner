@@ -292,7 +292,7 @@ def test_bitrate_falls_back_to_size_over_duration() -> None:
 
 
 def test_unicode_and_bracket_filename() -> None:
-    path = Path(r"W:\movies\The First Omen (2024).en.MX]")
+    path = Path("/movies/The First Omen (2024).en.MX]")
     info = parse_fixture("h264_1080p_sdr_mkv", path)
     assert info.path == path
     assert info.path.name == "The First Omen (2024).en.MX]"
