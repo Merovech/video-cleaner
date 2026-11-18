@@ -20,7 +20,6 @@ from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
-from video_cleaner.held import HELD_REASON
 from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
@@ -300,11 +299,6 @@ def plan(
     _print_plan_summary(report, csv_path, digest)
 
 
-CALIBRATION_HELD_MESSAGE = (
-    f"{HELD_REASON}: calibration needs real encodes; it will run once the hold is lifted"
-)
-
-
 def _approve_calibration(
     settings: Settings, vmaf_target: float | None, crf_max: int | None
 ) -> None:
@@ -374,9 +368,6 @@ def calibrate(
     if samples < 1:
         _fail(f"--samples must be at least 1, got {samples}")
     engine = _calibrate.default_engine()
-    if engine.held_stages():
-        typer.echo(CALIBRATION_HELD_MESSAGE, err=True)
-        raise typer.Exit(code=1)
     _require_state(settings)
     _logging(settings, verbose, quiet, log_file)
     tools = _tools()

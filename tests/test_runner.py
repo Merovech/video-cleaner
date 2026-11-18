@@ -1,8 +1,8 @@
-"""run_queue orchestration, against a fake pipeline.
+"""run_queue orchestration, against a fake pipeline, plus one integration run of the real one.
 
-Encoding, muxing and VMAF are on hold (no real encode may run), so every test injects a
-`Pipeline` of fakes that write small dummy files; the real copy code copies small dummy sources.
-No ffmpeg, ffprobe or mkvmerge process is started here.
+The unit tests inject a `Pipeline` of fakes that write small dummy files; the real copy code
+copies small dummy sources and no ffmpeg, ffprobe or mkvmerge process is started. The
+``integration`` tests at the end run the real pipeline on a tiny generated clip.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import sqlite3
 import stat
 import sys
 from collections.abc import Callable, Sequence
@@ -20,21 +21,25 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from media import RecordingReporter as MediaReporter
+from media import make_clip, vmaf_tools
 from video_cleaner import cli as cli_module
 from video_cleaner import doctor as doctor_module
+from video_cleaner import encode as encode_module
 from video_cleaner import paths as paths_module
 from video_cleaner import probe as probe_module
+from video_cleaner import quality as quality_module
 from video_cleaner import runner as runner_module
 from video_cleaner import scratch as scratch_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
-from video_cleaner.encode import CrfSearchResult
-from video_cleaner.held import HELD_REASON
+from video_cleaner.encode import CrfSearchResult, EncodeError
 from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.manifest import ManifestEntry, ManifestError, read_manifest, write_manifest
 from video_cleaner.planning import build_plan, plan_hash
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress, Reporter
+from video_cleaner.quality import VmafError
 from video_cleaner.runner import (
     CalibrationNotApproved,
     Pipeline,
@@ -46,7 +51,13 @@ from video_cleaner.runner import (
 )
 from video_cleaner.scratch import CopyResult, ScratchFull, SourceChanged, copy_with_progress
 from video_cleaner.state import FileRecord, State, Status
-from video_cleaner.tools import ToolFailed, ToolNotFound, ToolOutputError, ToolResult, Tools
+from video_cleaner.tools import (
+    ToolFailed,
+    ToolNotFound,
+    ToolOutputError,
+    ToolResult,
+    Tools,
+)
 from video_cleaner.verify import VerifyResult, verify_output
 
 TOOLS = Tools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"), mkvmerge=Path("mkvmerge"))
@@ -863,45 +874,186 @@ def test_tool_not_found_stops_the_run(settings: Settings, state: State) -> None:
     assert _status(state, b).status is Status.PENDING
 
 
-def test_held_stub_stops_run_and_leaves_pending(settings: Settings, state: State) -> None:
+@pytest.mark.parametrize(
+    ("stage", "error"),
+    [
+        ("search_crf", EncodeError("a.avi: the CRF 24 window 1/3 sample is empty")),
+        ("search_crf", VmafError("the VMAF log vmaf-1.json is missing")),
+        ("encode_full", EncodeError("a.avi: the encode at CRF 20 is empty")),
+        ("window_scores", VmafError("the VMAF log vmaf-2.json has an unusable mean nan")),
+    ],
+)
+def test_unusable_encode_or_score_flags_the_file_and_the_run_continues(
+    settings: Settings, state: State, stage: str, error: Exception
+) -> None:
     a = _source(settings, "a.avi")
     b = _source(settings, "b.avi")
     _plan(state, a, est=900)
     _plan(state, b, est=100)
     fakes = Fakes()
-    pipeline = fakes.pipeline()
+    if stage == "window_scores":
+        original = fakes.window_scores
 
-    def held_mid_run(*args: Any) -> CrfSearchResult:
-        raise NotImplementedError(HELD_REASON)  # not marked held: only found when called
+        def failing(*args: Any) -> Sequence[float]:
+            if args[1].path.name.endswith("a.avi"):
+                raise error
+            return original(*args)
 
-    pipeline.search_crf = held_mid_run
-    _ack(state)
-    summary = run_queue(
-        settings,
-        TOOLS,
-        state,
-        RecordingReporter(),
-        deadline=None,
-        now=Clock(),
-        pipeline=pipeline,
-    )
-    assert summary.stop_reason == HELD_REASON == "held: Task 10b"
-    assert summary.flagged == 0 and summary.retry == 0 and summary.completed == 0
-    assert _status(state, a).status is Status.PENDING
-    assert _status(state, b).status is Status.PENDING
+        pipeline = fakes.pipeline()
+        pipeline.window_scores = failing
+        _ack(state)
+        summary = run_queue(
+            settings,
+            TOOLS,
+            state,
+            RecordingReporter(),
+            deadline=None,
+            now=Clock(),
+            pipeline=pipeline,
+        )
+    else:
+        fakes.fail[stage] = lambda p: error if p.name.endswith("a.avi") else None
+        summary = _run(settings, state, fakes)
+    assert summary.stop_reason == ""
+    rec = _status(state, a)
+    assert rec.status is Status.FLAGGED
+    assert rec.note == str(error)
+    assert rec.attempts == 0
+    assert _status(state, b).status is Status.COMPLETED
     assert _scratch_files(settings) == []
 
 
-def test_default_pipeline_post_encode_scores_are_held() -> None:
-    with pytest.raises(NotImplementedError, match="held: Task 10b"):
-        Pipeline().window_scores(
-            TOOLS,
-            _info(Path("x"), 1, 1.0),
-            Path("y"),
-            _settings_stub(),
-            Path("w"),
-            RecordingReporter(),
-        )
+def test_default_pipeline_uses_the_real_stages() -> None:
+    pipeline = Pipeline()
+    assert pipeline.search_crf is encode_module.search_crf
+    assert pipeline.encode_full is encode_module.encode_full
+    assert pipeline.window_scores is runner_module.guard_window_scores
+
+
+def test_guard_window_scores_scores_four_20s_windows_of_both_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+    scores = iter([96.0, 95.0, 97.0, 94.0])
+
+    def fake_vmaf(
+        tools: Tools, distorted: Path, reference: Path, workdir: Path, rep: Reporter, **kw: Any
+    ) -> float:
+        calls.append({"distorted": distorted, "reference": reference, "workdir": workdir, **kw})
+        return next(scores)
+
+    monkeypatch.setattr(quality_module, "vmaf_mean", fake_vmaf)
+    source = _info(tmp_path / "copy.mkv", 1, 1.0, duration_s=1000.0)
+    out = tmp_path / "work" / "Film.mkv"
+    reporter = RecordingReporter()
+    result = runner_module.guard_window_scores(
+        TOOLS, source, out, _settings_stub(), tmp_path / "work", reporter
+    )
+    assert list(result) == [96.0, 95.0, 97.0, 94.0]
+    assert len(calls) == 4
+    for call in calls:
+        assert call["distorted"] == out
+        assert call["reference"] == source.path
+        assert call["reference_length_s"] == call["distorted_length_s"] == 20.0
+        assert call["reference_start_s"] == call["distorted_start_s"]
+        assert 100.0 <= call["reference_start_s"] <= 880.0  # inside the middle 80%
+    assert sum("quality guard" in s for s in reporter.stages) == 4
+
+
+def test_guard_window_scores_short_film_uses_one_shorter_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_vmaf(*args: Any, **kw: Any) -> float:
+        calls.append(kw)
+        return 99.0
+
+    monkeypatch.setattr(quality_module, "vmaf_mean", fake_vmaf)
+    source = _info(tmp_path / "copy.mkv", 1, 1.0, duration_s=10.0)
+    result = runner_module.guard_window_scores(
+        TOOLS, source, tmp_path / "o.mkv", _settings_stub(), tmp_path, RecordingReporter()
+    )
+    assert list(result) == [99.0]
+    assert calls[0]["reference_length_s"] == pytest.approx(9.0)
+
+
+def test_scratch_is_reserved_for_the_encode_before_it_runs(tmp_path: Path) -> None:
+    """R19: the encoded video is reserved at the original's size before it is written."""
+    settings = _settings(tmp_path, scratch_cap_bytes=1999)
+    with _open_state(settings) as state:
+        a = _source(settings, "a.avi", size=1000)
+        b = _source(settings, "b.avi", size=1000)
+        _plan(state, a, est=900)
+        _plan(state, b, est=100)
+        fakes = Fakes()
+        summary = _run(settings, state, fakes)
+        assert summary.stop_reason == "scratch full"
+        assert "search_crf" in fakes.names()
+        assert "encode_full" not in fakes.names()
+        rec = _status(state, a)
+        assert rec.status is Status.RETRY
+        assert "video.mkv" in rec.note
+        assert rec.attempts == 0  # like the copy path: a stop condition, not the file's fault
+        assert _status(state, b).status is Status.PENDING
+        assert _scratch_files(settings) == []
+
+
+def test_scratch_is_reserved_for_the_muxed_output_before_it_runs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, scratch_cap_bytes=2999)
+    with _open_state(settings) as state:
+        a = _source(settings, "a.avi", size=1000)
+        _plan(state, a)
+        fakes = Fakes()
+        summary = _run(settings, state, fakes)
+        assert summary.stop_reason == "scratch full"
+        assert "encode_full" in fakes.names()
+        assert "mux" not in fakes.names()
+        assert _status(state, a).status is Status.RETRY
+        assert _scratch_files(settings) == []
+
+
+def test_encode_fits_when_scratch_has_room_for_copy_video_and_output(tmp_path: Path) -> None:
+    # 1000 bytes each for the copy, the encoded video and the output, plus the tool's marker
+    settings = _settings(tmp_path, scratch_cap_bytes=3200)
+    with _open_state(settings) as state:
+        a = _source(settings, "a.avi", size=1000)
+        _plan(state, a)
+        summary = _run(settings, state, Fakes())
+        assert summary.completed == 1, _status(state, a).note
+
+
+def test_a_run_never_changes_the_plan_hash(settings: Settings, state: State) -> None:
+    """The run writes neither est_saving_bytes nor decision: the acknowledged plan stays valid."""
+    enc = _source(settings, "a.avi")
+    small = _source(settings, "b.avi")
+    remux = _source(settings, "c.mp4")
+    _plan(state, enc, est=900)
+    _plan(state, small, est=800)
+    _plan(state, remux, decision="remux", est=0)
+    before = plan_hash(build_plan(state))
+    fakes = Fakes()
+    original = fakes.search_crf
+
+    def low_saving_for_b(*args: Any) -> CrfSearchResult:
+        result = original(*args)
+        if args[0].path.name.endswith("b.avi"):
+            return dataclasses.replace(result, projected_saving=0.02)
+        return result
+
+    pipeline = fakes.pipeline()
+    pipeline.search_crf = low_saving_for_b
+    _ack(state)
+    summary = run_queue(
+        settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
+    )
+    assert (summary.completed, summary.left_alone) == (2, 1)
+    assert plan_hash(build_plan(state)) == before
+    # a second run is accepted with the same acknowledgement
+    again = run_queue(
+        settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
+    )
+    assert again.stop_reason == ""
 
 
 def _settings_stub() -> Settings:
@@ -1403,7 +1555,7 @@ def test_cli_run_passes_deadline_and_path(tmp_path: Path, monkeypatch: pytest.Mo
     [
         "scratch full",
         "library unreachable",
-        "held: Task 10b",
+        "tool not found: ffmpeg",
         "manifest unreadable: bad header",
         "completed folder not writable: denied",
     ],
@@ -1469,52 +1621,20 @@ def _forbid_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(scratch_module.Prefetcher, "start", no_prefetch)
 
 
-def test_default_pipeline_is_refused_before_anything(
-    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _forbid_tools(monkeypatch)
-    enc = _source(settings, "a.avi")
-    remux = _source(settings, "b.mp4")
-    pt1 = _source(settings, "C pt1.avi")
-    pt2 = _source(settings, "C pt2.avi")
-    stuck = _source(settings, "d.avi")
-    _plan(state, enc, est=900)
-    _plan(state, remux, decision="remux", est=0)
-    _plan(state, pt1, decision="remux", parts=(pt1, pt2))
-    _plan(state, stuck)
-    state.set_status(stuck, Status.ENCODING)
-    _ack(state)
-    before = {r.path: (r.status, r.note) for r in state.records()}
-    events = len(state.events(10_000))
-
-    for only in (None, remux, pt1):
-        summary = run_queue(
-            settings, TOOLS, state, RecordingReporter(), deadline=None, only=only, now=Clock()
-        )
-        assert summary == RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
-
-    assert {r.path: (r.status, r.note) for r in state.records()} == before
-    assert len(state.events(10_000)) == events  # not even reset_in_progress ran
-    assert not settings.scratch_dir.exists()
-    assert not settings.completed_dir.exists()
-
-
-def test_stage_marked_held_is_refused_up_front(settings: Settings, state: State) -> None:
-    _plan(state, _source(settings, "a.avi"))
+def test_not_implemented_in_a_stage_is_flagged_not_a_stop(settings: Settings, state: State) -> None:
+    """With the hold gone, NotImplementedError is just an unexpected error: flag, carry on."""
+    a = _source(settings, "a.avi")
+    b = _source(settings, "b.avi")
+    _plan(state, a, est=900)
+    _plan(state, b, est=100)
     fakes = Fakes()
-    pipeline = fakes.pipeline()
-
-    def scores(*args: Any) -> Sequence[float]:
-        raise NotImplementedError(HELD_REASON)
-
-    scores.held = True  # type: ignore[attr-defined]
-    pipeline.window_scores = scores
-    _ack(state)
-    summary = run_queue(
-        settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock(), pipeline=pipeline
+    fakes.fail["search_crf"] = lambda p: (
+        NotImplementedError("unfinished stage") if p.name.endswith("a.avi") else None
     )
-    assert summary.stop_reason == HELD_REASON
-    assert fakes.calls == []
+    summary = _run(settings, state, fakes)
+    assert summary.stop_reason == ""
+    assert _status(state, a).status is Status.FLAGGED
+    assert _status(state, b).status is Status.COMPLETED
 
 
 def test_refusal_uses_resolved_paths(
@@ -1673,9 +1793,9 @@ def test_run_refused_without_calibration_approval(
         fakes = Fakes()
         with pytest.raises(CalibrationNotApproved, match="calibrate"):
             _run(settings, state, fakes, ack=False)
-        # The held check comes first (fix list item 20): the default pipeline says "held".
-        held = run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
-        assert held.stop_reason == HELD_REASON
+        # The default (real) pipeline is refused the same way, before any tool runs.
+        with pytest.raises(CalibrationNotApproved, match="calibrate"):
+            run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
         assert fakes.calls == []
         assert _status(state, src).status is Status.PENDING
         assert len(state.events(10_000)) == events
@@ -2061,7 +2181,8 @@ def test_scratch_work_stays_inside_the_tool_folder(settings: Settings, state: St
 
 
 def test_foreign_files_in_scratch_do_not_count_toward_the_cap(tmp_path: Path) -> None:
-    settings = _settings(tmp_path, scratch_cap_bytes=3000)
+    # room for the copy, the encoded video and the output (1000 each, R19) plus the marker
+    settings = _settings(tmp_path, scratch_cap_bytes=3200)
     settings.scratch_dir.mkdir(parents=True)
     (settings.scratch_dir / "big-foreign.bin").write_bytes(b"f" * 5000)
     src = _source(settings, "a.avi")
@@ -2201,11 +2322,33 @@ def test_requeue_resets_attempts(settings: Settings, state: State) -> None:
     assert _status(state, a).attempts == 0
 
 
-def test_held_is_reported_before_plan_ack_and_calibration(tmp_path: Path) -> None:
+def test_default_pipeline_still_requires_the_plan_ack(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
-    with State.open(settings.state_db) as state:  # no ack, no calibration
-        summary = run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
-    assert summary.stop_reason == HELD_REASON
+    with (
+        State.open(settings.state_db) as state,  # no ack, no calibration
+        pytest.raises(PlanNotAcknowledged),
+    ):
+        run_queue(settings, TOOLS, state, RecordingReporter(), deadline=None, now=Clock())
+    assert not settings.scratch_dir.exists()
+
+
+def test_cli_run_with_corrupt_stored_calibration_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_module, "locate_tools", lambda: TOOLS)
+    config = _cli_config(tmp_path)
+    db = tmp_path / "appdata" / "state.db"
+    with State.open(db) as state:
+        _ack(state)
+    conn = sqlite3.connect(db)
+    with conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES ('calibration', 'garbage')")
+    conn.close()
+    for command in ("run", "status"):
+        result = CliRunner().invoke(cli_module.app, [command, "--config", str(config)])
+        assert result.exit_code == 2, (command, result.output)
+        assert "calibration" in result.output
+    assert not (tmp_path / "scratch").exists()
 
 
 def test_cli_run_without_state_database_exits_2_and_creates_nothing(
@@ -2217,3 +2360,86 @@ def test_cli_run_without_state_database_exits_2_and_creates_nothing(
     assert result.exit_code == 2
     assert "survey" in result.output
     assert not (tmp_path / "appdata").exists()
+
+
+# --- integration: the real pipeline on a tiny clip -----------------------------------------
+
+
+def _content_tree(root: Path) -> dict[str, tuple[bytes, int]]:
+    """Every file under *root* with its bytes and mtime: a byte-identical comparison."""
+    return {
+        str(Path(folder, name).relative_to(root)): (
+            Path(folder, name).read_bytes(),
+            Path(folder, name).stat().st_mtime_ns,
+        )
+        for folder, _dirs, names in os.walk(root)
+        for name in names
+    }
+
+
+@pytest.mark.integration
+def test_real_guard_window_scores_of_a_real_mux(tmp_path: Path) -> None:
+    tools = vmaf_tools()
+    reporter = MediaReporter()
+    clip = make_clip(tools, tmp_path / "src.mkv", duration_s=6.0, rich=True)
+    info = probe_module.probe(clip, tools, reporter)
+    settings = _settings(tmp_path)
+    video = tmp_path / "video.mkv"
+    encode_module.encode_full(info, tools, settings, 24, video, reporter)
+    output = tmp_path / "out.mkv"
+    runner_module.mux(tools, [clip], video, output, reporter)
+    scores = runner_module.guard_window_scores(
+        tools, info, output, settings, tmp_path / "work", reporter
+    )
+    assert len(scores) == 1  # a 6 s film has room for one (shortened) window
+    assert 80.0 < scores[0] <= 100.0
+    # the original against itself scores about 100
+    (same,) = runner_module.guard_window_scores(
+        tools, info, clip, settings, tmp_path / "work", reporter
+    )
+    assert same > 99.0
+
+
+@pytest.mark.integration
+def test_real_run_queue_encodes_one_tiny_clip_end_to_end(tmp_path: Path) -> None:
+    tools = vmaf_tools()
+    settings = _settings(tmp_path)
+    clip = make_clip(
+        tools, settings.library_root / "Films" / "Tiny [x] (2024).mkv", duration_s=8.0, rich=True
+    )
+    library_before = _content_tree(settings.library_root)
+    reporter = MediaReporter()
+    with State.open(settings.state_db) as state:
+        info = probe_module.probe(clip, tools, reporter)
+        state.upsert_file(info, decision="encode", reasons=("test",), est_saving_bytes=info.size)
+        state.approve_calibration(95.0, 24)
+        _ack(state)
+        hash_before = plan_hash(build_plan(state))
+        summary = run_queue(settings, tools, state, reporter, deadline=None)
+        record = _status(state, clip)
+        assert plan_hash(build_plan(state)) == hash_before
+    assert summary.stop_reason == ""
+    assert (summary.completed, summary.flagged, summary.retry) == (1, 0, 0), record.note
+    assert record.status is Status.COMPLETED
+
+    target = settings.completed_dir / "Films" / "Tiny [x] (2024).mkv"
+    out = probe_module.probe(target, tools, reporter)
+    assert out.video is not None
+    assert (out.video.codec, out.video.pix_fmt) == ("hevc", "yuv420p10le")
+    assert [a.codec for a in out.audio] == [a.codec for a in info.audio]
+    assert len(out.subtitles) == len(info.subtitles) == 1
+    assert out.chapters == info.chapters == 2
+    assert out.cover_art == info.cover_art >= 1
+    assert out.size < info.size * 0.9
+
+    (row,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert row.completed == target
+    assert row.original == (clip,)
+    assert row.action == "encode"
+    assert row.crf is not None and 16 <= row.crf <= 24
+    assert row.vmaf_mean is not None and row.vmaf_mean >= settings.guard_mean_floor
+    assert row.verified
+
+    assert _content_tree(settings.library_root) == library_before  # byte-identical
+    assert _scratch_files(settings) == []
+    assert any(s.startswith("encode CRF") for s in reporter.stages)

@@ -16,15 +16,11 @@ released after every file, whatever happened. The library is never written: ever
 lives under ``scratch_dir`` or ``completed_dir``, and a run refuses to start if any of them is
 under ``library_root``.
 
-The stages are injectable through `Pipeline`. Its defaults are the real implementations; the
-encode, CRF search and VMAF scoring defaults are still held (Task 10b) and raise
-``NotImplementedError(HELD_REASON)``, which stops the run and puts the file back to
-PENDING.
+The stages are injectable through `Pipeline`; its defaults are the real implementations.
 """
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import hashlib
 import logging
@@ -42,8 +38,7 @@ from pathlib import Path
 from video_cleaner import doctor, encode, planning, quality
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
-from video_cleaner.encode import CrfSearchResult
-from video_cleaner.held import HELD_REASON, held_stages
+from video_cleaner.encode import CrfSearchResult, EncodeError
 from video_cleaner.instancelock import instance_lock, lock_path_for
 from video_cleaner.logging_setup import redact
 from video_cleaner.manifest import (
@@ -66,6 +61,7 @@ from video_cleaner.paths import (
 )
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
+from video_cleaner.quality import VmafError
 from video_cleaner.scratch import (
     MARKER_NAME,
     CopyResult,
@@ -175,7 +171,12 @@ def mux(
     _run_mkvmerge(tools, build_mux_cmd(tools, output, sources, new_video), output, reporter)
 
 
-def held_window_scores(
+# The post-encode guard scores this many windows of this length (plan section 2, step 6).
+GUARD_WINDOW_COUNT = 4
+GUARD_WINDOW_S = 20.0
+
+
+def guard_window_scores(
     tools: Tools,
     source: MediaInfo,
     output: Path,
@@ -183,13 +184,31 @@ def held_window_scores(
     workdir: Path,
     reporter: Reporter,
 ) -> Sequence[float]:
-    """VMAF of each post-encode window of *output* against *source*. HELD until Task 10b."""
-    raise NotImplementedError(HELD_REASON)
+    """VMAF of each guard window of the muxed *output* against *source* (the scratch copy).
 
-
-# The stages that are still signature stubs. A replacement can also declare itself held with
-# a truthy ``held`` attribute. `run_queue` refuses to start while any of them is in the pipeline.
-_HELD_STAGES: tuple[object, ...] = (encode.search_crf, encode.encode_full, held_window_scores)
+    `encode.sample_windows` picks up to `GUARD_WINDOW_COUNT` windows of about
+    `GUARD_WINDOW_S` (fewer and shorter for a short film); the same window of both files is
+    scored with `quality.vmaf_mean`. One score per window, for `quality.evaluate_guard`.
+    """
+    spans = encode.sample_windows(source.duration_s, GUARD_WINDOW_COUNT, GUARD_WINDOW_S)
+    scores: list[float] = []
+    for index, (start, length) in enumerate(spans, start=1):
+        reporter.stage(f"quality guard window {index}/{len(spans)}: {output.name}")
+        scores.append(
+            quality.vmaf_mean(
+                tools,
+                output,
+                source.path,
+                workdir,
+                reporter,
+                reference_start_s=start,
+                reference_length_s=length,
+                distorted_start_s=start,
+                distorted_length_s=length,
+            )
+        )
+    _log.info("%s: guard VMAF per window %s", output.name, ", ".join(f"{v:.2f}" for v in scores))
+    return scores
 
 
 @dataclass
@@ -211,20 +230,11 @@ class Pipeline:
     append_parts: Callable[[Tools, Sequence[Path], Path, Reporter], None] = append_parts
     mux: Callable[[Tools, Sequence[Path], Path | None, Path, Reporter], None] = mux
     window_scores: Callable[[Tools, MediaInfo, Path, Settings, Path, Reporter], Sequence[float]] = (
-        held_window_scores
+        guard_window_scores
     )
     verify: Callable[..., VerifyResult] = verify_output
     probe: Callable[[Path, Tools, Reporter], MediaInfo] = probe
     prefetcher: Callable[[ScratchManager, Reporter], Prefetcher] = Prefetcher
-
-    def held_stages(self) -> list[str]:
-        """Names of the stages that are still held stubs."""
-        stages = {
-            "search_crf": self.search_crf,
-            "encode_full": self.encode_full,
-            "window_scores": self.window_scores,
-        }
-        return held_stages(stages, _HELD_STAGES)
 
 
 # --- deadline and summary ------------------------------------------------------------------
@@ -907,10 +917,14 @@ class _Runner:
                 f"projected saving {search.projected_saving:.1%} at CRF {search.crf} is below "
                 f"the minimum {s.min_saving:.0%}",
             )
+        # Both are estimated at the original's size: an encode is never kept if it is bigger.
+        estimate = original_size if original_size is not None else rec.size
         encoded = work.workdir / "video.mkv"
+        self._reserve(estimate, encoded, work)
         pipe.encode_full(info, tools, s, search.crf, encoded, rep)
         self._set(rec, Status.MUXING)
         output = work.workdir / target.name
+        self._reserve(estimate, output, work)
         pipe.mux(tools, [source], encoded, output, rep)
         self._set(rec, Status.VERIFYING)
         scores = pipe.window_scores(tools, info, output, s, work.workdir, rep)
@@ -978,15 +992,8 @@ class _Runner:
             outcome = _Outcome(
                 Status.RETRY, f"tool failed with exit code {exc.returncode}{where}", attempt=True
             )
-        except NotImplementedError as exc:
-            if str(exc) != HELD_REASON:
-                outcome = _Outcome(Status.FLAGGED, f"NotImplementedError: {exc}")
-            else:
-                with contextlib.suppress(StaleRecord):
-                    self.state.set_status(
-                        rec.path, Status.PENDING, "", size=rec.size, mtime=rec.mtime
-                    )
-                return HELD_REASON
+        except (EncodeError, VmafError) as exc:
+            outcome = _Outcome(Status.FLAGGED, str(exc))
         except ProbeError as exc:
             outcome = _Outcome(Status.FLAGGED, str(exc))
         except OSError as exc:
@@ -1043,13 +1050,7 @@ def run_queue(
     current record in its in-progress status (the next run retries it), cleans its scratch and
     propagates.
     """
-    # Held first: nobody should be sent through plan --ack and calibrate --approve only to be
-    # told the run cannot start anyway.
     pipeline = pipeline or Pipeline()
-    held = pipeline.held_stages()
-    if held:
-        _log.warning("run refused: %s (%s still held)", HELD_REASON, ", ".join(held))
-        return RunSummary(0, 0, 0, 0, 0, False, HELD_REASON)
     acknowledged = state.plan_acknowledged()
     if acknowledged is None:
         raise PlanNotAcknowledged(

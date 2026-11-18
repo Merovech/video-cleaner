@@ -1,6 +1,7 @@
-"""verify_output: probe, duration, streams, decode check and size, all against fakes.
+"""verify_output: probe, duration, streams, decode check and size.
 
-No ffmpeg/ffprobe runs here (encoding is on hold): the probe and decode functions are injected.
+The unit tests inject the probe and decode functions; the ``integration`` tests at the end run
+the real decode check and a real encode + mux on generated clips.
 """
 
 from __future__ import annotations
@@ -12,11 +13,22 @@ from typing import Any
 
 import pytest
 
+from media import make_clip
+from video_cleaner import runner as runner_module
 from video_cleaner import verify as verify_module
-from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, SubtitleStream, VideoStream
+from video_cleaner.config import Settings
+from video_cleaner.encode import encode_full
+from video_cleaner.probe import (
+    AudioStream,
+    MediaInfo,
+    ProbeError,
+    SubtitleStream,
+    VideoStream,
+    probe,
+)
 from video_cleaner.progress import Progress, Reporter
-from video_cleaner.tools import ToolResult, Tools
-from video_cleaner.verify import VerifyResult, decode_errors, verify_output
+from video_cleaner.tools import ToolResult, Tools, locate_tools
+from video_cleaner.verify import TEN_BIT_PIX_FMTS, VerifyResult, decode_errors, verify_output
 
 TOOLS = Tools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"), mkvmerge=Path("mkvmerge"))
 GIB = 1024**3
@@ -310,6 +322,9 @@ def test_decode_errors_reports_stderr_and_exit_code(monkeypatch: pytest.MonkeyPa
     [
         ("h264", "yuv420p10le", "codec h264"),
         ("hevc", "yuv420p", "pixel format yuv420p"),
+        # "10" appears in yuv410p but it is an 8-bit format: no substring test
+        ("hevc", "yuv410p", "pixel format yuv410p"),
+        ("hevc", "yuv420p12le", "pixel format yuv420p12le"),
     ],
 )
 def test_verify_requires_10_bit_hevc_for_an_encode(codec: str, pix_fmt: str, problem: str) -> None:
@@ -319,6 +334,55 @@ def test_verify_requires_10_bit_hevc_for_an_encode(codec: str, pix_fmt: str, pro
     assert problem in result.reason
 
 
+@pytest.mark.parametrize(
+    "pix_fmt", ["yuv420p10le", "yuv420p10be", "yuv422p10le", "yuv444p10le", "p010le"]
+)
+def test_verify_accepts_each_10_bit_format(pix_fmt: str) -> None:
+    out = _info(OUTPUT, size=2 * GIB, codec="hevc", pix_fmt=pix_fmt)
+    assert _verify(out).ok
+
+
 def test_verify_remux_keeps_whatever_video_the_source_had() -> None:
     out = _info(OUTPUT, size=4 * GIB, codec="h264", pix_fmt="yuv420p")
     assert _verify(out, encoded=False).ok
+
+
+# --- integration: real decode check and a real encode ---------------------------------------
+
+
+@pytest.mark.integration
+def test_real_decode_check_passes_on_mkv_with_srt_and_font(tmp_path: Path) -> None:
+    tools = locate_tools()
+    clip = make_clip(tools, tmp_path / "Rich [x] (2024).mkv", duration_s=3.0, rich=True)
+    info = probe(clip, tools, REPORTER)
+    assert len(info.subtitles) == 1
+    assert info.cover_art >= 1
+    assert info.chapters == 2
+    assert decode_errors(tools, clip, REPORTER) == ""
+    assert verify_output(tools, info, clip, REPORTER, encoded=False, min_saving=0.1).ok
+
+
+@pytest.mark.integration
+def test_real_encode_probes_as_10_bit_hevc_and_verifies(tmp_path: Path) -> None:
+    tools = locate_tools()
+    settings = Settings(
+        library_root=tmp_path / "lib",
+        scratch_dir=tmp_path / "scratch",
+        completed_dir=tmp_path / "done",
+        state_db=tmp_path / "s.db",
+        log_dir=tmp_path / "logs",
+    )
+    clip = make_clip(tools, tmp_path / "src.mkv", duration_s=3.0, rich=True)
+    info = probe(clip, tools, REPORTER)
+    video = tmp_path / "video.mkv"
+    encode_full(info, tools, settings, 24, video, REPORTER)
+    output = tmp_path / "out.mkv"
+    runner_module.mux(tools, [clip], video, output, REPORTER)
+    out = probe(output, tools, REPORTER)
+    assert out.video is not None
+    assert out.video.codec == "hevc"
+    assert out.video.pix_fmt in TEN_BIT_PIX_FMTS
+    assert (len(out.audio), len(out.subtitles), out.chapters) == (1, 1, 2)
+    assert out.cover_art == info.cover_art
+    result = verify_output(tools, info, output, REPORTER, encoded=True, min_saving=0.1)
+    assert result.ok, result.reason

@@ -397,6 +397,43 @@ def test_run_tool_kills_process_on_keyboard_interrupt(monkeypatch: pytest.Monkey
     assert started[0].poll() is not None  # no orphan left running
 
 
+def test_run_tool_sees_ctrl_c_while_waiting_for_a_long_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R20: a real SIGINT-style interrupt reaches the waiting main thread within a slice.
+
+    A blocking ``proc.wait()`` without a timeout is not interruptible on Windows: the
+    interrupt would only surface when the 20 s child exits on its own.
+    """
+    import _thread
+
+    started: list[subprocess.Popen[str]] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
+        proc = real_popen(*args, **kwargs)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording_popen)
+    timer = threading.Timer(0.5, _thread.interrupt_main)
+    began = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_tool(
+                _py("import time; time.sleep(20)"),
+                label="sleeper",
+                reporter=FakeReporter(),
+                heartbeat_s=5.0,
+            )
+    finally:
+        timer.cancel()
+    assert time.monotonic() - began < 10.0
+    assert len(started) == 1
+    assert started[0].poll() is not None  # terminated, not left running
+
+
 def test_run_tool_stops_heartbeat_thread_after_return() -> None:
     before = {t.name for t in threading.enumerate()}
     run_tool(_py("pass"), label="x", reporter=FakeReporter(), heartbeat_s=0.1)

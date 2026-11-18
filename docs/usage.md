@@ -38,19 +38,23 @@ activated virtual environment). `--help` works on every command.
 | `status` | Shows the number of files per status, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
 | `report [--output FILE]` | Writes the results so far to `report.csv` beside the state database (or `FILE`) and prints a summary, including for every manifest entry whether its original(s) are still unchanged (run it before overwriting originals). |
 
-**Current state (Phase 1, hold):** `doctor`, `survey`, `plan`, `status` and `report` work.
-`run` and `calibrate --samples` refuse with `held: Task 10b` (exit 1) until the encode, CRF search
-and VMAF stages are enabled.
+**Current state (Phase 1):** every command works. `run` searches a CRF per file (3 sample
+windows of 30 s encoded at CRF 20 and 24 and scored with VMAF, interpolated to the approved VMAF
+target and clamped to `crf_min`..the approved `crf_max`), leaves the file alone when the projected
+saving is under `min_saving`, encodes, muxes, scores 4 windows of 20 s against the original (the
+quality guard) and verifies the output. `calibrate --samples` reads the sample files from the
+library directly and read-only.
 
 `survey`, `plan`, `calibrate` and `run` take `--config PATH` (default
 `%APPDATA%\video-cleaner\config.toml`), `-v`/`--verbose` (repeat for more console logging) and
 `-q`/`--quiet` (warnings only) and `--log-file PATH` (this run's log goes there instead of
 `log_dir`); `doctor`, `status` and `report` take `--config` only.
 
-Exit codes: 0 success; 1 a run or calibration that stopped (including `held: Task 10b`) or a
+Exit codes: 0 success; 1 a run that stopped (scratch full, library unreachable, ...) or a
 failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,
-an output overlapping the library, another run active, no state database yet) or a
-configuration error; 130 interrupted with Ctrl+C.
+an output overlapping the library, another run active, no state database yet, a stored calibration
+that cannot be read), a configuration error or a calibration that failed (nothing to sample, an
+encode, probe or VMAF error, an unusable scratch folder); 130 interrupted with Ctrl+C.
 
 `doctor` checks: Python 3.11 or 3.12; ffmpeg found and built with `libx265` and `libvmaf`
 (`hevc_nvenc` is informational); ffprobe and mkvmerge found; an NVIDIA GPU visible
