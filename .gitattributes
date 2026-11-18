@@ -1,0 +1,4 @@
+# Normalise line endings in the repository: LF for source and text, CRLF only where Windows
+# tools need it.
+* text=auto eol=lf
+*.ps1 text eol=crlf

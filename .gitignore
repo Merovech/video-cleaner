@@ -1,0 +1,47 @@
+# Secrets and local config
+.env
+.env.*
+config.toml
+
+# Video files never belong in the repository (tests generate their clips)
+*.mkv
+*.mp4
+*.avi
+*.m4v
+*.mov
+*.webm
+
+# State, logs, outputs
+*.db
+*.sqlite
+*.log
+logs/
+completed/
+scratch/
+tmp/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Controller workspace
+.superpowers/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent worktrees
+.claude/

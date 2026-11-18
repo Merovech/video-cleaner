@@ -1,0 +1,6 @@
+# Copy to %LOCALAPPDATA%\video-cleaner\config.toml and change the three paths to yours.
+# Every other setting is optional: see docs/usage.md.
+
+library_root = '\\nas\media'
+scratch_dir = 'D:\video-cleaner\scratch'
+completed_dir = 'D:\video-cleaner\completed'

@@ -1,0 +1,254 @@
+{
+  "streams": [
+    {
+      "index": 0,
+      "codec_name": "h264",
+      "codec_long_name": "H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+      "profile": "Main",
+      "codec_type": "video",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_tag": "0x0000",
+      "mime_codec_string": "avc1.4d4028",
+      "width": 1920,
+      "height": 1080,
+      "coded_width": 1920,
+      "coded_height": 1080,
+      "has_b_frames": 2,
+      "sample_aspect_ratio": "423:320",
+      "display_aspect_ratio": "47:20",
+      "pix_fmt": "yuv420p",
+      "level": 40,
+      "color_range": "tv",
+      "color_space": "bt709",
+      "color_transfer": "bt709",
+      "color_primaries": "bt709",
+      "chroma_location": "left",
+      "field_order": "progressive",
+      "is_avc": "true",
+      "nal_length_size": "4",
+      "r_frame_rate": "29155/1216",
+      "avg_frame_rate": "29155/1216",
+      "time_base": "1/1000",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "bits_per_raw_sample": "8",
+      "extradata_size": 48,
+      "disposition": {
+        "default": 1,
+        "dub": 0,
+        "original": 0,
+        "comment": 0,
+        "lyrics": 0,
+        "karaoke": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "visual_impaired": 0,
+        "clean_effects": 0,
+        "attached_pic": 0,
+        "timed_thumbnails": 0,
+        "non_diegetic": 0,
+        "captions": 0,
+        "descriptions": 0,
+        "metadata": 0,
+        "dependent": 0,
+        "still_image": 0,
+        "multilayer": 0
+      },
+      "tags": {
+        "language": "eng"
+      }
+    },
+    {
+      "index": 1,
+      "codec_name": "ac3",
+      "codec_long_name": "ATSC A/52A (AC-3)",
+      "codec_type": "audio",
+      "codec_tag_string": "[0][0][0][0]",
+      "codec_tag": "0x0000",
+      "mime_codec_string": "ac-3",
+      "sample_fmt": "fltp",
+      "sample_rate": "48000",
+      "channels": 6,
+      "channel_layout": "5.1(side)",
+      "bits_per_sample": 0,
+      "initial_padding": 0,
+      "dmix_mode": "0",
+      "ltrt_cmixlev": "0.000000",
+      "ltrt_surmixlev": "0.000000",
+      "loro_cmixlev": "0.000000",
+      "loro_surmixlev": "0.000000",
+      "r_frame_rate": "0/0",
+      "avg_frame_rate": "0/0",
+      "time_base": "1/1000",
+      "start_pts": 0,
+      "start_time": "0.000000",
+      "bit_rate": "640000",
+      "disposition": {
+        "default": 1,
+        "dub": 0,
+        "original": 0,
+        "comment": 0,
+        "lyrics": 0,
+        "karaoke": 0,
+        "forced": 0,
+        "hearing_impaired": 0,
+        "visual_impaired": 0,
+        "clean_effects": 0,
+        "attached_pic": 0,
+        "timed_thumbnails": 0,
+        "non_diegetic": 0,
+        "captions": 0,
+        "descriptions": 0,
+        "metadata": 0,
+        "dependent": 0,
+        "still_image": 0,
+        "multilayer": 0
+      },
+      "tags": {
+        "language": "eng"
+      }
+    }
+  ],
+  "chapters": [
+    {
+      "id": 911169535,
+      "time_base": "1/1000000000",
+      "start": 0,
+      "start_time": "0.000000",
+      "end": 378628000000,
+      "end_time": "378.628000"
+    },
+    {
+      "id": 1220380900,
+      "time_base": "1/1000000000",
+      "start": 378628000000,
+      "start_time": "378.628000",
+      "end": 865239000000,
+      "end_time": "865.239000"
+    },
+    {
+      "id": 1588548073,
+      "time_base": "1/1000000000",
+      "start": 865239000000,
+      "start_time": "865.239000",
+      "end": 1439772000000,
+      "end_time": "1439.772000"
+    },
+    {
+      "id": 1088046971,
+      "time_base": "1/1000000000",
+      "start": 1439772000000,
+      "start_time": "1439.772000",
+      "end": 1932264000000,
+      "end_time": "1932.264000"
+    },
+    {
+      "id": 811432048,
+      "time_base": "1/1000000000",
+      "start": 1932264000000,
+      "start_time": "1932.264000",
+      "end": 2323613000000,
+      "end_time": "2323.613000"
+    },
+    {
+      "id": 120149831,
+      "time_base": "1/1000000000",
+      "start": 2323613000000,
+      "start_time": "2323.613000",
+      "end": 2651524000000,
+      "end_time": "2651.524000"
+    },
+    {
+      "id": 964776013,
+      "time_base": "1/1000000000",
+      "start": 2651524000000,
+      "start_time": "2651.524000",
+      "end": 3404526000000,
+      "end_time": "3404.526000"
+    },
+    {
+      "id": 335895458,
+      "time_base": "1/1000000000",
+      "start": 3404526000000,
+      "start_time": "3404.526000",
+      "end": 3882754000000,
+      "end_time": "3882.754000"
+    },
+    {
+      "id": 1242694421,
+      "time_base": "1/1000000000",
+      "start": 3882754000000,
+      "start_time": "3882.754000",
+      "end": 4192855000000,
+      "end_time": "4192.855000"
+    },
+    {
+      "id": 290480284,
+      "time_base": "1/1000000000",
+      "start": 4192855000000,
+      "start_time": "4192.855000",
+      "end": 4829575000000,
+      "end_time": "4829.575000"
+    },
+    {
+      "id": 1610419849,
+      "time_base": "1/1000000000",
+      "start": 4829575000000,
+      "start_time": "4829.575000",
+      "end": 5377831000000,
+      "end_time": "5377.831000"
+    },
+    {
+      "id": 2023770017,
+      "time_base": "1/1000000000",
+      "start": 5377831000000,
+      "start_time": "5377.831000",
+      "end": 6002455000000,
+      "end_time": "6002.455000"
+    },
+    {
+      "id": 1353620684,
+      "time_base": "1/1000000000",
+      "start": 6002455000000,
+      "start_time": "6002.455000",
+      "end": 6242319000000,
+      "end_time": "6242.319000"
+    },
+    {
+      "id": 1528979560,
+      "time_base": "1/1000000000",
+      "start": 6242319000000,
+      "start_time": "6242.319000",
+      "end": 6579781000000,
+      "end_time": "6579.781000"
+    },
+    {
+      "id": 1416705352,
+      "time_base": "1/1000000000",
+      "start": 6579781000000,
+      "start_time": "6579.781000",
+      "end": 7461704000000,
+      "end_time": "7461.704000"
+    },
+    {
+      "id": 376577217,
+      "time_base": "1/1000000000",
+      "start": 7461704000000,
+      "start_time": "7461.704000",
+      "end": 7928920500000,
+      "end_time": "7928.920500"
+    }
+  ],
+  "format": {
+    "nb_streams": 2,
+    "nb_programs": 0,
+    "nb_stream_groups": 0,
+    "format_name": "matroska,webm",
+    "format_long_name": "Matroska / WebM",
+    "start_time": "0.000000",
+    "duration": "7928.920500",
+    "size": "8566811847",
+    "bit_rate": "8643609",
+    "probe_score": 100
+  }
+}

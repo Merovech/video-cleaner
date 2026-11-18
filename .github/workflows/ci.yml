@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # The supported range (pyproject.toml): the oldest and the newest Python the code and its
+        # dependencies are verified on. 3.13 and later are not claimed: 3.14 already fails a
+        # test (pathlib treats names with trailing dots differently), and the planned subtitle
+        # dependencies (ffsubsync, Whisper) have been checked on 3.12 only.
+        python: ["3.11", "3.12"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Install dependencies
+        run: uv sync --locked --python ${{ matrix.python }}
+
+      - name: Install ffmpeg (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg mkvtoolnix
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg-full mkvtoolnix -y --no-progress
+
+      - name: Check ffmpeg has libx265 and libvmaf
+        run: |
+          ffmpeg -hide_banner -encoders | grep libx265
+          # Ubuntu's packaged ffmpeg has no libvmaf: the VMAF integration tests skip themselves
+          # there (tests/media.py vmaf_tools), so it is a warning on Linux and a failure on
+          # Windows, where those tests must run.
+          if ! ffmpeg -hide_banner -filters | grep libvmaf; then
+            if [ "$RUNNER_OS" = "Windows" ]; then exit 1; fi
+            echo "::warning::this ffmpeg build has no libvmaf; VMAF tests cannot run on this runner"
+          fi
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy
+
+      - name: Tests
+        run: uv run pytest -m "not gpu and not local"
+
+  security:
+    name: security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.12
+
+      - name: Bandit
+        run: uv run bandit -c pyproject.toml -r src -q
+
+      - name: Dependency audit
+        run: uv run pip-audit --skip-editable
+
+      - name: Secret scan (gitleaks, tracked files)
+        run: uv run pre-commit run gitleaks --all-files
