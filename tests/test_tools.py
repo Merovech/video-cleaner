@@ -400,7 +400,7 @@ def test_run_tool_kills_process_on_keyboard_interrupt(monkeypatch: pytest.Monkey
 def test_run_tool_sees_ctrl_c_while_waiting_for_a_long_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R20: a real SIGINT-style interrupt reaches the waiting main thread within a slice.
+    """A real SIGINT-style interrupt reaches the waiting main thread within a slice.
 
     A blocking ``proc.wait()`` without a timeout is not interruptible on Windows: the
     interrupt would only surface when the 20 s child exits on its own.

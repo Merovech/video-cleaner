@@ -260,7 +260,7 @@ def test_log_file_level_default_and_rejects_unknown(tmp_path: Path) -> None:
         load_settings(None, _env(tmp_path, VC_LOG_FILE_LEVEL="LOUD"))
 
 
-# --- item 16: heartbeat bound, absolute clean paths, BOM ------------------------------------
+# --- heartbeat bound, absolute clean paths, BOM ------------------------------------
 
 
 def test_heartbeat_s_is_at_most_15(tmp_path: Path) -> None:

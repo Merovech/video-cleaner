@@ -979,7 +979,7 @@ def test_guard_window_scores_short_film_uses_one_shorter_window(
 
 
 def test_scratch_is_reserved_for_the_encode_before_it_runs(tmp_path: Path) -> None:
-    """R19: the encoded video is reserved at the original's size before it is written."""
+    """The encoded video is reserved at the original's size before it is written."""
     settings = _settings(tmp_path, scratch_cap_bytes=1999)
     with _open_state(settings) as state:
         a = _source(settings, "a.avi", size=1000)
@@ -1778,7 +1778,7 @@ def test_delivering_beside_its_own_source_is_fine(settings: Settings, state: Sta
     assert summary.completed == 2
 
 
-# --- calibration approval (Task 14, ruling R3) ---------------------------------------------
+# --- calibration approval ---------------------------------------------
 
 
 def test_run_refused_without_calibration_approval(
@@ -1855,7 +1855,7 @@ def test_approved_crf_max_below_configured_crf_min_is_refused(
         assert fakes.calls == []
 
 
-# --- plan acknowledgement must match the current plan (Task 14 fix, ruling R15) -------------
+# --- plan acknowledgement must match the current plan -------------
 
 
 def test_run_refused_when_plan_changed_since_ack(
@@ -1973,7 +1973,7 @@ def test_approved_vmaf_target_below_guard_mean_floor_is_refused(
     assert not settings.scratch_dir.exists()
 
 
-# --- delivery order and crash recovery (plan section 6) ------------------------------------
+# --- delivery order and crash recovery ------------------------------------
 
 
 class _Kill(BaseException):
@@ -2181,7 +2181,7 @@ def test_scratch_work_stays_inside_the_tool_folder(settings: Settings, state: St
 
 
 def test_foreign_files_in_scratch_do_not_count_toward_the_cap(tmp_path: Path) -> None:
-    # room for the copy, the encoded video and the output (1000 each, R19) plus the marker
+    # room for the copy, the encoded video and the output (1000 each) plus the marker
     settings = _settings(tmp_path, scratch_cap_bytes=3200)
     settings.scratch_dir.mkdir(parents=True)
     (settings.scratch_dir / "big-foreign.bin").write_bytes(b"f" * 5000)

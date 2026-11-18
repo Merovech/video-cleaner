@@ -8,7 +8,7 @@ target and a CRF ceiling with ``calibrate --approve``; `run` refuses to start un
 
 The real work (encode, VMAF, side-by-side) is injected through `CalibrationEngine`; its defaults
 are the real `encode_sample`, `score_windows` and `make_sidebyside`. Calibration reads each
-sample's library file directly and read-only (ruling R18: ffprobe and ``-ss`` input seeks, no copy
+sample's library file directly and read-only (ffprobe and ``-ss`` input seeks, no copy
 through scratch); it writes only to ``<completed>/calibration`` and the tool scratch folder.
 """
 
@@ -71,7 +71,7 @@ class CalibrationError(Exception):
 
 @dataclass(frozen=True)
 class SampleEncode:
-    """One sample encoded at one CRF (ruling R17): one record per sample window."""
+    """One sample encoded at one CRF: one record per sample window."""
 
     crf: int
     windows: tuple[WindowEncode, ...]
@@ -116,7 +116,7 @@ def encode_sample(
 ) -> SampleEncode:
     """Encode the sample windows of the library file *sample* at *crf* into *workdir*.
 
-    The library file is probed and read in place, read-only (R18): ffprobe for the duration
+    The library file is probed and read in place, read-only: ffprobe for the duration
     and the windows' source bytes, ffmpeg ``-ss`` input seeks for the encodes, which use the
     run's preset and pixel format (`encode.encode_windows`). The windows are those of the CRF
     search (`encode.sample_windows`); *window_count* and *window_length_s* exist for tests.

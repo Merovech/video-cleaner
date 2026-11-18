@@ -37,7 +37,7 @@ def test_mux_cmd_new_video_contributes_only_its_video_track() -> None:
         "--no-track-tags",
         "--no-attachments",
     ]
-    # R21: the intermediate's track statistics tags never reach the output
+    # the intermediate's track statistics tags never reach the output
     for flag in ("--no-chapters", "--no-global-tags", "--no-track-tags", "--no-attachments"):
         assert cmd.count(flag) == 1
 

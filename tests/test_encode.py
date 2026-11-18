@@ -210,7 +210,7 @@ class _IntSubclass(int):
 
 @pytest.mark.parametrize("make", [_IntLike, _IntSubclass])
 def test_interpolate_crf_accepts_integer_like_crfs(make: type) -> None:
-    """R21: numpy-style integers (any numbers.Integral except bool) are accepted."""
+    """numpy-style integers (any numbers.Integral except bool) are accepted."""
     points = [(make(20), 96.0), (make(24), 94.0)]
     result = interpolate_crf(points, 95.0)
     assert result == 22

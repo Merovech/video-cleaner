@@ -115,7 +115,7 @@ def test_build_sidebyside_cmd() -> None:
     assert cmd[first + 1] == str(Path("/s/orig [1].mkv"))
     assert cmd[second + 1] == str(Path("/w/enc.mkv"))
     # the original is cut to the window; the encoded sample already IS that window, so it
-    # is only limited to the same length and never seeked (R17)
+    # is only limited to the same length and never seeked
     assert cmd[first - 4 : first] == ["-ss", "600.000", "-t", "20.000"]
     assert cmd[second - 2 : second] == ["-t", "20.000"]
     assert cmd.count("-ss") == 1
@@ -355,7 +355,7 @@ def test_unusable_scratch_folder_is_a_calibration_error(
 
 
 class FakeTools:
-    """run_tool / probe / vmaf_mean stand-ins for the real engine (R17, R18)."""
+    """run_tool / probe / vmaf_mean stand-ins for the real engine."""
 
     def __init__(self, sample: Path) -> None:
         self.sample = sample
@@ -407,7 +407,7 @@ def fake_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeTools:
 def test_real_encode_sample_reads_the_library_file_directly(
     fake_tools: FakeTools, tmp_path: Path
 ) -> None:
-    """R18: no copy through scratch; the library file is the encode input, read-only."""
+    """No copy through scratch; the library file is the encode input, read-only."""
     sample = fake_tools.sample
     before = (sample.read_bytes(), sample.stat().st_mtime_ns)
     rec = _rec("x", 13)

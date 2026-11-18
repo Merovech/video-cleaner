@@ -26,7 +26,7 @@ from video_cleaner.tools import Tools, run_tool
 
 _log = logging.getLogger(__name__)
 
-# The CRF search samples these two CRFs (plan section 5) ...
+# The CRF search samples these two CRFs ...
 SEARCH_CRFS: tuple[int, int] = (20, 24)
 # ... over this many windows of this length.
 SAMPLE_WINDOW_COUNT = 3
@@ -429,7 +429,7 @@ def search_crf(
     window_count: int = SAMPLE_WINDOW_COUNT,
     window_length_s: float = SAMPLE_WINDOW_S,
 ) -> CrfSearchResult:
-    """Find the per-file CRF that reaches ``settings.vmaf_target`` (plan section 5).
+    """Find the per-file CRF that reaches ``settings.vmaf_target``.
 
     The `sample_windows` of ``info.path`` (the scratch copy) are encoded at each of
     `SEARCH_CRFS` with the real encode's preset and pixel format; each encoded window is scored

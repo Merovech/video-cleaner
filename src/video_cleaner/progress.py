@@ -1,4 +1,4 @@
-"""Progress parsing and console reporting (spec section 4.4).
+"""Progress parsing and console reporting.
 
 The tool is never silent: percentages where a tool reports them, a heartbeat where it does
 not, an in-place `rich` display on a TTY and rate-limited plain lines otherwise.

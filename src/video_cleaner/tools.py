@@ -1,4 +1,4 @@
-"""External tool discovery and a subprocess runner that is never silent (spec section 4.4).
+"""External tool discovery and a subprocess runner that is never silent.
 
 `locate_tools` finds ffmpeg, ffprobe and mkvmerge. `run_tool` runs one command (argument list,
 never a shell), parses progress from its stdout, drains stderr concurrently, emits a heartbeat

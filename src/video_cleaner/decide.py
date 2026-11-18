@@ -24,7 +24,7 @@ from video_cleaner.probe import MediaInfo, VideoStream
 EFFICIENT_CODECS = frozenset({"hevc", "av1"})
 UHD_MIN_WIDTH = 3000
 UHD_MIN_HEIGHT = 2000
-# Plan section 9 item 11: a Dolby Vision profile 5 file has no HDR10 base layer, so most players
+# A Dolby Vision profile 5 file has no HDR10 base layer, so most players
 # show wrong colours; it is left alone and listed for the user to replace with another release.
 DV5_REPLACE_REASON = "Dolby Vision profile 5: replace (no HDR10 fallback)"
 

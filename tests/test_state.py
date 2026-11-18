@@ -582,7 +582,7 @@ def test_unrepresentable_path_raises_before_any_write(state: State) -> None:
     assert sum(state.counts().values()) == 0
 
 
-# --- calibration approval (Task 14, ruling R3) ---------------------------------------------
+# --- calibration approval ---------------------------------------------
 
 
 def test_calibration_is_none_until_approved(state: State) -> None:

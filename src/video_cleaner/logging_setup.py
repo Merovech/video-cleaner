@@ -1,7 +1,7 @@
 """Run logging: a DEBUG file per run, a console handler by verbosity, and secret redaction.
 
 Every record that reaches either handler passes through `RedactingFilter`, so keys, tokens
-and passwords never reach the console or the log file (spec section 4.4).
+and passwords never reach the console or the log file.
 """
 
 from __future__ import annotations

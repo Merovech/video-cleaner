@@ -8,7 +8,7 @@ original is re-checked against its state record, and then:
   full encode, mux of the new video with the source's untouched streams, the VMAF window guard
   and `verify_output`;
 * remux only: mkvmerge with the sources and no new video (every source video stream survives);
-* multi-part (Ruling R11): the parts are appended into one combined file first, which is then
+* multi-part: the parts are appended into one combined file first, which is then
   decided, encoded or delivered like a single file.
 
 A verified output is moved to the completed folder and recorded in ``manifest.csv``; scratch is
@@ -171,7 +171,7 @@ def mux(
     _run_mkvmerge(tools, build_mux_cmd(tools, output, sources, new_video), output, reporter)
 
 
-# The post-encode guard scores this many windows of this length (plan section 2, step 6).
+# The post-encode guard scores this many windows of this length.
 GUARD_WINDOW_COUNT = 4
 GUARD_WINDOW_S = 20.0
 
@@ -331,7 +331,7 @@ def refuse_outputs_in_library(settings: Settings) -> None:
 
 
 def apply_calibration(settings: Settings, state: State) -> Settings:
-    """*settings* with the approved ``vmaf_target`` and ``crf_max`` (ruling R3).
+    """*settings* with the approved ``vmaf_target`` and ``crf_max``.
 
     Raises `CalibrationNotApproved` when nothing was approved, when the approved ceiling is
     below the configured ``crf_min``, or when the approved VMAF target is below
@@ -825,7 +825,7 @@ class _Runner:
         if target.exists():
             raise _Refused(f"output {target} already exists in the completed folder")
 
-        # Order (plan section 6, crash safety): output -> <target>.part, manifest row, then
+        # Crash-safe order: output -> <target>.part, manifest row, then
         # rename .part -> target. A kill at any point is repaired by `reconcile` at the next
         # start: a .part without a row is removed, a row whose .part is still there is finished.
         # Cleanup below runs for errors only; a kill leaves exactly that state behind.

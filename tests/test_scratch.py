@@ -1,4 +1,4 @@
-"""Scratch space, verified copy and background prefetch (Task 11)."""
+"""Scratch space, verified copy and background prefetch."""
 
 from __future__ import annotations
 

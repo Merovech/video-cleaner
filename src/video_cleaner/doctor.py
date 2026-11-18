@@ -1,4 +1,4 @@
-"""Environment self-check (`video-cleaner doctor`) and log retention (spec sections 4.2-4.4).
+"""Environment self-check (`video-cleaner doctor`) and log retention.
 
 Every external command goes through an injectable *runner* so tests never start a process.
 No check raises: a problem, including an unexpected exception inside a check, becomes a
