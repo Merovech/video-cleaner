@@ -1,4 +1,4 @@
-# Copy to %APPDATA%\video-cleaner\config.toml and change the three paths to yours.
+# Copy to %LOCALAPPDATA%\video-cleaner\config.toml and change the three paths to yours.
 # Every other setting is optional: see docs/usage.md.
 
 library_root = '\\nas\media'

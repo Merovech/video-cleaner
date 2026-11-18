@@ -46,7 +46,9 @@ RootOption = Annotated[
 ]
 ConfigOption = Annotated[
     Path | None,
-    typer.Option("--config", help=r"Config file (default %APPDATA%\video-cleaner\config.toml)."),
+    typer.Option(
+        "--config", help=r"Config file (default %LOCALAPPDATA%\video-cleaner\config.toml)."
+    ),
 ]
 VerboseOption = Annotated[
     int, typer.Option("--verbose", "-v", count=True, help="More console logging.")
@@ -69,7 +71,7 @@ def doctor(
     config: Annotated[
         Path | None,
         typer.Option(
-            "--config", help=r"Config file (default %APPDATA%\video-cleaner\config.toml)."
+            "--config", help=r"Config file (default %LOCALAPPDATA%\video-cleaner\config.toml)."
         ),
     ] = None,
 ) -> None:

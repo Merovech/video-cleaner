@@ -853,7 +853,7 @@ def test_cli_survey_tool_lost_mid_run_exits_2(
 def test_cli_survey_help_shows_config_default_path() -> None:
     result = CliRunner().invoke(app, ["survey", "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    assert r"%APPDATA%\video-cleaner\config.toml" in result.stdout
+    assert r"%LOCALAPPDATA%\video-cleaner\config.toml" in result.stdout
     assert "\v" not in result.stdout  # the old help string turned "\v" into a vertical tab
 
 

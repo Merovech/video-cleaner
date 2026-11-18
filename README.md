@@ -15,7 +15,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
 Creates the Python 3.12 environment with `uv`, installs ffmpeg and MKVToolNix through winget,
-creates a private `%APPDATA%\video-cleaner\config.toml` from `config.example.toml` and runs
+creates a private `%LOCALAPPDATA%\video-cleaner\config.toml` from `config.example.toml` and runs
 `video-cleaner doctor`. Safe to rerun.
 
 ## Principles
@@ -45,7 +45,7 @@ uv run mypy
 uv run video-cleaner --help
 ```
 
-Copy `config.example.toml` to `%APPDATA%\video-cleaner\config.toml` and edit it. Individual values
+Copy `config.example.toml` to `%LOCALAPPDATA%\video-cleaner\config.toml` and edit it. Individual values
 can be overridden with `VC_*` environment variables.
 
 ## Licence

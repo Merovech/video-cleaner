@@ -79,10 +79,10 @@ try {
         Install-WingetPackage 'MoritzBunkus.MKVToolNix'
     }
 
-    if (-not $env:APPDATA) {
-        throw 'APPDATA is not set; cannot place the config file.'
+    if (-not $env:LOCALAPPDATA) {
+        throw 'LOCALAPPDATA is not set; cannot place the config file.'
     }
-    $ConfigDir = Join-Path $env:APPDATA 'video-cleaner'
+    $ConfigDir = Join-Path $env:LOCALAPPDATA 'video-cleaner'
     $ConfigFile = Join-Path $ConfigDir 'config.toml'
     if (-not (Test-Path $ConfigDir)) {
         New-Item -ItemType Directory -Path $ConfigDir | Out-Null

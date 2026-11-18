@@ -18,11 +18,11 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 The script is safe to rerun. It creates a Python 3.12 virtual environment with `uv`, installs the
 locked dependencies (`uv sync --frozen`), installs ffmpeg (`Gyan.FFmpeg`) and MKVToolNix
 (`MoritzBunkus.MKVToolNix`) through winget only, copies `config.example.toml` to
-`%APPDATA%\video-cleaner\config.toml` if it is not there yet, restricts that file to your user
+`%LOCALAPPDATA%\video-cleaner\config.toml` if it is not there yet, restricts that file to your user
 with `icacls`, and finally runs `video-cleaner doctor`. Pass `-SkipTools` to skip the winget
 installs.
 
-Edit `%APPDATA%\video-cleaner\config.toml` before the first run (at least `library_root`,
+Edit `%LOCALAPPDATA%\video-cleaner\config.toml` before the first run (at least `library_root`,
 `scratch_dir` and `completed_dir`), then rerun `uv run video-cleaner doctor`.
 
 ## Commands
@@ -49,7 +49,7 @@ quality guard) and verifies the output. `calibrate --samples` reads the sample f
 library directly and read-only.
 
 `survey`, `plan`, `calibrate` and `run` take `--config PATH` (default
-`%APPDATA%\video-cleaner\config.toml`), `-v`/`--verbose` (repeat for more console logging) and
+`%LOCALAPPDATA%\video-cleaner\config.toml`), `-v`/`--verbose` (repeat for more console logging) and
 `-q`/`--quiet` (warnings only) and `--log-file PATH` (this run's log goes there instead of
 `log_dir`); `doctor`, `status` and `report` take `--config` only.
 
@@ -142,7 +142,7 @@ full, a tool not found, the library or the manifest unreachable) do not count.
 
 ## Settings
 
-Settings come from the defaults, then `%APPDATA%\video-cleaner\config.toml`, then environment
+Settings come from the defaults, then `%LOCALAPPDATA%\video-cleaner\config.toml`, then environment
 variables named `VC_<SETTING IN UPPERCASE>` (for example `VC_VMAF_TARGET=94`). Unknown keys are
 an error. Use TOML literal strings (single quotes) for Windows paths. Environment variables such
 as `%LOCALAPPDATA%` are not expanded inside the file, so a path override is written out in full

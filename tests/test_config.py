@@ -17,7 +17,6 @@ def _env(tmp_path: Path, **extra: str) -> dict[str, str]:
     """Isolated environment: never falls through to the real os.environ."""
     env = {
         "LOCALAPPDATA": str(tmp_path / "local"),
-        "APPDATA": str(tmp_path / "roaming"),
         "VC_LIBRARY_ROOT": REQUIRED_PATHS["library_root"],
         "VC_SCRATCH_DIR": REQUIRED_PATHS["scratch_dir"],
         "VC_COMPLETED_DIR": REQUIRED_PATHS["completed_dir"],
@@ -123,8 +122,8 @@ def test_env_none_reads_os_environ(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert load_settings(None, None).vmaf_target == 91.0
 
 
-def test_default_config_path_is_under_appdata(tmp_path: Path) -> None:
-    cfg_dir = tmp_path / "roaming" / "video-cleaner"
+def test_default_config_path_is_under_localappdata(tmp_path: Path) -> None:
+    cfg_dir = tmp_path / "local" / "video-cleaner"
     cfg_dir.mkdir(parents=True)
     _write(cfg_dir / "config.toml", "crf_max = 22\n")
     s = load_settings(None, _env(tmp_path))

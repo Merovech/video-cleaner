@@ -185,13 +185,16 @@ def _validate(values: Mapping[str, Any]) -> None:
 
 
 def default_config_path(env: Mapping[str, str] | None = None) -> Path | None:
-    """The config file `load_settings` reads when no path is given, or None without APPDATA.
+    """The config file `load_settings` reads when no path is given, or None without LOCALAPPDATA.
+
+    The config sits beside the state database and the logs: it holds paths of this machine, so
+    it is not kept in the roaming profile (``APPDATA``).
 
     The single source of this rule: `doctor` checks the permissions of the same file.
     """
     environ: Mapping[str, str] = os.environ if env is None else env
-    appdata = environ.get("APPDATA")
-    return Path(appdata) / APP_DIR_NAME / "config.toml" if appdata else None
+    local_appdata = environ.get("LOCALAPPDATA")
+    return Path(local_appdata) / APP_DIR_NAME / "config.toml" if local_appdata else None
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
@@ -216,7 +219,7 @@ def load_settings(
     Precedence (lowest first): dataclass defaults, TOML file, environment. When *env* is
     given it is the only environment consulted (``os.environ`` is not read); when None,
     ``os.environ`` is used. An explicit *config_path* must exist; the default path
-    (``%APPDATA%\\video-cleaner\\config.toml``) is optional.
+    (``%LOCALAPPDATA%\\video-cleaner\\config.toml``) is optional.
     """
     environ: Mapping[str, str] = os.environ if env is None else env
     converters = _field_converters()

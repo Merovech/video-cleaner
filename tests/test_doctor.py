@@ -584,7 +584,7 @@ def test_doctor_checks_the_config_file_load_settings_reads(tmp_path: Path) -> No
     config = appdata / "video-cleaner" / "config.toml"
     config.parent.mkdir(parents=True)
     config.write_text(_config(tmp_path).read_text(encoding="utf-8"), encoding="utf-8")
-    env = {**_env(tmp_path), "APPDATA": str(appdata)}
+    env = {**_env(tmp_path), "LOCALAPPDATA": str(appdata)}
     settings = load_settings(env=env)
     assert settings.library_root == tmp_path / "library"  # load_settings read this file
     assert default_config_path(env) == config
@@ -606,7 +606,7 @@ def test_cli_doctor_checks_the_default_config_it_loaded(
     config = appdata / "video-cleaner" / "config.toml"
     config.parent.mkdir(parents=True)
     config.write_text(_config(tmp_path).read_text(encoding="utf-8"), encoding="utf-8")
-    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("LOCALAPPDATA", str(appdata))
     received: list[object] = []
 
     def fake(settings: Settings, **kwargs: object) -> list[Check]:

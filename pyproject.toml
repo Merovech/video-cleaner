@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Re-encode a video library to HEVC with x265, safely and non-destructively."
 readme = "README.md"
 license = { text = "MIT" }
+# 3.11 is the oldest tested; below 3.13 because newer versions are not verified (see ci.yml).
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "typer>=0.12",
