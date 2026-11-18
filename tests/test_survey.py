@@ -526,6 +526,22 @@ def test_survey_csv_has_hdr_dv_interlace_and_subtitle_columns(tmp_path: Path) ->
     assert "Dolby Vision profile 5: replace (no HDR10 fallback)" in dv["reasons"]
 
 
+def test_survey_csv_leaves_probe_columns_blank_for_an_unreadable_file(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    _touch(settings.library_root / "Garbage.mkv", b"not a video")
+
+    def unreadable(path: Path) -> MediaInfo:
+        raise ProbeError(path, "Invalid data found when processing input")
+
+    result, state = _run(settings, _fake_probe({"Garbage.mkv": unreadable}))
+    state.close()
+    row = _by_name(_csv_rows(result.csv_path))["Garbage.mkv"]
+    first, last = CSV_COLUMNS.index("duration_s"), CSV_COLUMNS.index("subtitle_streams")
+    probed = CSV_COLUMNS[first : last + 1]  # every column that comes from ffprobe
+    assert [row[column] for column in probed] == [""] * len(probed)  # unknown, not False
+    assert row["action"] == "flag"
+
+
 def _name_hash(path: Path) -> str:
     return f"{sum(path.name.encode()):016x}"
 

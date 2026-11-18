@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from video_cleaner import doctor, encode, planning, quality
+from video_cleaner import encode, logarchive, planning, quality
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action, decide
 from video_cleaner.encode import CrfSearchResult, EncodeError
@@ -1083,7 +1083,7 @@ def _run_locked(
     reset = state.reset_in_progress()
     if reset:
         _log.info("%d file(s) left in progress by an earlier run were reset to retry", reset)
-    removed = doctor.archive_old_logs(settings.log_dir, exclude=current_log)
+    removed = logarchive.archive_old_logs(settings.log_dir, exclude=current_log)
     if removed:
         _log.info("archived %d old log file(s)", len(removed))
 

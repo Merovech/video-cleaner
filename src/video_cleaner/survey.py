@@ -272,22 +272,38 @@ def _cell(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def _csv_line(row: _Row) -> list[str]:
-    info = row.info
-    video = info.video if info is not None else None
+# The columns from ffprobe: duration_s up to subtitle_streams.
+PROBE_COLUMNS = CSV_COLUMNS.index("subtitle_streams") - CSV_COLUMNS.index("duration_s") + 1
+
+
+def _probe_cells(info: MediaInfo | None) -> list[str]:
+    """The CSV cells that come from ffprobe; all blank when the file could not be probed.
+
+    A file ffprobe cannot read has no known HDR or interlace flag, so those cells stay blank
+    rather than claiming ``False``.
+    """
+    if info is None:
+        return [""] * PROBE_COLUMNS
+    video = info.video
     return [
-        str(row.path),
-        _cell(row.size),
-        f"{info.duration_s:.3f}" if info is not None else "",
-        info.container if info is not None else "",
+        f"{info.duration_s:.3f}",
+        info.container,
         video.codec if video is not None else "",
         _cell(video.width if video is not None else None),
         _cell(video.height if video is not None else None),
-        f"{info.bitrate_kbps:.0f}" if info is not None else "",
-        _cell(info.is_hdr if info is not None else None),
+        f"{info.bitrate_kbps:.0f}",
+        str(info.is_hdr),
         _cell(video.dv_profile if video is not None else None),
-        _cell(info.is_interlaced if info is not None else None),
-        str(len(info.subtitles)) if info is not None else "",
+        str(info.is_interlaced),
+        str(len(info.subtitles)),
+    ]
+
+
+def _csv_line(row: _Row) -> list[str]:
+    return [
+        str(row.path),
+        _cell(row.size),
+        *_probe_cells(row.info),
         row.action.value,
         LIST_SEPARATOR.join(row.reasons),
         str(row.est_saving_bytes),

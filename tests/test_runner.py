@@ -24,8 +24,8 @@ from typer.testing import CliRunner
 from media import RecordingReporter as MediaReporter
 from media import make_clip, vmaf_tools
 from video_cleaner import cli as cli_module
-from video_cleaner import doctor as doctor_module
 from video_cleaner import encode as encode_module
+from video_cleaner import logarchive
 from video_cleaner import paths as paths_module
 from video_cleaner import probe as probe_module
 from video_cleaner import quality as quality_module
@@ -503,7 +503,7 @@ def test_startup_resets_sweeps_and_prunes(
         pruned.append((log_dir, kw.get("exclude")))
         return []
 
-    monkeypatch.setattr(doctor_module, "archive_old_logs", fake_prune)
+    monkeypatch.setattr(logarchive, "archive_old_logs", fake_prune)
     current = settings.log_dir / "run-now.log"
     summary = _run(settings, state, Fakes(), current_log=current)
     assert pruned == [(settings.log_dir, current)]

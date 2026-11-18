@@ -14,7 +14,7 @@ from rich.console import Console
 
 from video_cleaner import calibrate as _calibrate
 from video_cleaner import doctor as doctor_mod
-from video_cleaner import planning, power
+from video_cleaner import logarchive, planning, power
 from video_cleaner import runner as _runner
 from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
@@ -83,7 +83,7 @@ def doctor(
     checks = doctor_mod.run_doctor(settings, config_path=config_path)
     for check in checks:
         typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")
-    removed = doctor_mod.archive_old_logs(settings.log_dir)
+    removed = logarchive.archive_old_logs(settings.log_dir)
     typer.echo(f"logs: archived {len(removed)} old log file(s) from {settings.log_dir}")
     if any(c.required and not c.ok for c in checks):
         raise typer.Exit(code=1)
