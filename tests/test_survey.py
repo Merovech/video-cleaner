@@ -520,9 +520,9 @@ def test_survey_csv_has_hdr_dv_interlace_and_subtitle_columns(tmp_path: Path) ->
     state.close()
     rows = _by_name(_csv_rows(result.csv_path))
     plain, dv = rows["Plain.mkv"], rows["Dv.mkv"]
-    assert (plain["hdr"], plain["dv_profile"], plain["interlaced"]) == ("no", "", "no")
+    assert (plain["hdr"], plain["dv_profile"], plain["interlaced"]) == ("False", "", "False")
     assert plain["subtitle_streams"] == "0"
-    assert (dv["hdr"], dv["dv_profile"]) == ("no", "5")
+    assert (dv["hdr"], dv["dv_profile"]) == ("False", "5")
     assert "Dolby Vision profile 5: replace (no HDR10 fallback)" in dv["reasons"]
 
 

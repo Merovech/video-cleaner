@@ -137,13 +137,16 @@ def _int_or_none(value: Any) -> int | None:
 
 
 def _parse_rate(value: Any) -> float:
-    """ffprobe rates are 'num/den' strings; '0/0' and junk give 0.0."""
+    """ffprobe writes a frame rate as a fraction string, 'numerator/denominator' ('24000/1001').
+
+    Returns the rate as a number (23.976...); '0/0' (ffprobe's "unknown") and junk give 0.0.
+    """
     if not isinstance(value, str):
         return 0.0
-    num, _, den = value.partition("/")
+    numerator_text, _, denominator_text = value.partition("/")
     try:
-        numerator = float(num)
-        denominator = float(den) if den else 1.0
+        numerator = float(numerator_text)
+        denominator = float(denominator_text) if denominator_text else 1.0
     except ValueError:
         return 0.0
     if denominator == 0:

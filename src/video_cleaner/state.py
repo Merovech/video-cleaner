@@ -519,7 +519,7 @@ class State:
         )
 
     def approve_calibration(self, vmaf_target: float, crf_max: int) -> None:
-        """Record the calibration Ari approved: the VMAF target and CRF ceiling a run uses.
+        """Record the calibration the user approved: the VMAF target and CRF ceiling a run uses.
 
         Stored like the plan acknowledgement (one meta value, one event line). Range checks
         against the configuration are the caller's job; this only refuses values that are not

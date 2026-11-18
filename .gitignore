@@ -3,6 +3,14 @@
 .env.*
 config.toml
 
+# Video files never belong in the repository (tests generate their clips)
+*.mkv
+*.mp4
+*.avi
+*.m4v
+*.mov
+*.webm
+
 # State, logs, outputs
 *.db
 *.sqlite

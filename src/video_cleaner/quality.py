@@ -10,6 +10,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from video_cleaner.cmdline import PROGRESS_OPTIONS, Option, flatten
 from video_cleaner.progress import Progress, Reporter, parse_ffmpeg_progress
 from video_cleaner.tools import Tools, run_tool
 
@@ -61,18 +62,18 @@ def vmaf_threads(cpu_count: int | None = None) -> int:
     return max(1, min(MAX_VMAF_THREADS, cpu_count or 1))
 
 
-def _window(start_s: float | None, length_s: float | None, name: str) -> list[str]:
+def _window(start_s: float | None, length_s: float | None, name: str) -> list[Option]:
     """``-ss`` / ``-t`` input options for one input (placed before its ``-i``)."""
-    args: list[str] = []
+    options: list[Option] = []
     if start_s is not None:
         if not (math.isfinite(start_s) and start_s >= 0):
             raise ValueError(f"{name}_start_s must be a non-negative number, got {start_s!r}")
-        args += ["-ss", f"{start_s:.3f}"]
+        options.append(("-ss", f"{start_s:.3f}"))  # seek this input to the window start
     if length_s is not None:
         if not (math.isfinite(length_s) and length_s > 0):
             raise ValueError(f"{name}_length_s must be a positive number, got {length_s!r}")
-        args += ["-t", f"{length_s:.3f}"]
-    return args
+        options.append(("-t", f"{length_s:.3f}"))  # read only the window length
+    return options
 
 
 def build_vmaf_cmd(
@@ -114,25 +115,21 @@ def build_vmaf_cmd(
     )
     return [
         str(tools.ffmpeg),
-        "-nostdin",
-        "-hide_banner",
-        *_window(distorted_start_s, distorted_length_s, "distorted"),
-        "-i",
-        str(distorted),
-        *_window(reference_start_s, reference_length_s, "reference"),
-        "-i",
-        str(reference),
-        "-lavfi",
-        graph,
-        "-an",
-        "-sn",
-        "-dn",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        "-f",
-        "null",
-        "-",
+        *flatten(
+            ("-nostdin",),  # never wait for keyboard input
+            ("-hide_banner",),  # no version and build banner in the log
+            *_window(distorted_start_s, distorted_length_s, "distorted"),
+            ("-i", str(distorted)),  # input 0: the encode being judged
+            *_window(reference_start_s, reference_length_s, "reference"),
+            ("-i", str(reference)),  # input 1: the original it is judged against
+            ("-lavfi", graph),  # the VMAF filter graph above
+            ("-an",),  # no audio
+            ("-sn",),  # no subtitles
+            ("-dn",),  # no data streams
+            *PROGRESS_OPTIONS,
+            ("-f", "null"),  # discard the output: only the score log matters
+            ("-",),
+        ),
     ]
 
 

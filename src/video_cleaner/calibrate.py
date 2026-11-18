@@ -2,9 +2,9 @@
 
 A few encode candidates spread over the size range are encoded at CRF 17, 20, 23 and 26; each
 encode is scored per window with VMAF, and a side-by-side clip (original left, encode right) is
-written so Ari can also judge by eye. The table goes to ``calibration.txt`` beside the state
-database and the clips to ``<completed>/calibration``. Ari then approves a VMAF target and a CRF
-ceiling with ``calibrate --approve``; `run` refuses to start until he has.
+written so the user can also judge by eye. The table goes to ``calibration.txt`` beside the
+state database and the clips to ``<completed>/calibration``. The user then approves a VMAF
+target and a CRF ceiling with ``calibrate --approve``; `run` refuses to start until they have.
 
 The real work (encode, VMAF, side-by-side) is injected through `CalibrationEngine`; its defaults
 are the real `encode_sample`, `score_windows` and `make_sidebyside`. Calibration reads each
@@ -24,6 +24,7 @@ from pathlib import Path
 
 from video_cleaner import quality
 from video_cleaner.atomicio import write_text_atomic
+from video_cleaner.cmdline import PROGRESS_OPTIONS, flatten
 from video_cleaner.config import Settings
 from video_cleaner.decide import Action
 from video_cleaner.encode import (
@@ -243,38 +244,32 @@ def build_sidebyside_cmd(
         raise ValueError(f"length_s must be a positive number, got {length_s!r}")
     if height < 2 or height % 2:
         raise ValueError(f"height must be an even number of at least 2, got {height}")
-    length = ["-t", _seconds(length_s)]
+    length = ("-t", _seconds(length_s))
+    # Scale both to the same height, then put the original on the left and the encode on the
+    # right.
     graph = (
         f"[0:V:0]scale=-2:{height}[left];[1:V:0]scale=-2:{height}[right];"
         "[left][right]hstack=inputs=2[v]"
     )
     return [
         str(tools.ffmpeg),
-        "-nostdin",
-        "-ss",
-        _seconds(start_s),
-        *length,
-        "-i",
-        str(original),
-        *length,
-        "-i",
-        str(encoded),
-        "-filter_complex",
-        graph,
-        "-map",
-        "[v]",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-crf",
-        str(SIDEBYSIDE_CRF),
-        "-pix_fmt",
-        "yuv420p",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        "-y",
-        str(dst),
+        *flatten(
+            ("-nostdin",),  # never wait for keyboard input
+            ("-ss", _seconds(start_s)),  # seek the original to the window start (fast)
+            length,  # and read only the window length of it
+            ("-i", str(original)),  # input 0: the original, left
+            length,  # the encoded sample already is the window; limit it to the same length
+            ("-i", str(encoded)),  # input 1: the encode, right
+            ("-filter_complex", graph),  # the scaling and stacking above
+            ("-map", "[v]"),  # write the stacked picture
+            ("-an",),  # no audio
+            ("-c:v", "libx264"),  # 8-bit H.264 so any player can show the clip
+            ("-crf", str(SIDEBYSIDE_CRF)),  # high quality: this clip is for judging by eye
+            ("-pix_fmt", "yuv420p"),  # the pixel format every player supports
+            *PROGRESS_OPTIONS,
+            ("-y",),  # overwrite an earlier clip
+            (str(dst),),  # the output file
+        ),
     ]
 
 

@@ -81,8 +81,8 @@ def doctor(
     checks = doctor_mod.run_doctor(settings, config_path=config_path)
     for check in checks:
         typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")
-    removed = doctor_mod.prune_logs(settings.log_dir)
-    typer.echo(f"logs: removed {len(removed)} old log file(s) from {settings.log_dir}")
+    removed = doctor_mod.archive_old_logs(settings.log_dir)
+    typer.echo(f"logs: archived {len(removed)} old log file(s) from {settings.log_dir}")
     if any(c.required and not c.ok for c in checks):
         raise typer.Exit(code=1)
 

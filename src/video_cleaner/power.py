@@ -19,6 +19,9 @@ _log = logging.getLogger(__name__)
 
 _WINDOWS = sys.platform == "win32"
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+# Unix "niceness": a process's scheduling priority, from -20 (most favoured) to 19 (least).
+# The name is because a higher value makes the process "nicer" to the others, which then get
+# the CPU first. Raising it by 10 is the Unix counterpart of Windows' below-normal priority.
 NICE_INCREMENT = 10
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001

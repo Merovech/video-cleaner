@@ -1,3 +1,6 @@
+<!-- TODO: when the project is complete, rewrite this document in the style of a man page
+     (synopsis, options, exit codes) instead of a walkthrough. -->
+
 # Using video-cleaner
 
 video-cleaner re-encodes a video library to HEVC (x265) to reclaim space. It never modifies the
@@ -141,7 +144,12 @@ full, a tool not found, the library or the manifest unreachable) do not count.
 
 Settings come from the defaults, then `%APPDATA%\video-cleaner\config.toml`, then environment
 variables named `VC_<SETTING IN UPPERCASE>` (for example `VC_VMAF_TARGET=94`). Unknown keys are
-an error. Use TOML literal strings (single quotes) for Windows paths.
+an error. Use TOML literal strings (single quotes) for Windows paths. Environment variables such
+as `%LOCALAPPDATA%` are not expanded inside the file, so a path override is written out in full
+(for example `state_db = 'C:\Users\you\AppData\Local\video-cleaner\state.db'`).
+
+`config.example.toml` holds only the three required paths; every other setting below is optional
+and has the default shown.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -168,5 +176,9 @@ an error. Use TOML literal strings (single quotes) for Windows paths.
 Every run writes a DEBUG log file `run-YYYYMMDD-HHMMSS.log` to `log_dir`
 (default `%LOCALAPPDATA%\video-cleaner\logs\`). Secrets are redacted. Failing ffmpeg and
 mkvmerge invocations keep their stderr in a per-file log next to it. Run logs older than 30
-days are deleted, then the oldest until the run logs total at most 200 MB; other files in the
-folder are never touched. `doctor` applies this retention and prints how many logs it removed.
+days are archived, then the oldest until the run logs total at most 200 MB. Nothing is deleted:
+each old log is added to a zip named for its month (`archive\run-logs-YYYY-MM.zip` under
+`log_dir`) and removed from the folder only after the copy in the zip has been read back and
+matches. A log that cannot be archived stays where it is. The archive is not pruned; delete old
+zips yourself when you no longer need them. Other files in the folder are never touched.
+`doctor` and `run` apply this retention; `doctor` prints how many logs it archived.

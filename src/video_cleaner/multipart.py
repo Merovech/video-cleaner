@@ -13,6 +13,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from video_cleaner.probe import MediaInfo
 
@@ -30,6 +31,14 @@ _PART_MARKER = re.compile(
     r"(?P<base>.*?)[ ._-]*(?<![^\W_])(?:pt|part|cd)[ ._-]*(?P<number>[0-9]{1,2})",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+class _Part(NamedTuple):
+    """One file of a candidate group: its part number, the name before the marker, its path."""
+
+    number: int
+    base: str
+    path: Path
 
 
 @dataclass(frozen=True)
@@ -60,26 +69,29 @@ def find_part_groups(files: Sequence[Path]) -> list[PartGroup]:
     numbered from 1 without gaps, each number exactly once; everything else is left out.
     Groups come back ordered by folder, then output name.
     """
-    candidates: dict[tuple[Path, str], list[tuple[int, str, Path]]] = defaultdict(list)
+    # Files of one folder whose names agree up to the part marker (compared ignoring case).
+    candidates: dict[tuple[Path, str], list[_Part]] = defaultdict(list)
     for path in files:
         split = _split_marker(path)
         if split is not None:
             base, number = split
-            candidates[(path.parent, base.casefold())].append((number, base, path))
+            candidates[(path.parent, base.casefold())].append(_Part(number, base, path))
 
-    groups: list[tuple[str, PartGroup]] = []
-    for (folder, _), members in candidates.items():
-        members.sort(key=lambda member: (member[0], str(member[2])))
-        numbers = [number for number, _, _ in members]
-        if len(members) < MIN_PARTS or numbers != list(range(1, len(members) + 1)):
+    groups: list[PartGroup] = []
+    for members in candidates.values():
+        members.sort(key=lambda part: (part.number, str(part.path)))
+        if len(members) < MIN_PARTS:
             continue
-        group = PartGroup(
-            output_name=members[0][1] + OUTPUT_SUFFIX,
-            parts=tuple(path for _, _, path in members),
+        if [part.number for part in members] != list(range(1, len(members) + 1)):
+            continue  # a gap or a duplicate number: not a clean group
+        groups.append(
+            PartGroup(
+                output_name=members[0].base + OUTPUT_SUFFIX,
+                parts=tuple(part.path for part in members),
+            )
         )
-        groups.append((str(folder), group))
-    groups.sort(key=lambda item: (item[0], item[1].output_name))
-    return [group for _, group in groups]
+    groups.sort(key=lambda group: (str(group.parts[0].parent), group.output_name))
+    return groups
 
 
 def parts_compatible(a: MediaInfo, b: MediaInfo) -> bool:

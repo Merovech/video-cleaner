@@ -272,10 +272,6 @@ def _cell(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def _yes_no(flag: bool) -> str:
-    return "yes" if flag else "no"
-
-
 def _csv_line(row: _Row) -> list[str]:
     info = row.info
     video = info.video if info is not None else None
@@ -288,9 +284,9 @@ def _csv_line(row: _Row) -> list[str]:
         _cell(video.width if video is not None else None),
         _cell(video.height if video is not None else None),
         f"{info.bitrate_kbps:.0f}" if info is not None else "",
-        _yes_no(info.is_hdr) if info is not None else "",
+        _cell(info.is_hdr if info is not None else None),
         _cell(video.dv_profile if video is not None else None),
-        _yes_no(info.is_interlaced) if info is not None else "",
+        _cell(info.is_interlaced if info is not None else None),
         str(len(info.subtitles)) if info is not None else "",
         row.action.value,
         LIST_SEPARATOR.join(row.reasons),

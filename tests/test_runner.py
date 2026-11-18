@@ -503,7 +503,7 @@ def test_startup_resets_sweeps_and_prunes(
         pruned.append((log_dir, kw.get("exclude")))
         return []
 
-    monkeypatch.setattr(doctor_module, "prune_logs", fake_prune)
+    monkeypatch.setattr(doctor_module, "archive_old_logs", fake_prune)
     current = settings.log_dir / "run-now.log"
     summary = _run(settings, state, Fakes(), current_log=current)
     assert pruned == [(settings.log_dir, current)]

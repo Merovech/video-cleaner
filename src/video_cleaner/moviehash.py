@@ -2,7 +2,7 @@
 
 The hash is the file size plus the sum of the 64-bit little-endian words of the first and the
 last 64 KiB, modulo 2**64, written as 16 lower-case hex digits. It identifies a release for
-subtitle lookups (Phase 2); after Ari replaces an original with its re-encode it can never be
+subtitle lookups (Phase 2); after the user replaces an original with its re-encode it can never be
 computed again, so `survey` stores it in the state database.
 
 Read-only: the file is opened for reading only, and only 128 KiB of it are read.

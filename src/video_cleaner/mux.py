@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from video_cleaner.cmdline import flatten
 from video_cleaner.tools import Tools
 
 
@@ -37,13 +38,17 @@ def build_mux_cmd(
             raise ValueError("new_video can be combined with exactly one source file")
         return [
             *cmd,
-            "--no-chapters",
-            "--no-global-tags",
-            "--no-track-tags",
-            "--no-attachments",
-            str(new_video),
-            "--no-video",
-            str(sources[0]),
+            *flatten(
+                # The next file contributes only its video track:
+                ("--no-chapters",),  # not its chapters
+                ("--no-global-tags",),  # nor its global tags
+                ("--no-track-tags",),  # nor the encoder's statistics tags
+                ("--no-attachments",),  # nor attachments
+                (str(new_video),),  # the new video track
+                # The original contributes everything but its video:
+                ("--no-video",),
+                (str(sources[0]),),
+            ),
         ]
     first, *rest = sources
     return [*cmd, str(first), *(f"+{part}" for part in rest)]

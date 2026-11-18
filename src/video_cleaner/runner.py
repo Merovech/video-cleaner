@@ -1083,9 +1083,9 @@ def _run_locked(
     reset = state.reset_in_progress()
     if reset:
         _log.info("%d file(s) left in progress by an earlier run were reset to retry", reset)
-    removed = doctor.prune_logs(settings.log_dir, exclude=current_log)
+    removed = doctor.archive_old_logs(settings.log_dir, exclude=current_log)
     if removed:
-        _log.info("pruned %d old log file(s)", len(removed))
+        _log.info("archived %d old log file(s)", len(removed))
 
     runner = _Runner(settings, tools, state, reporter, pipeline, deadline, only, now)
     if only is not None and not any(runner.in_scope(r) for r in state.records()):

@@ -52,12 +52,12 @@ class Settings:
     log_dir: Path
     scratch_cap_bytes: int = 2 * 10**12
     min_file_size: int = 0
-    bitrate_floor_kbps: int = 2500  # placeholder Ari sets; calibration does not change it
+    bitrate_floor_kbps: int = 2500  # placeholder the user sets; calibration does not change it
     vmaf_target: float = 95.0
     crf_min: int = 16
     crf_max: int = 24
     guard_mean_floor: float = 93.0
-    guard_worst_floor: float = 88.0  # placeholder Ari sets after reviewing the calibration
+    guard_worst_floor: float = 88.0  # placeholder the user sets after reviewing the calibration
     min_saving: float = 0.10
     preset: str = "slow"
     heartbeat_s: float = 15.0

@@ -1,4 +1,4 @@
-"""The plan Ari reviews before a run, its hash, and the results report after one.
+"""The plan the user reviews before a run, its hash, and the results report after one.
 
 `build_plan` turns the live state records into one row per file to review: what will happen,
 why, how big it is. A multi-part movie is one row (its first part, with every part listed) and

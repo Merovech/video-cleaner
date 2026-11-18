@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner import quality
+from video_cleaner.cmdline import PROGRESS_OPTIONS, Option, flatten
 from video_cleaner.config import Settings
 from video_cleaner.probe import MediaInfo
 from video_cleaner.progress import Progress, Reporter, parse_ffmpeg_progress
@@ -164,37 +165,31 @@ def build_x265_cmd(
         raise ValueError(f"start_s must be a non-negative number, got {start_s!r}")
     if length_s is not None and not (math.isfinite(length_s) and length_s > 0):
         raise ValueError(f"length_s must be a positive number, got {length_s!r}")
-    cmd = [str(tools.ffmpeg), "-nostdin"]
+    window: list[Option] = []
     if start_s is not None:
-        cmd += ["-ss", str(start_s)]
+        window.append(("-ss", str(start_s)))  # seek the input to the window start (fast)
     if length_s is not None:
-        cmd += ["-t", str(length_s)]
-    cmd += [
-        "-i",
-        str(src),
-        "-map",
-        "0:V:0",
-        "-map_chapters",
-        "-1",
-        "-map_metadata",
-        "-1",
-        "-c:v",
-        "libx265",
-        "-preset",
-        settings.preset,
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p10le",
-        "-an",
-        "-sn",
-        "-progress",
-        "pipe:1",
-        "-nostats",
-        "-y",
-        str(dst),
+        window.append(("-t", str(length_s)))  # and stop reading after the window length
+    return [
+        str(tools.ffmpeg),
+        *flatten(
+            ("-nostdin",),  # never wait for keyboard input
+            *window,
+            ("-i", str(src)),  # the input file
+            ("-map", "0:V:0"),  # only the first real video stream (not cover art)
+            ("-map_chapters", "-1"),  # drop chapters: the mux takes them from the source
+            ("-map_metadata", "-1"),  # drop global and stream tags, same reason
+            ("-c:v", "libx265"),  # the encoder
+            ("-preset", settings.preset),  # speed against compression (slower = smaller)
+            ("-crf", str(crf)),  # constant quality: lower is better and bigger
+            ("-pix_fmt", "yuv420p10le"),  # 10-bit 4:2:0, which avoids banding in dark scenes
+            ("-an",),  # no audio
+            ("-sn",),  # no subtitles
+            *PROGRESS_OPTIONS,
+            ("-y",),  # overwrite the work file of an interrupted earlier attempt
+            (str(dst),),  # the output file
+        ),
     ]
-    return cmd
 
 
 class EncodeError(Exception):
@@ -258,18 +253,15 @@ def build_packet_sizes_cmd(tools: Tools, src: Path, start_s: float, length_s: fl
     """
     return [
         str(tools.ffprobe),
-        "-v",
-        "error",
-        "-select_streams",
-        "V:0",
-        "-read_intervals",
-        # An absolute end: a relative ``%+length`` counts from the keyframe ffprobe seeks to.
-        f"{start_s:.3f}%{start_s + length_s:.3f}",
-        "-show_entries",
-        "packet=pts_time,dts_time,size",
-        "-of",
-        "csv=p=0",
-        str(src),
+        *flatten(
+            ("-v", "error"),  # print nothing but errors
+            ("-select_streams", "V:0"),  # the first real video stream
+            # An absolute end: a relative ``%+length`` counts from the keyframe ffprobe seeks to.
+            ("-read_intervals", f"{start_s:.3f}%{start_s + length_s:.3f}"),
+            ("-show_entries", "packet=pts_time,dts_time,size"),  # per packet: time and bytes
+            ("-of", "csv=p=0"),  # plain comma-separated values, no header or section names
+            (str(src),),
+        ),
     ]
 
 
