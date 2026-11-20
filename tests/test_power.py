@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from video_cleaner import power
+from video_cleaner.consolefmt import Level
 from video_cleaner.tools import run_tool
 
 
@@ -27,7 +28,7 @@ class _Reporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         pass
 
 

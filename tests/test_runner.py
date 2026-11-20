@@ -33,6 +33,7 @@ from video_cleaner import runner as runner_module
 from video_cleaner import scratch as scratch_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import Level
 from video_cleaner.encode import CrfSearchResult, EncodeError
 from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.manifest import ManifestEntry, ManifestError, read_manifest, write_manifest
@@ -75,6 +76,7 @@ class RecordingReporter:
         self.stages: list[str] = []
         self.updates: list[Progress] = []
         self.done: list[str] = []
+        self.done_levels: list[Level] = []
 
     def stage(self, label: str) -> None:
         self.stages.append(label)
@@ -85,8 +87,9 @@ class RecordingReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         self.done.append(summary)
+        self.done_levels.append(level)
 
 
 class Clock:
@@ -718,6 +721,34 @@ def test_verify_failure_flags(settings: Settings, state: State) -> None:
     assert record.status is Status.FLAGGED
     assert "verify failed: audio streams: 0 in the output" in record.note
     assert not (settings.completed_dir / "a.mkv").exists()
+
+
+def test_a_files_closing_console_line_is_tagged_by_outcome(
+    settings: Settings, state: State
+) -> None:
+    """completed is OK (green), left alone is INFO, flagged is WARN (yellow)."""
+    done, kept, bad = (_source(settings, n) for n in ("done.avi", "kept.avi", "bad.avi"))
+    for src, est in ((done, 900), (kept, 800), (bad, 700)):
+        _plan(state, src, est=est)
+    fakes = Fakes()
+    fakes.fail["probe"] = lambda p: ProbeError(p, "zero duration") if _named(p, "bad.avi") else None
+
+    reporter = RecordingReporter()
+    summary = _run(settings, state, fakes, reporter=reporter)
+    assert (summary.completed, summary.flagged) == (2, 1)
+    levels = dict(zip((d.split(":")[0] for d in reporter.done), reporter.done_levels, strict=True))
+    assert levels["done.avi"] is Level.OK
+    assert levels["bad.avi"] is Level.WARN
+
+
+def test_left_alone_closing_line_is_info(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    fakes = Fakes()
+    fakes.ratio = 0.95  # saves under the minimum
+    reporter = RecordingReporter()
+    assert _run(settings, state, fakes, reporter=reporter).left_alone == 1
+    assert reporter.done_levels == [Level.INFO]
 
 
 # --- errors --------------------------------------------------------------------------------

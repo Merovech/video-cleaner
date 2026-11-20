@@ -37,6 +37,7 @@ from pathlib import Path
 
 from video_cleaner import encode, logarchive, planning, quality
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import Level
 from video_cleaner.decide import Action, decide
 from video_cleaner.encode import CrfSearchResult, EncodeError
 from video_cleaner.instancelock import instance_lock, lock_path_for
@@ -283,6 +284,10 @@ def _clean(note: str) -> str:
     return note.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
+# Console level of a file's final line; a status not listed here (left_alone) is plain INFO.
+_FINISH_LEVELS = {Status.COMPLETED: Level.OK, Status.FLAGGED: Level.WARN, Status.RETRY: Level.WARN}
+
+
 class _BackgroundReporter:
     """Reporter for the background prefetch: never touches the console, logs at DEBUG."""
 
@@ -295,7 +300,7 @@ class _BackgroundReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         _log.debug("prefetch: %s", summary)
 
 
@@ -520,7 +525,10 @@ class _Runner:
         self.bytes_saved += outcome.bytes_saved
         detail = f" ({outcome.note})" if outcome.note else ""
         _log.info("%s: %s%s", rec.path, outcome.status.value, detail)
-        self.reporter.file_done(f"{rec.path.name}: {outcome.status.value}{detail}")
+        self.reporter.file_done(
+            f"{rec.path.name}: {outcome.status.value}{detail}",
+            _FINISH_LEVELS.get(outcome.status, Level.INFO),
+        )
 
     # -- scratch --------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ import pytest
 from rich.console import Console
 
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import Level
 from video_cleaner.progress import (
     PlainReporter,
     Progress,
@@ -56,7 +57,7 @@ def test_parse_ffmpeg_progress_percent_and_eta() -> None:
 def test_parse_ffmpeg_progress_one_progress_per_terminator() -> None:
     second = BLOCK.replace("60000000", "90000000").replace("progress=continue", "progress=end")
     out = list(parse_ffmpeg_progress(_lines(BLOCK + second), duration_s=120.0))
-    assert [round(p.percent or 0) for p in out] == [50, 75]
+    assert [round(p.percent or 0) for p in out] == [50, 100]  # the end block is always 100
     assert out[-1].note == "end"
     assert out[0].note == ""
 
@@ -150,8 +151,8 @@ def test_plain_reporter_line_has_timestamp_label_and_values() -> None:
     rep.stage("encode")
     rep.update(Progress(percent=43.2, fps=38.0, speed=1.6, eta_s=3120.0))
     lines = out.getvalue().splitlines()
-    assert lines[0] == "[07:30:05] encode"
-    assert "[07:30:05]" in lines[1]
+    assert lines[0] == "[INFO] 07:30:05 encode"
+    assert lines[1].startswith("[INFO] 07:30:05 ")
     for fragment in ("encode", "43.2%", "38 fps", "1.6x", "ETA 52m"):
         assert fragment in lines[1]
 
@@ -286,7 +287,7 @@ def test_rich_reporter_renders_stage_update_heartbeat_and_summary() -> None:
     rep.close()
     rep.close()  # idempotent
     text = buf.getvalue()
-    assert "ffsubsync, 3m12s elapsed, still working" in text
+    assert "still working" not in text  # the spinner already shows the stage is alive
     assert "Movie (2018).mkv done" in text
 
 
@@ -369,7 +370,7 @@ def test_plain_reporter_is_thread_safe() -> None:
             rep.file_done("done")
 
     assert _run_threads(work) == []
-    assert all(line.startswith("[07:30:05] ") for line in out.getvalue().splitlines())
+    assert all(line.startswith("[INFO] 07:30:05 ") for line in out.getvalue().splitlines())
 
 
 def test_rich_reporter_is_thread_safe() -> None:
@@ -408,6 +409,77 @@ def test_rich_reporter_prints_emoji_codes_literally() -> None:
 
 
 def test_encodable_is_public() -> None:
-    from video_cleaner.progress import encodable
+    from video_cleaner.consolefmt import encodable
 
     assert encodable("abc", None) == "abc"
+
+
+# --- final 100%, tagged lines, no heartbeat noise on the live bar ------------------------
+
+
+def test_parse_ffmpeg_progress_end_block_is_always_100_percent() -> None:
+    """ffmpeg's last out_time can fall short of the nominal duration; the end is still 100%."""
+    short_end = BLOCK.replace("60000000", "103320000").replace("progress=continue", "progress=end")
+    (p,) = list(parse_ffmpeg_progress(_lines(short_end), duration_s=120.0))
+    assert p.percent == pytest.approx(100.0)
+    assert p.note == "end"
+    assert p.eta_s == pytest.approx(0.0)
+
+
+def test_rich_bar_shows_100_percent_after_the_end_update() -> None:
+    console = Console(file=io.StringIO(), force_terminal=True, width=120, color_system=None)
+    rep = RichReporter(console=console)
+    rep.stage("quality guard window 4/4")
+    rep.update(Progress(percent=86.1, fps=202.0, speed=8.4, eta_s=0.0))
+    rep.update(Progress(percent=100.0, fps=202.0, speed=8.4, eta_s=0.0, note="end"))
+    assert rep._progress is not None
+    (task,) = rep._progress.tasks
+    assert task.completed == pytest.approx(100.0)
+    rep.close()
+
+
+def test_rich_reporter_prints_no_heartbeat_lines() -> None:
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=True, width=120, color_system=None)
+    rep = RichReporter(console=console)
+    rep.stage("decode check")
+    rep.heartbeat("decode check", 15.0)
+    rep.heartbeat("decode check", 30.0)
+    rep.close()
+    assert "elapsed" not in buf.getvalue()
+    assert "still working" not in buf.getvalue()
+
+
+def test_plain_reporter_still_prints_heartbeats_because_it_has_no_spinner() -> None:
+    out = io.StringIO()
+    _plain(FakeClock(), out).heartbeat("decode check", 15.0)
+    assert out.getvalue() == "[INFO] 07:30:05 decode check, 0m15s elapsed, still working\n"
+
+
+@pytest.mark.parametrize(
+    ("level", "tag"),
+    [(Level.OK, "[ OK ]"), (Level.INFO, "[INFO]"), (Level.WARN, "[WARN]"), (Level.ERR, "[ERR ]")],
+)
+def test_plain_reporter_file_done_carries_the_level_tag(level: Level, tag: str) -> None:
+    out = io.StringIO()
+    _plain(FakeClock(), out).file_done("Movie.mkv: done", level)
+    assert out.getvalue() == f"{tag} 07:30:05 Movie.mkv: done\n"
+
+
+def test_plain_reporter_file_done_defaults_to_info() -> None:
+    out = io.StringIO()
+    _plain(FakeClock(), out).file_done("Movie.mkv: left_alone")
+    assert out.getvalue().startswith("[INFO] ")
+
+
+def test_rich_reporter_file_done_is_tagged_and_coloured() -> None:
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=True, width=120, color_system="standard")
+    rep = RichReporter(console=console)
+    rep.stage("encode")
+    rep.file_done("Movie.mkv: completed", Level.OK)
+    rep.file_done("Other.mkv: flagged", Level.WARN)
+    rep.close()
+    text = buf.getvalue()
+    assert "[\x1b[32m OK \x1b[0m] Movie.mkv: completed" in text
+    assert "[\x1b[33mWARN\x1b[0m] Other.mkv: flagged" in text

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from video_cleaner.consolefmt import ConsoleLogHandler
 from video_cleaner.logging_setup import LOGGER_NAME, redact, setup_logging
 
 
@@ -123,7 +124,7 @@ def test_setup_logging_twice_does_not_duplicate_handlers(
     ours = [
         h
         for h in logging.getLogger(LOGGER_NAME).handlers
-        if type(h) in (logging.FileHandler, logging.StreamHandler)
+        if type(h) in (logging.FileHandler, ConsoleLogHandler)
     ]
     assert len(ours) == 2  # one file + one console, not four
     logging.getLogger(f"{LOGGER_NAME}.twice").info("only-once-marker")
@@ -197,3 +198,17 @@ def test_log_file_option_and_file_level(tmp_path: Path) -> None:
     assert "info-line-marker" in content
     assert "debug-line-marker" not in content
     assert not (tmp_path / "logs").exists()
+
+
+def test_console_lines_carry_a_level_tag_the_file_lines_do_not(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = setup_logging(tmp_path, verbosity=1)
+    log = logging.getLogger(f"{LOGGER_NAME}.tags")
+    log.debug("d-marker")
+    log.info("i-marker")
+    log.warning("w-marker")
+    log.error("e-marker")
+    err = capsys.readouterr().err.splitlines()
+    assert err == ["[INFO] d-marker", "[INFO] i-marker", "[WARN] w-marker", "[ERR ] e-marker"]
+    assert "[INFO]" not in path.read_text(encoding="utf-8")  # the file keeps its own format

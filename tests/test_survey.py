@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 from video_cleaner import survey as survey_module
 from video_cleaner.cli import app
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import Level
 from video_cleaner.decide import Action
 from video_cleaner.multipart import PartGroup
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
@@ -56,7 +57,7 @@ class RecordingReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         pass
 
 

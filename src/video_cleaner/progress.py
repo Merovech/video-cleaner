@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import IO, Protocol, TextIO
+from typing import Protocol, TextIO
 
 from rich.console import Console
 from rich.markup import escape
@@ -27,6 +27,14 @@ from rich.progress import (
 from rich.progress import Progress as RichProgress
 
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import (
+    Level,
+    clear_active_console,
+    encodable,
+    set_active_console,
+    tag,
+    tagged,
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +80,10 @@ def _progress_from_fields(fields: dict[str, str], duration_s: float) -> Progress
         if speed is not None and speed > 0:
             eta = max(0.0, (duration_s - out_s) / speed)
     note = "end" if fields.get("progress") == "end" else ""
+    if note and percent is not None:
+        # The last out_time can fall short of the nominal duration (a filter graph that drops
+        # the final partial frame, say); a finished tool is at 100%, whatever it last reported.
+        percent, eta = 100.0, 0.0
     return Progress(
         percent=percent, fps=_to_float(fields.get("fps")), speed=speed, eta_s=eta, note=note
     )
@@ -138,26 +150,11 @@ class Reporter(Protocol):
 
     def heartbeat(self, label: str, elapsed_s: float) -> None: ...
 
-    def file_done(self, summary: str) -> None: ...
-
-
-def encodable(text: str, stream: IO[str] | None) -> str:
-    """Make *text* writable to *stream* even if its encoding (e.g. cp1252) lacks characters.
-
-    File names reach the reporters, so a redirected, narrow-encoding stream must never crash a
-    long run: unencodable characters become backslash escapes.
-    """
-    encoding = getattr(stream, "encoding", None)
-    if not encoding:
-        return text
-    try:
-        return text.encode(encoding, errors="backslashreplace").decode(encoding)
-    except (LookupError, UnicodeError):
-        return text.encode("ascii", errors="backslashreplace").decode("ascii")
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None: ...
 
 
 class PlainReporter:
-    """Timestamped plain lines; `update` is rate-limited to one line per *interval_s*.
+    """Tagged, timestamped plain lines; `update` is rate-limited to one line per *interval_s*.
 
     Thread-safe: all state and writes are guarded by one re-entrant lock.
     """
@@ -178,9 +175,9 @@ class PlainReporter:
         self._last_update: float | None = None
         self._lock = threading.RLock()
 
-    def _emit(self, text: str) -> None:
+    def _emit(self, text: str, level: Level = Level.INFO) -> None:
         out = self._out if self._out is not None else sys.stdout
-        line = f"[{self._now():%H:%M:%S}] {text}\n"
+        line = f"{tag(level)} {self._now():%H:%M:%S} {text}\n"
         try:
             out.write(encodable(line, out))
         except UnicodeEncodeError:
@@ -205,9 +202,9 @@ class PlainReporter:
         with self._lock:
             self._emit(format_heartbeat(label, elapsed_s))
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         with self._lock:
-            self._emit(summary)
+            self._emit(summary, level)
 
 
 class RichReporter:
@@ -238,6 +235,8 @@ class RichReporter:
                 transient=True,
             )
             self._progress.start()
+            # Log lines printed from now on go through this console, above the bar.
+            set_active_console(self._console)
         return self._progress
 
     def stage(self, label: str) -> None:
@@ -252,25 +251,30 @@ class RichReporter:
             if self._progress is None or self._task is None:
                 return
             detail = format_progress(p)
+            # The bar redraws ten times a second; the final update must not wait for that, or
+            # the next line can replace the bar while it still shows an earlier percentage.
+            refresh = p.note == "end"
             if p.percent is None:
-                self._progress.update(self._task, total=None, detail=detail)
+                self._progress.update(self._task, total=None, detail=detail, refresh=refresh)
             else:
-                self._progress.update(self._task, total=100.0, completed=p.percent, detail=detail)
+                self._progress.update(
+                    self._task, total=100.0, completed=p.percent, detail=detail, refresh=refresh
+                )
 
     def heartbeat(self, label: str, elapsed_s: float) -> None:
-        with self._lock:
-            self._console.print(self._text(escape(format_heartbeat(label, elapsed_s))))
+        """Nothing to print: the spinner on the bar already shows that the tool is alive."""
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         with self._lock:
             self.close()
-            self._console.print(self._text(escape(summary)))
+            self._console.print(tagged(level, self._text(summary)), soft_wrap=True)
 
     def close(self) -> None:
         """Stop the live display; safe to call repeatedly."""
         with self._lock:
             if self._progress is not None:
                 self._progress.stop()
+                clear_active_console(self._console)
                 self._progress = None
                 self._task = None
 

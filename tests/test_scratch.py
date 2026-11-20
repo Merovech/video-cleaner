@@ -14,6 +14,7 @@ from typing import IO, Any
 import pytest
 
 from video_cleaner import scratch
+from video_cleaner.consolefmt import Level
 from video_cleaner.progress import Progress
 from video_cleaner.scratch import (
     CopyResult,
@@ -44,7 +45,7 @@ class FakeReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         pass
 
 

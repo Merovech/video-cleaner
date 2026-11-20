@@ -33,6 +33,7 @@ from video_cleaner.calibrate import (
 )
 from video_cleaner.cli import app
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import Level
 from video_cleaner.encode import EncodeError, WindowEncode
 from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.probe import ProbeError, probe
@@ -54,7 +55,7 @@ class NullReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         pass
 
 

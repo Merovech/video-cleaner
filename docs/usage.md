@@ -32,7 +32,7 @@ activated virtual environment). `--help` works on every command.
 
 | Command | What it does |
 |---|---|
-| `doctor` | Checks the environment and prints one line per check: `[ OK ]`, `[WARN]` (informational check failed) or `[FAIL]` (required check failed). Also prunes old run logs. Exit code 0 when all required checks pass, 1 otherwise. |
+| `doctor` | Checks the environment and prints one line per check: `[ OK ]`, `[WARN]` (informational check failed) or `[ERR ]` (required check failed). Also prunes old run logs. Exit code 0 when all required checks pass, 1 otherwise. |
 | `survey [--root X]` | Scans the library (or only folder `X`) read-only and probes every file (codec, resolution, bitrate, HDR, Dolby Vision, subtitles) and stores its OpenSubtitles movie hash. Writes `survey.csv` beside the state database. |
 | `plan [--ack] [--retry PATH]` | Dry run: decides per file what will happen (re-encode, remux, leave alone, skip and flag) and projects the savings. Writes `plan.csv` and `plan.hash` beside the state database. `--ack` acknowledges the plan last written (its hash must still match the current state). `--retry PATH` puts a file a run left alone or flagged back in the queue. |
 | `calibrate --samples N` | Encodes N sample files at CRF 17/20/23/26, scores them with VMAF and writes `calibration.txt` beside the state database and side-by-side clips to `completed_dir\calibration`. |
@@ -60,6 +60,15 @@ a scheduled task). `rich` always draws the live line, even when the output is pi
 looks right if the program reading it is a terminal; `plain` always writes plain lines, which
 suits logs. Git Bash's default console often is not detected as a terminal, so use `--progress
 rich` there, or run from Windows Terminal or PowerShell.
+
+Console lines the tool writes about its own work start with a level tag: `[ OK ]` (green),
+`[INFO]` (white), `[WARN]` (yellow) or `[ERR ]` (red); only the text inside the brackets is
+coloured, and colour is dropped when the output is not a terminal. A file's closing line is
+`[ OK ]` when it completed, `[WARN]` when it was flagged or must be retried and `[INFO]` when it
+was left alone. While the live bar is up, these lines appear above it. The plain progress lines
+carry the tag and a time (`[INFO] 07:30:05 encode ...`) and include a "still working" line
+every `heartbeat_s` seconds for tools that report no percentage; the live bar has a spinner
+instead and prints none. The run log file keeps its own, more detailed format.
 
 Exit codes: 0 success; 1 a run that stopped (scratch full, library unreachable, ...) or a
 failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,

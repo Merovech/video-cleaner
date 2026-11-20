@@ -17,6 +17,7 @@ from media import make_clip
 from video_cleaner import runner as runner_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
+from video_cleaner.consolefmt import Level
 from video_cleaner.encode import encode_full
 from video_cleaner.probe import (
     AudioStream,
@@ -44,7 +45,7 @@ class NullReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         pass
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         pass
 
 

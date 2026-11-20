@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
-from rich.console import Console
 
 from video_cleaner import calibrate as _calibrate
 from video_cleaner import doctor as doctor_mod
@@ -18,6 +17,7 @@ from video_cleaner import logarchive, planning, power
 from video_cleaner import runner as _runner
 from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
+from video_cleaner.consolefmt import Level, encodable, print_tagged
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
 from video_cleaner.instancelock import AlreadyRunning
@@ -28,7 +28,6 @@ from video_cleaner.progress import (
     ProgressMode,
     Reporter,
     RichReporter,
-    encodable,
     make_reporter,
 )
 from video_cleaner.state import State, StateError
@@ -40,8 +39,6 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
-
-_err = Console(stderr=True, emoji=False)
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
 MAX_LISTED_UNPROBEABLE = 20
@@ -74,10 +71,10 @@ LogFileOption = Annotated[
 ]
 
 
-def _check_tag(check: doctor_mod.Check) -> str:
+def _check_level(check: doctor_mod.Check) -> Level:
     if check.ok:
-        return "[ OK ]"
-    return "[FAIL]" if check.required else "[WARN]"
+        return Level.OK
+    return Level.ERR if check.required else Level.WARN
 
 
 @app.command()
@@ -96,15 +93,17 @@ def doctor(
     settings = _load(config)
     checks = doctor_mod.run_doctor(settings, config_path=config_path)
     for check in checks:
-        typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")
+        print_tagged(_check_level(check), f"{check.name}: {check.detail}")
     removed = logarchive.archive_old_logs(settings.log_dir)
-    typer.echo(f"logs: archived {len(removed)} old log file(s) from {settings.log_dir}")
+    print_tagged(
+        Level.INFO, f"logs: archived {len(removed)} old log file(s) from {settings.log_dir}"
+    )
     if any(c.required and not c.ok for c in checks):
         raise typer.Exit(code=1)
 
 
 def _fail(message: str) -> NoReturn:
-    _err.print(message, markup=False, highlight=False)
+    print_tagged(Level.ERR, message, stderr=True)
     raise typer.Exit(code=2)
 
 
@@ -212,10 +211,11 @@ def survey(
         except (_survey.SurveyError, ToolNotFound) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print(
+            print_tagged(
+                Level.WARN,
                 "survey interrupted; files are recorded only once all of them are probed, so "
                 "nothing from this survey was recorded: run it again",
-                highlight=False,
+                stderr=True,
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_survey_summary(surveyed, result)
@@ -405,7 +405,7 @@ def calibrate(
         ) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print("calibration interrupted; nothing was approved", highlight=False)
+            print_tagged(Level.WARN, "calibration interrupted; nothing was approved", stderr=True)
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _say(_calibrate.format_calibration_table(rows))
     _say(f"Table: {settings.state_db.parent / _calibrate.CALIBRATION_TXT}")
@@ -417,16 +417,17 @@ def calibrate(
 
 
 def _print_run_summary(summary: _runner.RunSummary) -> None:
-    _say(
+    print_tagged(
+        Level.INFO,
         f"Run: completed {summary.completed}, left alone {summary.left_alone}, "
-        f"flagged {summary.flagged}, retry {summary.retry}; saved {_gib(summary.bytes_saved)}"
+        f"flagged {summary.flagged}, retry {summary.retry}; saved {_gib(summary.bytes_saved)}",
     )
     if summary.stop_reason:
-        _say(f"Run stopped: {summary.stop_reason}")
+        print_tagged(Level.WARN, f"Run stopped: {summary.stop_reason}")
     elif summary.stopped_by_deadline:
-        _say("Run ended: deadline reached (the file in progress was finished)")
+        print_tagged(Level.INFO, "Run ended: deadline reached (the file in progress was finished)")
     else:
-        _say("Run ended: queue finished")
+        print_tagged(Level.OK, "Run ended: queue finished")
 
 
 @app.command()
@@ -477,13 +478,14 @@ def run(
         ) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print(
+            print_tagged(
+                Level.WARN,
                 "run interrupted; the file in progress is retried on the next run",
-                highlight=False,
+                stderr=True,
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_run_summary(summary)
-    _say(f"Log: {log_path}")
+    print_tagged(Level.INFO, f"Log: {log_path}")
     if summary.stop_reason:
         raise typer.Exit(code=1)
 
