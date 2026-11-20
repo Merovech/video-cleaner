@@ -1,7 +1,8 @@
 """How the tool writes lines to the console: a level tag, colour, and one place to print.
 
 Every line the tool prints about its own work starts with a four-character tag in brackets,
-``[ OK ]`` (green), ``[INFO]`` (white), ``[WARN]`` (yellow) or ``[ERR ]`` (red); only the
+``[ OK ]`` (green), ``[INFO]`` (white), ``[WARN]`` (yellow), ``[FAIL]`` (red) or ``[VERB]``
+(grey, debug detail shown by ``-v``); only the
 text inside the brackets is coloured. The console log handler, the reporters and the command
 summaries all use `tagged` / `print_tagged`, so the format lives here only.
 
@@ -27,16 +28,29 @@ class Level(StrEnum):
     OK = "ok"
     INFO = "info"
     WARN = "warn"
-    ERR = "err"
+    FAIL = "fail"
+    VERB = "verb"
 
 
 # Four characters inside the brackets, so message text lines up whatever the level.
-_TAGS = {Level.OK: " OK ", Level.INFO: "INFO", Level.WARN: "WARN", Level.ERR: "ERR "}
-_STYLES = {Level.OK: "green", Level.INFO: "white", Level.WARN: "yellow", Level.ERR: "red"}
+_TAGS = {
+    Level.OK: " OK ",
+    Level.INFO: "INFO",
+    Level.WARN: "WARN",
+    Level.FAIL: "FAIL",
+    Level.VERB: "VERB",
+}
+_STYLES = {
+    Level.OK: "green",
+    Level.INFO: "white",
+    Level.WARN: "yellow",
+    Level.FAIL: "red",
+    Level.VERB: "bright_black",
+}
 
 
 def tag(level: Level) -> str:
-    """``"[ OK ]"``, ``"[INFO]"``, ``"[WARN]"`` or ``"[ERR ]"`` (uncoloured)."""
+    """``"[ OK ]"``, ``"[INFO]"``, ``"[WARN]"``, ``"[FAIL]"`` or ``"[VERB]"`` (uncoloured)."""
     return f"[{_TAGS[level]}]"
 
 
@@ -46,12 +60,12 @@ def tagged(level: Level, message: str) -> Text:
 
 
 def level_for_record(levelno: int) -> Level:
-    """Log level to tag: ERROR and above ERR, WARNING WARN, everything else (DEBUG too) INFO."""
+    """Log level to tag: ERROR and above FAIL, WARNING WARN, INFO INFO, DEBUG VERB."""
     if levelno >= logging.ERROR:
-        return Level.ERR
+        return Level.FAIL
     if levelno >= logging.WARNING:
         return Level.WARN
-    return Level.INFO
+    return Level.INFO if levelno >= logging.INFO else Level.VERB
 
 
 def encodable(text: str, stream: IO[str] | None) -> str:

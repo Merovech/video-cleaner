@@ -396,7 +396,7 @@ def test_cli_doctor_required_failure_exits_1(
     monkeypatch.setattr(doctor, "run_doctor", _fake_doctor(checks))
     result = CliRunner().invoke(app, ["doctor", "--config", str(_config(tmp_path))])
     assert result.exit_code == 1
-    assert "[ERR ] libx265: missing" in result.output
+    assert "[FAIL] libx265: missing" in result.output
 
 
 def test_cli_doctor_config_error_exits_2(tmp_path: Path) -> None:

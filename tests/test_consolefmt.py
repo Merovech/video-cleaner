@@ -39,7 +39,8 @@ def _colour_console(buf: io.StringIO) -> Console:
         (Level.OK, "[ OK ]"),
         (Level.INFO, "[INFO]"),
         (Level.WARN, "[WARN]"),
-        (Level.ERR, "[ERR ]"),
+        (Level.FAIL, "[FAIL]"),
+        (Level.VERB, "[VERB]"),
     ],
 )
 def test_tags_are_four_characters_inside_brackets(level: Level, text: str) -> None:
@@ -49,7 +50,13 @@ def test_tags_are_four_characters_inside_brackets(level: Level, text: str) -> No
 
 @pytest.mark.parametrize(
     ("level", "code"),
-    [(Level.OK, "32"), (Level.INFO, "37"), (Level.WARN, "33"), (Level.ERR, "31")],
+    [
+        (Level.OK, "32"),
+        (Level.INFO, "37"),
+        (Level.WARN, "33"),
+        (Level.FAIL, "31"),
+        (Level.VERB, "90"),
+    ],
 )
 def test_only_the_text_inside_the_brackets_is_coloured(level: Level, code: str) -> None:
     buf = io.StringIO()
@@ -65,11 +72,11 @@ def test_message_is_never_parsed_as_markup() -> None:
 @pytest.mark.parametrize(
     ("levelno", "level"),
     [
-        (logging.DEBUG, Level.INFO),
+        (logging.DEBUG, Level.VERB),
         (logging.INFO, Level.INFO),
         (logging.WARNING, Level.WARN),
-        (logging.ERROR, Level.ERR),
-        (logging.CRITICAL, Level.ERR),
+        (logging.ERROR, Level.FAIL),
+        (logging.CRITICAL, Level.FAIL),
     ],
 )
 def test_log_levels_map_to_tags(levelno: int, level: Level) -> None:
@@ -91,7 +98,7 @@ def test_log_handler_writes_tagged_lines_to_stderr(capsys: pytest.CaptureFixture
     log.error("three")
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.splitlines() == ["[INFO] one", "[WARN] two", "[ERR ] three"]
+    assert captured.err.splitlines() == ["[INFO] one", "[WARN] two", "[FAIL] three"]
 
 
 def test_log_handler_appends_the_traceback(capsys: pytest.CaptureFixture[str]) -> None:
@@ -101,7 +108,7 @@ def test_log_handler_appends_the_traceback(capsys: pytest.CaptureFixture[str]) -
     except RuntimeError:
         log.exception("failed")
     err = capsys.readouterr().err
-    assert err.startswith("[ERR ] failed")
+    assert err.startswith("[FAIL] failed")
     assert "RuntimeError: kaput" in err
 
 

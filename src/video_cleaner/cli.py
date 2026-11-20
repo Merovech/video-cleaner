@@ -74,7 +74,7 @@ LogFileOption = Annotated[
 def _check_level(check: doctor_mod.Check) -> Level:
     if check.ok:
         return Level.OK
-    return Level.ERR if check.required else Level.WARN
+    return Level.FAIL if check.required else Level.WARN
 
 
 @app.command()
@@ -103,7 +103,7 @@ def doctor(
 
 
 def _fail(message: str) -> NoReturn:
-    print_tagged(Level.ERR, message, stderr=True)
+    print_tagged(Level.FAIL, message, stderr=True)
     raise typer.Exit(code=2)
 
 

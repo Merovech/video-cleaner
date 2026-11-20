@@ -458,7 +458,7 @@ def test_plain_reporter_still_prints_heartbeats_because_it_has_no_spinner() -> N
 
 @pytest.mark.parametrize(
     ("level", "tag"),
-    [(Level.OK, "[ OK ]"), (Level.INFO, "[INFO]"), (Level.WARN, "[WARN]"), (Level.ERR, "[ERR ]")],
+    [(Level.OK, "[ OK ]"), (Level.INFO, "[INFO]"), (Level.WARN, "[WARN]"), (Level.FAIL, "[FAIL]")],
 )
 def test_plain_reporter_file_done_carries_the_level_tag(level: Level, tag: str) -> None:
     out = io.StringIO()

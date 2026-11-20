@@ -210,5 +210,5 @@ def test_console_lines_carry_a_level_tag_the_file_lines_do_not(
     log.warning("w-marker")
     log.error("e-marker")
     err = capsys.readouterr().err.splitlines()
-    assert err == ["[INFO] d-marker", "[INFO] i-marker", "[WARN] w-marker", "[ERR ] e-marker"]
+    assert err == ["[VERB] d-marker", "[INFO] i-marker", "[WARN] w-marker", "[FAIL] e-marker"]
     assert "[INFO]" not in path.read_text(encoding="utf-8")  # the file keeps its own format
