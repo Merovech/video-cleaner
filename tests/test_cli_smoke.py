@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -36,10 +37,12 @@ def test_version_is_a_string() -> None:
 
 @pytest.mark.parametrize("cmd", ["survey", "calibrate", "run"])
 def test_long_commands_offer_a_progress_flag(cmd: str) -> None:
-    result = CliRunner().invoke(app, [cmd, "--help"], env={"COLUMNS": "200"})
+    # CI sets colour variables, so the help may carry ANSI styling that splits "--progress".
+    result = CliRunner().invoke(app, [cmd, "--help"], env={"COLUMNS": "200", "NO_COLOR": "1"})
     assert result.exit_code == 0
-    assert "--progress" in result.stdout
-    assert "auto" in result.stdout and "rich" in result.stdout and "plain" in result.stdout
+    text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    assert "--progress" in text
+    assert "auto" in text and "rich" in text and "plain" in text
 
 
 def test_progress_flag_rejects_an_unknown_mode() -> None:
