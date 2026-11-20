@@ -32,3 +32,16 @@ def test_no_command_is_a_stub(cmd: str, tmp_path: Path) -> None:
 def test_version_is_a_string() -> None:
     assert isinstance(video_cleaner.__version__, str)
     assert video_cleaner.__version__
+
+
+@pytest.mark.parametrize("cmd", ["survey", "calibrate", "run"])
+def test_long_commands_offer_a_progress_flag(cmd: str) -> None:
+    result = CliRunner().invoke(app, [cmd, "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0
+    assert "--progress" in result.stdout
+    assert "auto" in result.stdout and "rich" in result.stdout and "plain" in result.stdout
+
+
+def test_progress_flag_rejects_an_unknown_mode() -> None:
+    result = CliRunner().invoke(app, ["run", "--progress", "fancy"])
+    assert result.exit_code == 2

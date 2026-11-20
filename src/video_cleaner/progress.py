@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import IO, Protocol, TextIO
 
 from rich.console import Console
@@ -274,14 +275,41 @@ class RichReporter:
                 self._task = None
 
 
+class ProgressMode(StrEnum):
+    """How long commands report progress on the console."""
+
+    AUTO = "auto"  # the live bar on an interactive terminal, plain lines otherwise
+    RICH = "rich"  # always the live bar, even when output is piped (the terminal must show it)
+    PLAIN = "plain"  # always plain lines, one every ``plain_progress_s``
+
+
 def make_reporter(
     settings: Settings,
     *,
     is_tty: bool,
+    mode: ProgressMode = ProgressMode.AUTO,
     clock: Callable[[], float] = time.monotonic,
     out: TextIO | None = None,
 ) -> Reporter:
-    """A `rich` in-place reporter on a TTY, otherwise plain lines every ``plain_progress_s``."""
-    if is_tty:
-        return RichReporter(Console(file=out, emoji=False) if out is not None else None)
-    return PlainReporter(settings.plain_progress_s, clock=clock, out=out)
+    """A `rich` in-place reporter or plain lines every ``plain_progress_s``, chosen by *mode*.
+
+    ``AUTO`` picks the live bar when *is_tty*; ``RICH`` and ``PLAIN`` ignore *is_tty*.
+    """
+    live = mode is ProgressMode.RICH or (mode is ProgressMode.AUTO and is_tty)
+    if not live:
+        return PlainReporter(settings.plain_progress_s, clock=clock, out=out)
+    if mode is not ProgressMode.RICH:
+        return RichReporter(Console(file=out, emoji=False))
+    # Explicit rich mode: draw the bar although stdout may not be a console (a pipe, or a
+    # terminal such as Git Bash's that Windows does not report as one). Rich would then fall
+    # back to a Windows console API that does not exist there and print no control codes, so
+    # ask for ANSI codes directly unless stdout really is a console.
+    real_console = out is None and sys.stdout.isatty()
+    return RichReporter(
+        Console(
+            file=out,
+            emoji=False,
+            force_terminal=True,
+            legacy_windows=None if real_console else False,
+        )
+    )

@@ -24,7 +24,13 @@ from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
-from video_cleaner.progress import Reporter, RichReporter, encodable, make_reporter
+from video_cleaner.progress import (
+    ProgressMode,
+    Reporter,
+    RichReporter,
+    encodable,
+    make_reporter,
+)
 from video_cleaner.state import State, StateError
 from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
@@ -54,6 +60,14 @@ VerboseOption = Annotated[
     int, typer.Option("--verbose", "-v", count=True, help="More console logging.")
 ]
 QuietOption = Annotated[bool, typer.Option("--quiet", "-q", help="Warnings only on the console.")]
+ProgressOption = Annotated[
+    ProgressMode,
+    typer.Option(
+        "--progress",
+        help="Progress display: auto (live bar on a terminal, plain lines otherwise), "
+        "rich (always the live bar) or plain (always plain lines).",
+    ),
+]
 LogFileOption = Annotated[
     Path | None,
     typer.Option("--log-file", help="Write this run's log here instead of log_dir."),
@@ -129,9 +143,11 @@ def _tools() -> Tools:
 
 
 @contextmanager
-def _open_reporter(settings: Settings) -> Iterator[Reporter]:
+def _open_reporter(
+    settings: Settings, progress: ProgressMode = ProgressMode.AUTO
+) -> Iterator[Reporter]:
     """The console reporter for a long command, closed (live display stopped) on the way out."""
-    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
+    reporter = make_reporter(settings, is_tty=sys.stdout.isatty(), mode=progress)
     try:
         yield reporter
     finally:
@@ -178,6 +194,7 @@ def survey(
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
     log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
 ) -> None:
     """Scan the library and probe every file (read-only)."""
     settings = _load(config)
@@ -188,7 +205,7 @@ def survey(
         _fail(str(exc))
     _logging(settings, verbose, quiet, log_file)
     tools = _tools()
-    with _open_reporter(settings) as reporter:
+    with _open_reporter(settings, progress) as reporter:
         try:
             with State.open(settings.state_db) as state:
                 result = _survey.run_survey(settings, tools, state, reporter, root=root)
@@ -355,6 +372,7 @@ def calibrate(
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
     log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
 ) -> None:
     """Calibrate CRF selection on sample clips, or approve the calibration."""
     settings = _load_outside_library(config)
@@ -373,7 +391,7 @@ def calibrate(
     _require_state(settings)
     _logging(settings, verbose, quiet, log_file)
     tools = _tools()
-    with _open_reporter(settings) as reporter:
+    with _open_reporter(settings, progress) as reporter:
         try:
             with State.open(settings.state_db) as state:
                 rows = _calibrate.run_calibration(
@@ -427,6 +445,7 @@ def run(
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
     log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
 ) -> None:
     """Execute the acknowledged plan."""
     settings = _load_outside_library(config)
@@ -437,7 +456,7 @@ def run(
         _fail(str(exc))
     log_path = _logging(settings, verbose, quiet, log_file)
     tools = _tools()
-    with _open_reporter(settings) as reporter, power.keep_awake():
+    with _open_reporter(settings, progress) as reporter, power.keep_awake():
         try:
             with State.open(settings.state_db) as state:
                 summary = _runner.run_queue(

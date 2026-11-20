@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -14,6 +16,7 @@ from video_cleaner.config import Settings
 from video_cleaner.progress import (
     PlainReporter,
     Progress,
+    ProgressMode,
     RichReporter,
     format_eta,
     format_heartbeat,
@@ -211,6 +214,51 @@ def test_make_reporter_picks_by_tty(tmp_path: Path) -> None:
     rich_rep = make_reporter(s, is_tty=True, out=io.StringIO())
     assert isinstance(rich_rep, RichReporter)
     rich_rep.close()
+
+
+def test_make_reporter_mode_overrides_the_tty_check(tmp_path: Path) -> None:
+    s = _settings(tmp_path)
+    forced = make_reporter(s, is_tty=False, mode=ProgressMode.RICH, out=io.StringIO())
+    assert isinstance(forced, RichReporter)
+    forced.close()
+    assert isinstance(make_reporter(s, is_tty=True, mode=ProgressMode.PLAIN), PlainReporter)
+    auto = make_reporter(s, is_tty=False, mode=ProgressMode.AUTO)
+    assert isinstance(auto, PlainReporter)
+
+
+def test_forced_rich_output_uses_terminal_control_codes_on_a_pipe(tmp_path: Path) -> None:
+    buf = io.StringIO()  # not a terminal
+    rep = make_reporter(_settings(tmp_path), is_tty=False, mode=ProgressMode.RICH, out=buf)
+    rep.stage("encode film.mkv")
+    rep.update(Progress(percent=40.0, fps=12.0, speed=0.5, eta_s=3600.0))
+    rep.file_done("film.mkv done")
+    assert "\x1b[" in buf.getvalue()
+    assert "film.mkv done" in buf.getvalue()
+
+
+def test_forced_rich_output_on_redirected_stdout_has_control_codes(tmp_path: Path) -> None:
+    """A real process whose stdout is a file (what Git Bash or a pipe gives): codes still appear.
+
+    Rich picks a Windows console API when it thinks the console is "legacy" and then writes no
+    control codes to a redirected stdout; only an operating-system level redirect shows it.
+    """
+    code = (
+        "from pathlib import Path\n"
+        "from video_cleaner.config import Settings\n"
+        "from video_cleaner.progress import Progress, ProgressMode, make_reporter\n"
+        "p = Path('x')\n"
+        "s = Settings(library_root=p, scratch_dir=p, completed_dir=p, state_db=p, log_dir=p)\n"
+        "r = make_reporter(s, is_tty=False, mode=ProgressMode.RICH)\n"
+        "r.stage('encode film.mkv')\n"
+        "r.update(Progress(percent=40.0, fps=12.0, speed=0.5, eta_s=3600.0))\n"
+        "r.file_done('film.mkv done')\n"
+    )
+    out = tmp_path / "out.txt"
+    with out.open("wb") as handle:
+        subprocess.run([sys.executable, "-c", code], stdout=handle, check=True)  # noqa: S603
+    text = out.read_bytes().decode("utf-8", errors="replace")
+    assert "\x1b[" in text
+    assert "film.mkv done" in text
 
 
 def test_make_reporter_plain_uses_configured_interval(tmp_path: Path) -> None:

@@ -53,6 +53,14 @@ library directly and read-only.
 `-q`/`--quiet` (warnings only) and `--log-file PATH` (this run's log goes there instead of
 `log_dir`); `doctor`, `status` and `report` take `--config` only.
 
+`survey`, `calibrate` and `run` also take `--progress auto|rich|plain`. The default, `auto`, shows
+a live in-place progress line (spinner, stage, bar, percent, fps and ETA) when the output is an
+interactive terminal, and plain lines every `plain_progress_s` seconds otherwise (a pipe, a file,
+a scheduled task). `rich` always draws the live line, even when the output is piped, which only
+looks right if the program reading it is a terminal; `plain` always writes plain lines, which
+suits logs. Git Bash's default console often is not detected as a terminal, so use `--progress
+rich` there, or run from Windows Terminal or PowerShell.
+
 Exit codes: 0 success; 1 a run that stopped (scratch full, library unreachable, ...) or a
 failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,
 an output overlapping the library, another run active, no state database yet, a stored calibration
