@@ -48,14 +48,19 @@ def test_tags_are_four_characters_inside_brackets(level: Level, text: str) -> No
     assert tagged(level, "hello").plain == f"{text} hello"
 
 
+# ANSI "select graphic rendition" foreground codes, which rich emits for its 16 standard colours
+# (30-37 are black, red, green, yellow, blue, magenta, cyan, white; 90-97 are the bright ones).
+SGR_RED, SGR_GREEN, SGR_YELLOW, SGR_WHITE, SGR_BRIGHT_BLACK = "31", "32", "33", "37", "90"
+
+
 @pytest.mark.parametrize(
     ("level", "code"),
     [
-        (Level.OK, "32"),
-        (Level.INFO, "37"),
-        (Level.WARN, "33"),
-        (Level.FAIL, "31"),
-        (Level.VERB, "90"),
+        (Level.OK, SGR_GREEN),
+        (Level.INFO, SGR_WHITE),
+        (Level.WARN, SGR_YELLOW),
+        (Level.FAIL, SGR_RED),
+        (Level.VERB, SGR_BRIGHT_BLACK),  # "bright black" is how terminals spell grey
     ],
 )
 def test_only_the_text_inside_the_brackets_is_coloured(level: Level, code: str) -> None:
