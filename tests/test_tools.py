@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from video_cleaner import tools
+from video_cleaner.consolefmt import Level
 from video_cleaner.progress import Progress, parse_ffmpeg_progress
 from video_cleaner.tools import (
     ToolFailed,
@@ -49,7 +50,9 @@ class FakeReporter:
         with self._lock:
             self.heartbeats.append((label, elapsed_s))
 
-    def file_done(self, summary: str) -> None:  # pragma: no cover - unused by run_tool
+    def file_done(
+        self, summary: str, level: Level = Level.INFO
+    ) -> None:  # pragma: no cover - unused by run_tool
         pass
 
 

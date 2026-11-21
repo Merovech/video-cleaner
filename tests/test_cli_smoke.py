@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -32,3 +33,18 @@ def test_no_command_is_a_stub(cmd: str, tmp_path: Path) -> None:
 def test_version_is_a_string() -> None:
     assert isinstance(video_cleaner.__version__, str)
     assert video_cleaner.__version__
+
+
+@pytest.mark.parametrize("cmd", ["survey", "calibrate", "run"])
+def test_long_commands_offer_a_progress_flag(cmd: str) -> None:
+    # CI sets colour variables, so the help may carry ANSI styling that splits "--progress".
+    result = CliRunner().invoke(app, [cmd, "--help"], env={"COLUMNS": "200", "NO_COLOR": "1"})
+    assert result.exit_code == 0
+    text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    assert "--progress" in text
+    assert "auto" in text and "rich" in text and "plain" in text
+
+
+def test_progress_flag_rejects_an_unknown_mode() -> None:
+    result = CliRunner().invoke(app, ["run", "--progress", "fancy"])
+    assert result.exit_code == 2

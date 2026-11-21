@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from video_cleaner import probe as probe_module
+from video_cleaner.consolefmt import Level
 from video_cleaner.probe import (
     MediaInfo,
     ProbeError,
@@ -42,7 +43,9 @@ class FakeReporter:
         with self._lock:
             self.heartbeats.append((label, elapsed_s))
 
-    def file_done(self, summary: str) -> None:  # pragma: no cover - unused
+    def file_done(
+        self, summary: str, level: Level = Level.INFO
+    ) -> None:  # pragma: no cover - unused
         pass
 
 

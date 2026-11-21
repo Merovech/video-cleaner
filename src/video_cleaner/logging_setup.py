@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
+
+from video_cleaner.consolefmt import ConsoleLogHandler
 
 LOGGER_NAME = "video_cleaner"
 MASK = "***"
@@ -86,10 +87,10 @@ def setup_logging(
     The log file is ``run-YYYYMMDD-HHMMSS.log`` in *log_dir*, or *log_file* when given
     (``--log-file``; its folder is created, *log_dir* is then not). The file handler logs at
     *file_level* (DEBUG unless the ``log_file_level`` setting says otherwise). The console
-    handler (stderr) is WARNING for
-    ``verbosity < 0`` (-q), INFO for 0 and DEBUG for ``> 0`` (-v). Calling this again replaces
-    the handlers installed by the previous call. The logger does not propagate, so records
-    never reach un-redacted handlers on the root logger.
+    handler (`ConsoleLogHandler`: tagged lines on stderr, or above a live progress bar) is
+    WARNING for ``verbosity < 0`` (-q), INFO for 0 and DEBUG for ``> 0`` (-v). Calling this
+    again replaces the handlers installed by the previous call. The logger does not propagate,
+    so records never reach un-redacted handlers on the root logger.
     """
     secret_list = [s for s in secrets if s]
     default = log_dir / f"run-{datetime.now():%Y%m%d-%H%M%S}.log"
@@ -106,9 +107,7 @@ def setup_logging(
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     )
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(_console_level(verbosity))
-    console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    console_handler = ConsoleLogHandler(_console_level(verbosity))
 
     for handler in (file_handler, console_handler):
         handler.addFilter(RedactingFilter(secret_list))

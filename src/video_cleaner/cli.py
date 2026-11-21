@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
-from rich.console import Console
 
 from video_cleaner import calibrate as _calibrate
 from video_cleaner import doctor as doctor_mod
@@ -18,13 +17,19 @@ from video_cleaner import logarchive, planning, power
 from video_cleaner import runner as _runner
 from video_cleaner import survey as _survey
 from video_cleaner.config import ConfigError, Settings, default_config_path, load_settings
+from video_cleaner.consolefmt import Level, encodable, print_tagged
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
 from video_cleaner.instancelock import AlreadyRunning
 from video_cleaner.logging_setup import setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
-from video_cleaner.progress import Reporter, RichReporter, encodable, make_reporter
+from video_cleaner.progress import (
+    ProgressMode,
+    Reporter,
+    RichReporter,
+    make_reporter,
+)
 from video_cleaner.state import State, StateError
 from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
@@ -34,8 +39,6 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
-
-_err = Console(stderr=True, emoji=False)
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
 MAX_LISTED_UNPROBEABLE = 20
@@ -54,16 +57,24 @@ VerboseOption = Annotated[
     int, typer.Option("--verbose", "-v", count=True, help="More console logging.")
 ]
 QuietOption = Annotated[bool, typer.Option("--quiet", "-q", help="Warnings only on the console.")]
+ProgressOption = Annotated[
+    ProgressMode,
+    typer.Option(
+        "--progress",
+        help="Progress display: auto (live bar on a terminal, plain lines otherwise), "
+        "rich (always the live bar) or plain (always plain lines).",
+    ),
+]
 LogFileOption = Annotated[
     Path | None,
     typer.Option("--log-file", help="Write this run's log here instead of log_dir."),
 ]
 
 
-def _check_tag(check: doctor_mod.Check) -> str:
+def _check_level(check: doctor_mod.Check) -> Level:
     if check.ok:
-        return "[ OK ]"
-    return "[FAIL]" if check.required else "[WARN]"
+        return Level.OK
+    return Level.FAIL if check.required else Level.WARN
 
 
 @app.command()
@@ -82,15 +93,17 @@ def doctor(
     settings = _load(config)
     checks = doctor_mod.run_doctor(settings, config_path=config_path)
     for check in checks:
-        typer.echo(f"{_check_tag(check)} {check.name}: {check.detail}")
+        print_tagged(_check_level(check), f"{check.name}: {check.detail}")
     removed = logarchive.archive_old_logs(settings.log_dir)
-    typer.echo(f"logs: archived {len(removed)} old log file(s) from {settings.log_dir}")
+    print_tagged(
+        Level.INFO, f"logs: archived {len(removed)} old log file(s) from {settings.log_dir}"
+    )
     if any(c.required and not c.ok for c in checks):
         raise typer.Exit(code=1)
 
 
 def _fail(message: str) -> NoReturn:
-    _err.print(message, markup=False, highlight=False)
+    print_tagged(Level.FAIL, message, stderr=True)
     raise typer.Exit(code=2)
 
 
@@ -129,9 +142,11 @@ def _tools() -> Tools:
 
 
 @contextmanager
-def _open_reporter(settings: Settings) -> Iterator[Reporter]:
+def _open_reporter(
+    settings: Settings, progress: ProgressMode = ProgressMode.AUTO
+) -> Iterator[Reporter]:
     """The console reporter for a long command, closed (live display stopped) on the way out."""
-    reporter = make_reporter(settings, is_tty=sys.stdout.isatty())
+    reporter = make_reporter(settings, is_tty=sys.stdout.isatty(), mode=progress)
     try:
         yield reporter
     finally:
@@ -178,6 +193,7 @@ def survey(
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
     log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
 ) -> None:
     """Scan the library and probe every file (read-only)."""
     settings = _load(config)
@@ -188,17 +204,18 @@ def survey(
         _fail(str(exc))
     _logging(settings, verbose, quiet, log_file)
     tools = _tools()
-    with _open_reporter(settings) as reporter:
+    with _open_reporter(settings, progress) as reporter:
         try:
             with State.open(settings.state_db) as state:
                 result = _survey.run_survey(settings, tools, state, reporter, root=root)
         except (_survey.SurveyError, ToolNotFound) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print(
+            print_tagged(
+                Level.WARN,
                 "survey interrupted; files are recorded only once all of them are probed, so "
                 "nothing from this survey was recorded: run it again",
-                highlight=False,
+                stderr=True,
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_survey_summary(surveyed, result)
@@ -355,6 +372,7 @@ def calibrate(
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
     log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
 ) -> None:
     """Calibrate CRF selection on sample clips, or approve the calibration."""
     settings = _load_outside_library(config)
@@ -373,7 +391,7 @@ def calibrate(
     _require_state(settings)
     _logging(settings, verbose, quiet, log_file)
     tools = _tools()
-    with _open_reporter(settings) as reporter:
+    with _open_reporter(settings, progress) as reporter:
         try:
             with State.open(settings.state_db) as state:
                 rows = _calibrate.run_calibration(
@@ -387,7 +405,7 @@ def calibrate(
         ) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print("calibration interrupted; nothing was approved", highlight=False)
+            print_tagged(Level.WARN, "calibration interrupted; nothing was approved", stderr=True)
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _say(_calibrate.format_calibration_table(rows))
     _say(f"Table: {settings.state_db.parent / _calibrate.CALIBRATION_TXT}")
@@ -399,16 +417,17 @@ def calibrate(
 
 
 def _print_run_summary(summary: _runner.RunSummary) -> None:
-    _say(
+    print_tagged(
+        Level.INFO,
         f"Run: completed {summary.completed}, left alone {summary.left_alone}, "
-        f"flagged {summary.flagged}, retry {summary.retry}; saved {_gib(summary.bytes_saved)}"
+        f"flagged {summary.flagged}, retry {summary.retry}; saved {_gib(summary.bytes_saved)}",
     )
     if summary.stop_reason:
-        _say(f"Run stopped: {summary.stop_reason}")
+        print_tagged(Level.WARN, f"Run stopped: {summary.stop_reason}")
     elif summary.stopped_by_deadline:
-        _say("Run ended: deadline reached (the file in progress was finished)")
+        print_tagged(Level.INFO, "Run ended: deadline reached (the file in progress was finished)")
     else:
-        _say("Run ended: queue finished")
+        print_tagged(Level.OK, "Run ended: queue finished")
 
 
 @app.command()
@@ -427,6 +446,7 @@ def run(
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
     log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
 ) -> None:
     """Execute the acknowledged plan."""
     settings = _load_outside_library(config)
@@ -437,7 +457,7 @@ def run(
         _fail(str(exc))
     log_path = _logging(settings, verbose, quiet, log_file)
     tools = _tools()
-    with _open_reporter(settings) as reporter, power.keep_awake():
+    with _open_reporter(settings, progress) as reporter, power.keep_awake():
         try:
             with State.open(settings.state_db) as state:
                 summary = _runner.run_queue(
@@ -458,13 +478,14 @@ def run(
         ) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
-            _err.print(
+            print_tagged(
+                Level.WARN,
                 "run interrupted; the file in progress is retried on the next run",
-                highlight=False,
+                stderr=True,
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
     _print_run_summary(summary)
-    _say(f"Log: {log_path}")
+    print_tagged(Level.INFO, f"Log: {log_path}")
     if summary.stop_reason:
         raise typer.Exit(code=1)
 

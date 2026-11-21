@@ -53,6 +53,23 @@ library directly and read-only.
 `-q`/`--quiet` (warnings only) and `--log-file PATH` (this run's log goes there instead of
 `log_dir`); `doctor`, `status` and `report` take `--config` only.
 
+`survey`, `calibrate` and `run` also take `--progress auto|rich|plain`. The default, `auto`, shows
+a live in-place progress line (spinner, stage, bar, percent, fps and ETA) when the output is an
+interactive terminal, and plain lines every `plain_progress_s` seconds otherwise (a pipe, a file,
+a scheduled task). `rich` always draws the live line, even when the output is piped, which only
+looks right if the program reading it is a terminal; `plain` always writes plain lines, which
+suits logs. Git Bash's default console often is not detected as a terminal, so use `--progress
+rich` there, or run from Windows Terminal or PowerShell.
+
+Console lines the tool writes about its own work start with a level tag: `[ OK ]` (green),
+`[INFO]` (white), `[WARN]` (yellow), `[FAIL]` (red) or `[VERB]` (grey, the detail `-v` adds);
+only the text inside the brackets is coloured, and colour is dropped when the output is not a
+terminal. A file's closing line is `[ OK ]` when it completed, `[WARN]` when it was flagged or must be retried and `[INFO]` when it
+was left alone. While the live bar is up, these lines appear above it. The plain progress lines
+carry the tag and a time (`[INFO] 07:30:05 encode ...`) and include a "still working" line
+every `heartbeat_s` seconds for tools that report no percentage; the live bar has a spinner
+instead and prints none. The run log file keeps its own, more detailed format.
+
 Exit codes: 0 success; 1 a run that stopped (scratch full, library unreachable, ...) or a
 failed required `doctor` check; 2 a refusal (plan not acknowledged, calibration not approved,
 an output overlapping the library, another run active, no state database yet, a stored calibration

@@ -52,6 +52,10 @@ files = ["src", "tests"]
 testpaths = ["tests"]
 # `from helpers import ...` / `from media import ...` resolve without relying on rootdir insertion.
 pythonpath = ["tests"]
+# Tests write only under pytest's tmp_path. Keep the folders of failing tests for a post-mortem
+# and remove everything else when the run ends, instead of leaving three runs in the system
+# temp folder.
+tmp_path_retention_policy = "failed"
 addopts = "-ra --strict-markers --strict-config --cov=src/video_cleaner --cov-report=term-missing"
 markers = [
     "integration: tests that run real ffmpeg/ffprobe against generated media",

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from video_cleaner.consolefmt import Level
 from video_cleaner.progress import Progress
 from video_cleaner.tools import Tools, locate_tools
 
@@ -24,6 +25,7 @@ class RecordingReporter:
         self.updates: list[Progress] = []
         self.heartbeats: list[str] = []
         self.done: list[str] = []
+        self.done_levels: list[Level] = []
 
     def stage(self, label: str) -> None:
         self.stages.append(label)
@@ -34,8 +36,9 @@ class RecordingReporter:
     def heartbeat(self, label: str, elapsed_s: float) -> None:
         self.heartbeats.append(label)
 
-    def file_done(self, summary: str) -> None:
+    def file_done(self, summary: str, level: Level = Level.INFO) -> None:
         self.done.append(summary)
+        self.done_levels.append(level)
 
 
 @functools.cache
