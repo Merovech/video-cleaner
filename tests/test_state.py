@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -838,11 +839,24 @@ def test_set_subtitle_updates_in_place(state: State) -> None:
     assert sum(state.subtitle_counts().values()) == 1
 
 
-def test_found_subtitle_survives_a_wanted_write(state: State) -> None:
-    found = sub_rec(SubtitleStatus.FOUND, provider="sidecar", sha256="cd" * 32)
+@pytest.mark.parametrize(
+    "late", [SubtitleStatus.WANTED, SubtitleStatus.UNAVAILABLE, SubtitleStatus.UNCLEAR]
+)
+def test_found_subtitle_survives_a_late_write_of_a_lesser_outcome(
+    state: State, late: SubtitleStatus
+) -> None:
+    found = sub_rec(
+        SubtitleStatus.FOUND,
+        provider="opensubtitles",
+        cache_path=Path("/cache/subs/ab/abcdef.srt"),
+        sha256="cd" * 32,
+        provenance="English",
+        tried_ids=(4,),
+    )
     state.set_subtitle(found)
-    state.set_subtitle(sub_rec(SubtitleStatus.WANTED, english_audio=True))
+    state.set_subtitle(sub_rec(late, reason="late result", english_audio=True))
     assert state.subtitle(SUB_PATH, SIZE, MTIME) == found
+    assert state.subtitle_counts()[SubtitleStatus.FOUND] == 1
 
 
 def test_found_subtitle_may_still_be_replaced_by_another_outcome(state: State) -> None:
@@ -973,19 +987,92 @@ def test_reset_subtitle_of_an_unknown_row_is_a_no_op(state: State) -> None:
     assert state.subtitle(SUB_PATH, SIZE, MTIME) is None
 
 
-@pytest.mark.parametrize(
-    "stored",
-    ["not json", '{"a": 1}', '"7"', '[1, "2"]', "[true]", "[1.5]", "[-3]", "[[1]]", "", "null"],
-)
-def test_corrupt_tried_ids_read_as_empty_and_never_crash_a_read(state: State, stored: str) -> None:
+_CORRUPT_TRIED_IDS = [
+    "not json",
+    '{"a": 1}',
+    '"7"',
+    '[1, "2"]',
+    "[true]",
+    "[1.5]",
+    "[-3]",
+    "[[1]]",
+    "",
+    "null",
+    "[" * 1000,
+    "[" * 5000,
+    "[" * 200_000,
+    "[" * 200_000 + "]" * 200_000,
+    '{"a": ' * 5000,
+    "x" * 1_000_000,
+    "[" + "1," * 600_000 + "1]",  # a valid array, far longer than any real record
+    "[" + "9" * 5000 + "]",  # an int too large to parse
+    "[" + "9" * 300 + "]",  # an int that parses but is not an id SQLite or a provider can hold
+]
+
+
+def _corrupt_tried_ids(state: State, stored: str) -> None:
     state.set_subtitle(sub_rec(tried_ids=(1, 2)))
     raw = sqlite3.connect(state._db_path)
     raw.execute("UPDATE subtitles SET tried_ids = ?", (stored,))
     raw.commit()
     raw.close()
+
+
+@pytest.mark.parametrize("stored", _CORRUPT_TRIED_IDS)
+def test_corrupt_tried_ids_read_as_empty_and_never_crash_a_read(state: State, stored: str) -> None:
+    _corrupt_tried_ids(state, stored)
     got = state.subtitle(SUB_PATH, SIZE, MTIME)
     assert got is not None and got.tried_ids == ()
     assert [r.tried_ids for r in state.wanted_subtitles()] == [()]
+
+
+class _Collect(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+@pytest.fixture
+def state_log() -> Iterator[_Collect]:
+    """Collects what the state module logs, whether or not the tool's logging is set up."""
+    logger = logging.getLogger("video_cleaner.state")
+    handler = _Collect()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        logger.setLevel(previous)
+        logger.removeHandler(handler)
+
+
+def test_corrupt_tried_ids_warn_once_per_read_naming_the_row_not_the_value(
+    state: State, state_log: _Collect
+) -> None:
+    junk = "DAMAGED-ROW-CONTENT"
+    _corrupt_tried_ids(state, junk)
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got is not None and got.tried_ids == ()
+    warnings = [r for r in state_log.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert SUB_PATH.as_posix() in message
+    assert str(len(junk)) in message
+    assert junk not in message
+    state.wanted_subtitles()
+    assert len([r for r in state_log.records if r.levelno == logging.WARNING]) == 2
+
+
+def test_healthy_tried_ids_do_not_warn(state: State, state_log: _Collect) -> None:
+    state.set_subtitle(sub_rec(tried_ids=(1, 2)))
+    state.set_subtitle(sub_rec(path=Path("/m/b.mkv")))  # the empty default is healthy too
+    state.subtitle(SUB_PATH, SIZE, MTIME)
+    state.wanted_subtitles()
+    assert state_log.records == []
 
 
 def test_tried_ids_are_stored_as_a_json_array_of_ints(state: State) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import sqlite3
 import threading
@@ -27,7 +28,11 @@ from video_cleaner.probe import MediaInfo
 from video_cleaner.subtitles.models import QuotaInfo
 
 SCHEMA_VERSION = 4
+_log = logging.getLogger("video_cleaner.state")
 _BUSY_TIMEOUT_S = 30.0
+# A real tried_ids list is a handful of ids; anything past this is damage, not a record.
+_MAX_TRIED_IDS_CHARS = 64 * 1024
+_MAX_TRIED_ID = 2**63 - 1
 
 
 class StateError(Exception):
@@ -171,6 +176,10 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
     3: ("ALTER TABLE files ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",),
     4: (_SUBTITLES_TABLE, _SUBTITLES_INDEX),
 }
+# Outcomes that never replace a FOUND record.
+_NEVER_OVER_FOUND = frozenset(
+    {SubtitleStatus.WANTED, SubtitleStatus.UNAVAILABLE, SubtitleStatus.UNCLEAR}
+)
 _SUB_COLUMNS = (
     "path, size, mtime, status, provider, cache_path, sha256, provenance, hash_exact, "
     "english_audio, reason, tried_ids, attempts"
@@ -248,20 +257,33 @@ def _record(row: Sequence[Any]) -> FileRecord:
     )
 
 
-def _tried_ids(raw: object) -> tuple[int, ...]:
-    """The ids in a stored ``tried_ids`` value; anything but a JSON array of non-negative ints
-    reads as empty, so a damaged row costs a repeat download at worst and never an error."""
-    try:
-        data = json.loads(str(raw))
-    except ValueError:
-        return ()
-    if not isinstance(data, list):
-        return ()
+def _valid_id(value: object) -> bool:
+    return type(value) is int and 0 <= value <= _MAX_TRIED_ID
+
+
+def _tried_ids(raw: object, key: str) -> tuple[int, ...]:
+    """The ids in a stored ``tried_ids`` value for the record at *key*.
+
+    Anything but a short JSON array of ids (non-negative ints that fit 64 bits) reads as empty,
+    so a damaged row costs a repeat download at worst and never an error (deeply nested or
+    oversized values included). The damage is logged with the row's path and the value's
+    length, never its content.
+    """
+    text = str(raw)
     ids: list[int] = []
-    for item in data:
-        if type(item) is not int or item < 0:
-            return ()
-        ids.append(item)
+    try:
+        data = json.loads(text) if len(text) <= _MAX_TRIED_IDS_CHARS else None
+    except (ValueError, RecursionError):  # not JSON, or nested past the parser's stack
+        data = None
+    if isinstance(data, list) and all(_valid_id(item) for item in data):
+        ids = list(data)
+    else:
+        _log.warning(
+            "the subtitle record for %s has an unreadable tried_ids value (%d characters); "
+            "reading it as empty",
+            key,
+            len(text),
+        )
     return tuple(ids)
 
 
@@ -278,7 +300,7 @@ def _subtitle_record(row: Sequence[Any]) -> SubtitleRecord:
         hash_exact=bool(row[8]),
         english_audio=bool(row[9]),
         reason=str(row[10]),
-        tried_ids=_tried_ids(row[11]),
+        tried_ids=_tried_ids(row[11], str(row[0])),
         attempts=int(row[12]),
     )
 
@@ -622,20 +644,21 @@ class State:
     def set_subtitle(self, rec: SubtitleRecord) -> None:
         """Store *rec*, replacing any record for its (path, size, mtime), in one transaction.
 
-        A FOUND record is never downgraded to WANTED (a stale writer cannot undo a result);
-        that write changes nothing. Every other change goes through, including FOUND to
-        another outcome. Raises ValueError for a *tried_ids* entry that is not a
-        non-negative int.
+        A FOUND record is never replaced by WANTED, UNAVAILABLE or UNCLEAR (a late or stale
+        result must not orphan the cached file a download paid for); that write changes
+        nothing. Every other change goes through, including FOUND to NOT_NEEDED (the video
+        gained its own subtitles) and FOUND to FOUND. Raises ValueError for a *tried_ids*
+        entry that is not an int from 0 to 2**63 - 1.
         """
         key = _key(rec.path)
         cache = None if rec.cache_path is None else _key(rec.cache_path)
-        if any(type(i) is not int or i < 0 for i in rec.tried_ids):
-            raise ValueError(f"tried_ids must be non-negative ints, got {rec.tried_ids!r}")
+        if not all(_valid_id(i) for i in rec.tried_ids):
+            raise ValueError(f"tried_ids must be ints from 0 to 2**63 - 1, got {rec.tried_ids!r}")
         tried = json.dumps(list(rec.tried_ids))
         with self._tx(write=True) as conn:
             existing = self._subtitle_row(conn, key, rec.size, rec.mtime)
             old = None if existing is None else SubtitleStatus(existing[3])
-            if old is SubtitleStatus.FOUND and rec.status is SubtitleStatus.WANTED:
+            if old is SubtitleStatus.FOUND and rec.status in _NEVER_OVER_FOUND:
                 return
             conn.execute(
                 "INSERT INTO subtitles (path, size, mtime, status, provider, cache_path, sha256, "
