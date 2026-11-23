@@ -16,7 +16,7 @@ dependencies = [
     "keyring>=25.7.0",
     "pysubs2>=1.8.1",
     "ffsubsync>=0.5.1",
-    "guessit>=4.5.5",
+    "guessit>=4.4.0",
 ]
 
 [project.scripts]

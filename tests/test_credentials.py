@@ -637,10 +637,43 @@ def test_auth_registers_what_it_was_given_for_redaction(
     assert PHRASE not in redact(f"password was {PHRASE}")
 
 
-def test_auth_strips_surrounding_whitespace(tmp_path: Path, cli_store: MemoryStore) -> None:
-    code, _ = _auth(tmp_path, input_text=f"  {API} \n{USER}\n\t{PHRASE}\n")
+def test_auth_strips_the_api_key_and_username_but_keeps_the_password_as_typed(
+    tmp_path: Path, cli_store: MemoryStore
+) -> None:
+    code, _ = _auth(tmp_path, input_text=f"  {API} \n {USER}\t\n  {PHRASE} \n")
     assert code == 0
-    assert cli_store.values == FULL
+    assert cli_store.values == {API_KEY: API, USERNAME: USER, PASSWORD: f"  {PHRASE} "}
+
+
+def test_auth_refuses_a_blank_password_but_keeps_inner_spaces(
+    tmp_path: Path, cli_store: MemoryStore
+) -> None:
+    code, _ = _auth(tmp_path, input_text=f"{API}\n{USER}\n \t \n")
+    assert code == 2
+    assert cli_store.values == {}
+    code, _ = _auth(tmp_path, input_text=f"{API}\n{USER}\na b  c\n")
+    assert code == 0
+    assert cli_store.values[PASSWORD] == "a b  c"
+
+
+def test_auth_deletes_the_stale_token_before_it_writes_new_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class SecondSetFails(MemoryStore):
+        sets = 0
+
+        def set(self, name: str, value: str) -> None:
+            self.sets += 1
+            if self.sets == 2:
+                raise CredentialError("keyring locked")
+            super().set(name, value)
+
+    store = SecondSetFails({TOKEN: "stale-token-1234", API_KEY: "old-key-1234"})
+    monkeypatch.setattr(credentials, "open_store", lambda env=None: store)
+    code, _ = _auth(tmp_path, input_text=f"{API}\n{USER}\n{PHRASE}\n")
+    assert code == 2
+    assert store.values[API_KEY] == API  # the first write went through
+    assert TOKEN not in store.values  # and no old token sits beside the new key
 
 
 def test_auth_stores_nothing_when_input_ends_early(tmp_path: Path, cli_store: MemoryStore) -> None:

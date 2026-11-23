@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -53,8 +54,11 @@ _GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 # Process-wide secrets (values the run knows are credentials), masked by every `redact` call
-# and every `RedactingFilter` in addition to the ones passed explicitly.
-_registered: set[str] = set()
+# and every `RedactingFilter` in addition to the ones passed explicitly. An immutable snapshot,
+# replaced under a lock on every write, so a thread that redacts (the tool's stderr drain) never
+# iterates a set another thread is changing.
+_registered: frozenset[str] = frozenset()
+_registered_lock = threading.Lock()
 
 
 def register_secrets(secrets: Iterable[str]) -> None:
@@ -63,12 +67,17 @@ def register_secrets(secrets: Iterable[str]) -> None:
     Values shorter than `MIN_SECRET_LENGTH` characters are ignored: masking a one- or
     two-letter value would garble ordinary text.
     """
-    _registered.update(s for s in secrets if len(s) >= MIN_SECRET_LENGTH)
+    global _registered
+    new = {s for s in secrets if len(s) >= MIN_SECRET_LENGTH}
+    with _registered_lock:
+        _registered = _registered | new
 
 
 def _reset_registered_secrets() -> None:
     """Forget every registered secret (for tests, so one test cannot leak into the next)."""
-    _registered.clear()
+    global _registered
+    with _registered_lock:
+        _registered = frozenset()
 
 
 def redact(text: str, secrets: Iterable[str] = ()) -> str:
@@ -77,7 +86,8 @@ def redact(text: str, secrets: Iterable[str] = ()) -> str:
     The generic ones are Api-Key / password / token labels, Bearer / Basic / Digest credentials.
     """
     # Longest first so a secret that contains another is masked whole.
-    for secret in sorted({s for s in (*secrets, *_registered) if s}, key=len, reverse=True):
+    registered = _registered  # one snapshot for the whole call
+    for secret in sorted({s for s in (*secrets, *registered) if s}, key=len, reverse=True):
         text = text.replace(secret, MASK)
     for pattern in _GENERIC_PATTERNS:
         text = pattern.sub(rf"\g<1>{MASK}", text)

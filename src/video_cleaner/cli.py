@@ -618,18 +618,22 @@ def _auth_prompt(store: _credentials.CredentialStore) -> None:
         _credentials.USERNAME: "OpenSubtitles username",
         _credentials.PASSWORD: "OpenSubtitles password",
     }
-    values = {
-        name: str(typer.prompt(label, hide_input=True)).strip() for name, label in labels.items()
-    }
-    blank = [name for name, value in values.items() if not value]
+    values: dict[str, str] = {}
+    for name, label in labels.items():
+        typed = str(typer.prompt(label, hide_input=True))
+        # A password is kept exactly as typed (spaces can be part of it); the other two are
+        # identifiers, where stray spaces are a paste accident.
+        values[name] = typed if name == _credentials.PASSWORD else typed.strip()
+    blank = [name for name, value in values.items() if not value.strip()]
     if blank:
         _fail(f"{', '.join(blank)}: a value is required; nothing was stored")
-    register_secrets(values.values())
+    register_secrets([*values.values(), values[_credentials.PASSWORD].strip()])
+    # A token cached for the previous login is no longer valid. It goes first, so a write that
+    # fails part-way never leaves a new key beside the old login's token.
+    store.delete(_credentials.TOKEN)
     for name, value in values.items():
         store.set(name, value)
         print_tagged(Level.OK, f"stored {name}")
-    # A token cached for the previous login is no longer valid.
-    store.delete(_credentials.TOKEN)
 
 
 @app.command()

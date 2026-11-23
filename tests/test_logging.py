@@ -293,6 +293,43 @@ def test_registered_secret_is_masked_by_redact() -> None:
 
 
 @pytest.mark.usefixtures("clean_registry")
+def test_the_registry_is_an_immutable_snapshot_swapped_under_a_lock() -> None:
+    from video_cleaner import logging_setup
+
+    before = logging_setup._registered
+    assert isinstance(before, frozenset)
+    register_secrets(["hunter22"])
+    assert before == frozenset()  # a reader holding the old snapshot is unaffected
+    assert logging_setup._registered == frozenset({"hunter22"})
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registering_while_another_thread_redacts_never_raises() -> None:
+    import threading
+
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                redact("text with secret-0 and secret-5 in it")
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        for i in range(3000):
+            register_secrets([f"secret-{i}"])
+    finally:
+        stop.set()
+        thread.join()
+    assert errors == []
+    assert redact("secret-2999") == "***"
+
+
+@pytest.mark.usefixtures("clean_registry")
 def test_registered_secret_is_masked_by_the_filter() -> None:
     register_secrets(["hunter22"])
     record = logging.LogRecord(
