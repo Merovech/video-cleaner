@@ -3,10 +3,11 @@
 The server is not trusted. Every URL the client is about to contact (the host the login names,
 the link a download names) must be HTTPS on ``opensubtitles.com`` or one of its subdomains;
 redirects are held to the same rule; every response is read with a size cap and its JSON is
-checked before use, so an odd or hostile reply raises `ProviderError` and never anything else;
-every request times out. No secret (key, user name, password, session token) appears in a URL,
-a log record or an exception message, and each is registered with
-`logging_setup.register_secrets` as soon as the client has it.
+checked before use, so an odd or hostile reply raises `ProviderError` (`AuthError` when a login
+reply names an API host outside opensubtitles.com, `QuotaExhausted` when the limit is reached)
+and never a parser or type error; every request times out. No secret (key, user name,
+password, session token) appears in a URL, a log record or an exception message, and each is
+registered with `logging_setup.register_secrets` as soon as the client has it.
 File names the server sends are never read.
 
 Only the standard library does the HTTP (`UrllibTransport`); tests substitute a `Transport`.
@@ -298,7 +299,7 @@ class UrllibTransport:
     def _read(self, response: object, status: int, max_bytes: int, deadline: float) -> HttpResponse:
         headers = {k.lower(): v for k, v in response.headers.items()}  # type: ignore[attr-defined]
         declared = headers.get("content-length", "")
-        if declared.isdigit() and int(declared) > max_bytes:
+        if declared.isascii() and declared.isdigit() and int(declared) > max_bytes:
             raise ResponseTooLarge("the reply is larger than allowed")
         read = getattr(response, "read1", None) or response.read  # type: ignore[attr-defined]
         chunks: list[bytes] = []

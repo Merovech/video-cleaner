@@ -12,10 +12,11 @@ from __future__ import annotations
 import contextlib
 import itertools
 import time
+from collections.abc import Callable
 
 import pytest
 
-from video_cleaner.subtitles.textfmt import SubtitleRejected, normalise_subtitle
+from video_cleaner.subtitles.textfmt import SubtitleRejected, normalise_subtitle, to_srt
 
 SIZE_CAP = 2_000_000
 TIME_BOUND_S = 2.0
@@ -121,3 +122,95 @@ def test_thousands_of_tag_rich_cues_are_accepted_quickly() -> None:
     assert time.perf_counter() - started < TIME_BOUND_S
     assert len(result.cues) == 5_000
     assert result.cues[4_999].text == "Line 5000 bold\nsecond"
+
+
+# --- the normalised text reads back as the same cues ----------------------------------------
+
+HOSTILE_TEXTS = [
+    "<i>00:59:00,000 --> 00:59:05,000</i>",
+    "before\n<b>00:00:09,000 --> 00:00:10,000</b>\nafter",
+    "<i>100:00:00,000 --> 100:00:01,000</i>",
+    "<i>99999999999999:00:00,000 --> 00:00:01,000</i>",
+    "7\n<i>00:00:09,000 --> 00:00:10,000</i>",
+    "7\n<i>00:00:09,000 --> 00:00:10,000</i>\n8",
+    "<i> 00:59:00.000  -->  00:59:05.000 </i> trailing words",
+    "59:00,000 --> 59:05,000",
+    "00:59:00,000 --> 00:59:05,000 and then words",
+    "a --> b",
+    "-->",
+    "dash ---> arrow --> done",
+    "line one\n   \n\t\nline two",
+    "line one\u2028line two\u2029line three",
+    "5",
+    "5\n\n6",
+    "<<i>b>",
+    "<i<b>>text",
+    "{\\{\\a}}x",
+    "{{\\an8}name}",
+    "<\x01i>gone</i>",
+    "<" * 6 + "i>" * 6 + "x",
+    "{\\" * 6 + "a}" * 6 + "x",
+    "I <3 you, 2 < 3 and {name}",
+]
+
+
+def _srt_with_cue_text(text: str) -> bytes:
+    cues = [
+        "1\n00:00:01,000 --> 00:00:02,000\nfirst\n",
+        f"2\n00:00:03,000 --> 00:00:04,000\n{text}\n",
+        "3\n00:00:05,000 --> 00:00:06,000\nlast\n",
+    ]
+    return "\n".join(cues).encode()
+
+
+def _vtt_with_cue_text(text: str) -> bytes:
+    # A blank line ends a WebVTT cue, so the hostile text carries no blank lines here.
+    text = "\n".join(line for line in text.split("\n") if line.strip())
+    return (
+        b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nfirst\n\n"
+        + f"00:00:03.000 --> 00:00:04.000\n{text}\n\n".encode()
+        + b"00:00:05.000 --> 00:00:06.000\nlast\n"
+    )
+
+
+def _ass_with_cue_text(text: str) -> bytes:
+    one_line = text.replace("\n", "\\N")
+    return (
+        ASS_HEAD
+        + b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,first\n"
+        + b"Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,"
+        + one_line.encode()
+        + b"\n"
+        + b"Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,last\n"
+    )
+
+
+@pytest.mark.parametrize("build", [_srt_with_cue_text, _vtt_with_cue_text, _ass_with_cue_text])
+@pytest.mark.parametrize("text", HOSTILE_TEXTS, ids=lambda t: repr(t)[:40])
+def test_normalised_text_reads_back_as_the_same_cues(
+    text: str, build: Callable[[str], bytes]
+) -> None:
+    first = normalise_subtitle(build(text), max_bytes=SIZE_CAP, min_cues=1)
+    again = normalise_subtitle(to_srt(first.cues).encode(), max_bytes=SIZE_CAP, min_cues=1)
+    assert again.cues == first.cues
+    assert again.srt == first.srt
+    # no cue the file did not have: first and last are always there, the hostile one at most
+    assert len(first.cues) <= 3
+
+
+def test_markup_nested_deeper_than_the_passes_loses_its_brackets_in_bounded_time() -> None:
+    nested = "<" * 6_000 + "i>" * 6_000
+    started = time.perf_counter()
+    first = normalise_subtitle(_srt_with_cue_text(nested), max_bytes=SIZE_CAP, min_cues=1)
+    assert time.perf_counter() - started < TIME_BOUND_S
+    assert all("<" not in cue.text and ">" not in cue.text for cue in first.cues)
+    again = normalise_subtitle(first.srt.encode(), max_bytes=SIZE_CAP, min_cues=1)
+    assert again.cues == first.cues
+
+
+def test_a_timestamp_line_built_by_tag_removal_is_not_written_as_a_timing_line() -> None:
+    first = normalise_subtitle(
+        _srt_with_cue_text("<i>00:59:00,000 --> 00:59:05,000</i>"), max_bytes=SIZE_CAP, min_cues=1
+    )
+    assert [c.text for c in first.cues] == ["first", "last"]
+    assert "00:59:00" not in first.srt

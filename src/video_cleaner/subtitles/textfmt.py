@@ -10,8 +10,10 @@ The formats are read by the small line-based parsers in this module rather than 
 library. Library parsers lean on regular expressions with nested or optional quantifiers, and
 attacker-shaped text (a "<" followed by a long run of spaces, a "[" heading line with a long run
 of letters) makes those backtrack quadratically; a file under the size cap could then cost
-minutes of CPU. Here every regular expression is applied to a single line, which is capped at
-`MAX_LINE_CHARS`, and is either anchored with plain linear quantifiers or bounded in length.
+minutes of CPU. Here every regular expression runs in linear time: each is anchored, built from
+plain greedy runs that the next literal ends, or bounded in length. Parsing works line by line,
+and no line may exceed `MAX_LINE_CHARS`; the format detection and the cleaning patterns also scan
+the whole text or a whole multi-line cue body, which is safe for the same reason.
 """
 
 from __future__ import annotations
@@ -63,13 +65,25 @@ _ASS_DEFAULT_FIELDS = (
     "text",
 )
 
+# ASS/SSA: every {...} block is a comment or an override block. Other formats only have override
+# blocks ({\an8}), so a literal {name} in SRT or WebVTT dialogue is kept.
 _ASS_OVERRIDE_RE = re.compile(r"\{[^{}]*\}")
-_ASS_DRAWING_RE = re.compile(r"\{[^{}]*\\p\d")
+_OVERRIDE_BLOCK_RE = re.compile(r"\{\\[^{}]*\}")
+# \p1 and up switch drawing mode on; \p0 ends it and must not drop the text around it.
+_ASS_DRAWING_RE = re.compile(r"\{[^{}]*\\p[1-9]")
 _ASS_BREAK_RE = re.compile(r"\\[Nn]")
 _ASS_HARD_SPACE_RE = re.compile(r"\\h")
 # HTML/WebVTT tags (<i>, </font>, <c.yellow>, <v Anna>, <00:01.000>). A tag must start with a
 # letter, so "I <3 you" and "2 < 3" are left alone. At most 200 characters are looked at per "<".
 _MARKUP_TAG_RE = re.compile(r"</?[A-Za-z][^<>\n]{0,200}>|<\d{1,2}:\d{2}(?::\d{2})?\.\d{3}>")
+# A cleaned text line that another reader would take for a cue timing line: besides the shape the
+# parser itself accepts, a timestamp followed by an arrow anywhere in the line (digit runs are
+# bounded, so scanning a long line stays linear).
+_TIMING_LIKE_RE = re.compile(r"\d{1,6}(?::\d{1,6}){1,2}[,.]\d{1,6}\s*-+>")
+# Removing markup can leave new markup behind (`<<i>b>`), so it is removed again, up to this many
+# times; text that is still changing after that loses its angle and curly brackets instead.
+_MAX_MARKUP_PASSES = 4
+_BRACKETS = str.maketrans("", "", "<>{}")
 
 _UTF8_BOM = b"\xef\xbb\xbf"
 _UTF16_LE_BOM = b"\xff\xfe"
@@ -177,14 +191,30 @@ def cues_per_hour(cues: Sequence[Cue], duration_s: float) -> float:
 
 
 def to_srt(cues: Sequence[Cue]) -> str:
-    """Render *cues* as SRT text, numbered from 1, with LF line endings."""
-    blocks = []
-    for number, cue in enumerate(cues, start=1):
-        # A blank line would end the cue early, so empty lines are dropped.
-        body = "\n".join(line for line in cue.text.splitlines() if line.strip())
+    """Render *cues* as SRT text, numbered from 1, with LF line endings.
+
+    Blank lines (they would end the cue early) and lines that read as a cue timing line (they
+    would start a cue that is not there) are left out of the text, and a cue with no text left
+    is left out altogether, so the result reads back as the same cues.
+    """
+    blocks: list[str] = []
+    for cue in cues:
+        body = "\n".join(_text_lines(cue.text))
+        if not body:
+            continue
         stamps = f"{_srt_time(cue.start_ms)} --> {_srt_time(cue.end_ms)}"
-        blocks.append(f"{number}\n{stamps}\n{body}\n")
+        blocks.append(f"{len(blocks) + 1}\n{stamps}\n{body}\n")
     return "\n".join(blocks)
+
+
+def _text_lines(text: str) -> list[str]:
+    """The lines of a cue's text, stripped, without blank lines or timing-looking lines."""
+    lines = (line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    return [line for line in lines if line and not _looks_like_timing(line)]
+
+
+def _looks_like_timing(line: str) -> bool:
+    return bool(_CUE_LINE_RE.match(line) or _TIMING_LIKE_RE.search(line))
 
 
 def _srt_time(ms: int) -> str:
@@ -327,15 +357,27 @@ def _parse_ass(lines: Sequence[str]) -> list[_RawCue]:
 
 
 def _clean_text(text: str, *, ass: bool) -> str | None:
-    """Plain text of one cue, or None when nothing is left (or it is an ASS vector drawing)."""
-    if ass and _ASS_DRAWING_RE.search(text):
-        return None
-    text = _ASS_OVERRIDE_RE.sub("", text)
+    """Plain text of one cue, or None when nothing is left (or it is an ASS vector drawing).
+
+    The result is a fixed point: cleaning it again (as SRT, which is how it is written) changes
+    nothing, and none of its lines reads as a cue timing line.
+    """
     if ass:
+        if _ASS_DRAWING_RE.search(text):
+            return None
+        text = _ASS_OVERRIDE_RE.sub("", text)
         text = _ASS_BREAK_RE.sub(lambda m: "\n" if m.group(0) == "\\N" else " ", text)
         text = _ASS_HARD_SPACE_RE.sub(" ", text)
-    text = _MARKUP_TAG_RE.sub("", text)
     text = _CONTROL_RE.sub("", text)
-    lines = [line.strip() for line in text.split("\n")]
-    cleaned = "\n".join(line for line in lines if line)
+    cleaned = "\n".join(_text_lines(_strip_markup(text)))
     return cleaned or None
+
+
+def _strip_markup(text: str) -> str:
+    """Remove override blocks and HTML/WebVTT tags until none are left."""
+    for _ in range(_MAX_MARKUP_PASSES):
+        stripped = _MARKUP_TAG_RE.sub("", _OVERRIDE_BLOCK_RE.sub("", text))
+        if stripped == text:
+            return text
+        text = stripped
+    return text.translate(_BRACKETS)

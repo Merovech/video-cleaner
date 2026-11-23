@@ -37,6 +37,56 @@ def test_release_name_yields_title_and_year(name: str, title: str, year: int) ->
     assert parsed == TitleYear(title=title, year=year, is_episode=False)
 
 
+@pytest.mark.parametrize(
+    ("name", "languages"),
+    [
+        ("Alien.1979", ()),
+        ("Alien.1979.fr", ("fr",)),
+        ("Alien.1979.fre", ("fr",)),
+        ("Alien.1979.spa", ("es",)),
+        ("Alien.1979.pt-BR", ("pt-br",)),
+        ("Alien.1979.en", ("en",)),
+        ("Alien.1979.eng", ("en",)),
+        ("Alien.1979.English", ("en",)),
+        ("Alien.1979.German.en", ("de", "en")),
+        ("Alien.1979.VOSTFR", ("fr",)),
+        ("Alien.1979.Multi", ("mul",)),
+    ],
+)
+def test_release_name_reports_the_language_tags_of_the_name(
+    name: str, languages: tuple[str, ...]
+) -> None:
+    parsed = parse_release_name(name)
+
+    assert parsed.languages == languages
+    assert (parsed.title, parsed.year) == ("Alien", 1979)
+
+
+@pytest.mark.parametrize(
+    ("name", "non_english"),
+    [
+        ("Alien.1979", False),
+        ("Alien.1979.en", False),
+        ("Alien.1979.eng", False),
+        ("Alien.1979.English", False),
+        ("Alien.1979.fr", True),
+        ("Alien.1979.pt-BR", True),
+        ("Alien.1979.en.fr", True),
+        ("Alien.1979.German.en", True),
+        ("Alien.1979.VOSTFR", True),
+        ("Alien.1979.Multi", True),
+    ],
+)
+def test_a_name_is_non_english_unless_english_is_its_only_language(
+    name: str, non_english: bool
+) -> None:
+    assert parse_release_name(name).non_english is non_english
+
+
+def test_the_languages_of_a_name_are_not_part_of_its_identity() -> None:
+    assert parse_release_name("Alien.1979.fr") == TitleYear("Alien", 1979)
+
+
 def test_release_name_without_a_year_has_year_none() -> None:
     parsed = parse_release_name("Some.Film.1080p.en")
 
@@ -124,6 +174,26 @@ def test_library_name_does_not_borrow_the_folder_for_an_unrelated_file() -> None
 
     assert parsed.title == "Behind The Scenes"
     assert parsed.year is None
+
+
+def test_library_name_does_not_give_the_folders_year_to_a_different_film() -> None:
+    # "Aliens" is 0.91 similar to "Alien" but is another film: borrowing the year 1979 would make
+    # it match the subtitle of the original at 0.909.
+    parsed = parse_library_name(Path("Alien (1979)") / "Aliens.mkv")
+
+    assert (parsed.title, parsed.year) == ("Aliens", None)
+
+
+def test_library_name_still_borrows_the_folders_year_for_the_same_title() -> None:
+    parsed = parse_library_name(Path("Dune (2021)") / "Dune.mkv")
+
+    assert (parsed.title, parsed.year) == ("Dune", 2021)
+
+
+def test_library_name_borrows_the_folders_year_when_only_spelling_differs() -> None:
+    parsed = parse_library_name(Path("Amelie (2001)") / "Amélie.mkv")
+
+    assert (parsed.title, parsed.year) == ("Amélie", 2001)
 
 
 def test_library_name_prefers_the_file_year_over_the_folder_year() -> None:

@@ -23,6 +23,7 @@ from video_cleaner.subtitles.local import (
     LocalSubtitle,
     index_local_folders,
     match_local,
+    title_year_confidence,
 )
 from video_cleaner.subtitles.names import (
     TitleYear,
@@ -112,6 +113,54 @@ def test_index_skips_episodes(tmp_path: Path) -> None:
     index = index_local_folders([tmp_path], max_bytes=MB)
 
     assert names_of(index) == ["Movie.2010.en.srt"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Alien.1979.fr.srt",
+        "Alien.1979.spa.srt",
+        "Alien.1979.pt-BR.srt",
+        "Alien.1979.fre.srt",
+        "Alien.1979.French.srt",
+        "Alien.1979.en.fr.srt",
+        "Alien.1979.VOSTFR.srt",
+    ],
+)
+def test_index_skips_a_file_named_for_a_language_other_than_english(
+    tmp_path: Path, name: str
+) -> None:
+    write(tmp_path / name)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Alien.1979.en.srt", "Alien.1979.eng.srt", "Alien.1979.English.srt", "Alien.1979.srt"],
+)
+def test_index_keeps_english_and_untagged_files(tmp_path: Path, name: str) -> None:
+    # An untagged name says nothing about the language: the resolver checks the content.
+    write(tmp_path / name)
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == [name]
+
+
+def test_a_french_sibling_does_not_make_the_english_file_ambiguous(tmp_path: Path) -> None:
+    write(tmp_path / "Alien.1979.en.srt")
+    write(tmp_path / "Alien.1979.fr.srt")
+
+    result = match_local(index_local_folders([tmp_path], max_bytes=MB), TitleYear("Alien", 1979))
+
+    assert result == LocalCandidate(tmp_path / "Alien.1979.en.srt", 1.0)
+
+
+def test_a_folder_with_only_a_french_file_matches_nothing(tmp_path: Path) -> None:
+    write(tmp_path / "Alien.1979.fr.srt")
+
+    index = index_local_folders([tmp_path], max_bytes=MB)
+
+    assert match_local(index, TitleYear("Alien", 1979)) is None
 
 
 def test_index_skips_a_file_with_no_readable_title(tmp_path: Path) -> None:
@@ -377,6 +426,27 @@ def test_alien_never_matches_aliens() -> None:
 
     assert match_local([entry("Aliens", 1986)], target) is None
     assert match_local([entry("Aliens", None, "Aliens.en.srt")], target) is None
+
+
+def test_a_library_file_named_aliens_in_the_alien_folder_never_gets_the_alien_subtitle(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path / "Alien.1979.en.srt")
+    index = index_local_folders([tmp_path], max_bytes=MB)
+
+    aliens = parse_library_name(Path("Alien (1979)") / "Aliens.mkv")
+    alien = parse_library_name(Path("Alien (1979)") / "Alien.mkv")
+
+    assert match_local(index, aliens) is None
+    assert match_local(index, alien) == LocalCandidate(tmp_path / "Alien.1979.en.srt", 1.0)
+
+
+def test_title_year_confidence_is_public_and_applies_the_match_rule() -> None:
+    assert title_year_confidence(TitleYear("Alien", 1979), TitleYear("Alien", 1979)) == 1.0
+    assert title_year_confidence(TitleYear("Alien", 1980), TitleYear("Alien", 1979)) == (1.0 * 0.95)
+    assert title_year_confidence(TitleYear("Alien", 1981), TitleYear("Alien", 1979)) is None
+    assert title_year_confidence(TitleYear("Alien", None), TitleYear("Alien", 1979)) == 0.9
+    assert title_year_confidence(TitleYear("Alien", None), TitleYear("Aliens", 1986)) is None
 
 
 def test_sequels_are_not_the_original() -> None:

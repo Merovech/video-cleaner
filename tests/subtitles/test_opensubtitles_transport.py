@@ -155,6 +155,13 @@ def test_a_declared_content_length_over_the_cap_is_refused_without_reading() -> 
         get(t, URL, max_bytes=100)
 
 
+@pytest.mark.parametrize("declared", ["\u00b2", "\u0663\u0663", "1.5", "-3", ""])
+def test_a_content_length_that_is_not_ascii_digits_is_ignored_not_a_crash(declared: str) -> None:
+    # Superscript two is a digit to str.isdigit() but int() refuses it.
+    t, _ = transport(lambda req: (200, {"Content-Length": declared}, b"x" * 50))
+    assert get(t, URL, max_bytes=100).body == b"x" * 50
+
+
 def test_a_lying_content_length_does_not_get_past_the_cap() -> None:
     t, _ = transport(lambda req: (200, {"Content-Length": "5"}, b"x" * 500))
     with pytest.raises(ResponseTooLarge):

@@ -13,7 +13,7 @@ import functools
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,6 @@ _LIBRARY_NAME = re.compile(r"(?P<title>.*?)\s*\((?P<year>(?:18|19|20)[0-9]{2})\)
 _EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,5}")
 # File names that say nothing about the film, so the folder's name is used instead.
 _GENERIC_STEMS = frozenset({"movie", "video", "film", "main", "feature"})
-_SAME_TITLE_AS_FOLDER = 0.90
 # Number words and roman numerals count as the digit they stand for, so "Part II", "Part Two"
 # and "Part 2" are one title. A lone "i" is an ordinary word unless a part word comes before it.
 _NUMBER_WORDS = {
@@ -63,13 +62,29 @@ _YEAR_AT_END = re.compile(r"\((?:18|19|20)[0-9]{2}\)\s*\Z")
 # Titles that differ in a sequel number are different films however alike the rest is.
 _NUMBER_MISMATCH_CAP = 0.5
 _LATIN_LIMIT = 0x250  # end of Latin Extended-B: accents are stripped from these letters only
+_ENGLISH_CODES = frozenset({"en", "eng"})
+# guessit reports the language of a name as "language" and, for "VOSTFR"-style tags, as
+# "subtitle_language".
+_LANGUAGE_KEYS = ("language", "subtitle_language")
 
 
 @dataclass(frozen=True)
 class TitleYear:
+    """What a name says about a film: its title and year, whether it is an episode, and the
+    languages tagged in it (lower-case codes such as "en" or "pt-br", only set by
+    `parse_release_name`). The languages describe a file, not the film, so they do not take part
+    in comparing two of these.
+    """
+
     title: str
     year: int | None
     is_episode: bool = False
+    languages: tuple[str, ...] = field(default=(), compare=False)
+
+    @property
+    def non_english(self) -> bool:
+        """Whether the name is tagged with a language and English is not the only one."""
+        return any(_primary_subtag(code) not in _ENGLISH_CODES for code in self.languages)
 
 
 def _empty() -> TitleYear:
@@ -101,13 +116,31 @@ def parse_release_name(name: str) -> TitleYear:
     raw_year = _value(guess, "year")
     year = raw_year if isinstance(raw_year, int) and _MIN_YEAR <= raw_year <= _MAX_YEAR else None
     is_episode = _value(guess, "season") is not None or _value(guess, "episode") is not None
+    languages = _language_codes(guess)
     if title and _dropped_a_number(text, title, guess):
-        return TitleYear(title="", year=year, is_episode=is_episode)
+        return TitleYear(title="", year=year, is_episode=is_episode, languages=languages)
     if title:
         # guessit moves "Part II" and "Vol 2" out of the title; they say which film it is.
         title = " ".join([title, *_numbered(_value(guess, "part"), "Part")])
         title = " ".join([title, *_numbered(_value(guess, "volume"), "Volume")])
-    return TitleYear(title=title, year=year, is_episode=is_episode)
+    return TitleYear(title=title, year=year, is_episode=is_episode, languages=languages)
+
+
+def _language_codes(guess: dict[str, list[Any]]) -> tuple[str, ...]:
+    """The languages guessit found in the name, as lower-case codes, in name order."""
+    found = [match for key in _LANGUAGE_KEYS for match in guess.get(key, [])]
+    found.sort(key=lambda match: match.span)
+    codes: list[str] = []
+    for match in found:
+        code = str(match.value).strip().lower()
+        if code and code not in codes:
+            codes.append(code)
+    return tuple(codes)
+
+
+def _primary_subtag(code: str) -> str:
+    """ "pt" for "pt-br"."""
+    return code.replace("_", "-").split("-", 1)[0]
 
 
 def _matches(found: object) -> list[Any]:
@@ -194,8 +227,10 @@ def _without_split_marker(stem: str) -> str:
 def parse_library_name(path: Path) -> TitleYear:
     """Title and year of a library file: "Title (2010).mkv", with a " - pt1" marker stripped.
 
-    The folder's name fills in what the file name lacks: its year when the titles agree, or the
-    whole identity when the file is named something generic like "movie.mkv".
+    The folder's name fills in what the file name lacks: its year when the titles are the same
+    once normalised, or the whole identity when the file is named something generic like
+    "movie.mkv". A merely similar title does not borrow the year: "Aliens" in the folder
+    "Alien (1979)" is another film, and giving it 1979 would match it to the first film's subtitle.
     """
     stem = _without_split_marker(_without_extension(path.name[:MAX_NAME_CHARS]))
     parsed = _parse_stem(stem)
@@ -210,7 +245,7 @@ def parse_library_name(path: Path) -> TitleYear:
     own = normalise_title(parsed.title)
     if not own or own in _GENERIC_STEMS:
         return folder
-    if title_similarity(parsed.title, folder.title) >= _SAME_TITLE_AS_FOLDER:
+    if own == normalise_title(folder.title):
         return TitleYear(title=parsed.title, year=folder.year)
     return parsed
 

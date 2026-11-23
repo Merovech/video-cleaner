@@ -199,6 +199,34 @@ def test_normalised_srt_parses_back_to_the_same_cues() -> None:
     assert again.source_format == "srt"
 
 
+def test_braces_in_srt_and_vtt_dialogue_are_kept_but_override_blocks_are_stripped() -> None:
+    srt = srt_with(("00:00:01,000", "00:00:02,000", "Call me {name} {\\an8}now"))
+    assert normalise_subtitle(srt, max_bytes=BIG, min_cues=1).cues[0].text == "Call me {name} now"
+    vtt = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi {Anna}, {\\i1}you{\\i0}\n"
+    assert normalise_subtitle(vtt, max_bytes=BIG, min_cues=1).cues[0].text == "Hi {Anna}, you"
+
+
+def _ass_text(text: str) -> bytes:
+    body = ASS.rsplit(b"Dialogue:", 2)[0]
+    return body + b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,," + text.encode() + b"\n"
+
+
+def test_every_brace_block_is_stripped_in_ass() -> None:
+    raw = _ass_text("{\\an8}Top {a note}line")
+    assert normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues[0].text == "Top line"
+
+
+def test_a_drawing_mode_end_tag_does_not_drop_real_text() -> None:
+    raw = _ass_text("{\\p0}Real text")
+    assert normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues[0].text == "Real text"
+
+
+@pytest.mark.parametrize("text", ["{\\p1}m 0 0 l 10 10{\\p0}", "{\\an7\\p2}m 0 0 l 5 5", "{\\p1}x"])
+def test_a_drawing_event_is_still_dropped(text: str) -> None:
+    raw = _ass_text(text) + b"Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Spoken\n"
+    assert [c.text for c in normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues] == ["Spoken"]
+
+
 def test_format_comes_from_content_not_a_name() -> None:
     # The API takes bytes only; an ASS body is recognised as ASS whatever it was called.
     assert normalise_subtitle(ASS, max_bytes=BIG, min_cues=1).source_format == "ass"
@@ -446,6 +474,31 @@ def test_to_srt_of_nothing_is_empty() -> None:
 
 def test_to_srt_cannot_be_split_by_blank_lines_in_text() -> None:
     assert to_srt([Cue(0, 1000, "a\n\n\nb")]) == "1\n00:00:00,000 --> 00:00:01,000\na\nb\n"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "00:59:00,000 --> 00:59:05,000",
+        "  0:59:00.000-->0:59:05.000 and more",
+        "59:00,000 --> 59:05,000",
+        "100:00:00,000 --> 100:00:01,000",
+    ],
+)
+def test_to_srt_never_writes_a_text_line_that_reads_as_a_timing_line(line: str) -> None:
+    out = to_srt([Cue(0, 1000, f"a\n{line}\nb")])
+    assert out == "1\n00:00:00,000 --> 00:00:01,000\na\nb\n"
+
+
+def test_to_srt_leaves_out_a_cue_with_no_text_left() -> None:
+    cues = [Cue(0, 1000, "00:59:00,000 --> 00:59:05,000"), Cue(2000, 3000, "kept")]
+    assert to_srt(cues) == "1\n00:00:02,000 --> 00:00:03,000\nkept\n"
+
+
+def test_to_srt_keeps_text_that_merely_contains_an_arrow() -> None:
+    assert (
+        to_srt([Cue(0, 1000, "go --> there")]) == "1\n00:00:00,000 --> 00:00:01,000\ngo --> there\n"
+    )
 
 
 # --- timestamps that the parser would silently misread ----------------------------------

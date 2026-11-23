@@ -44,7 +44,9 @@ _log = logging.getLogger("video_cleaner.subtitles.align")
 #: Overall limit for one ffsubsync run. It reads the whole audio track (possibly over the
 #: network), which takes minutes for a film; an hour is far past any healthy run.
 ALIGN_TIMEOUT_S = 3600.0
-# ffsubsync's log is mostly one line per skipped cue; the numbers are near its start.
+# ffsubsync's log is mostly one line per skipped cue; those warnings come before the report of
+# the numbers and a traceback, if any, after it. A log past this cap is cut off at its end, so
+# the report can be missing: that fails safe (no numbers, no alignment).
 _LOG_READ_CAP_BYTES = 8 * 1024 * 1024
 _SCALE_SLACK = 1e-9
 #: ffsubsync works on a 100 Hz grid and only looks for offsets inside the window it is given
@@ -62,6 +64,10 @@ _EXCERPT_LINES = 10
 _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
 _WORK_PREFIX = ".align-"
+# Environment variables that are not passed to ffsubsync: this tool's OpenSubtitles credentials
+# and, as a net for others, any name with one of these words in it (compared in upper case).
+_OPENSUBTITLES_ENV_PREFIX = "VC_OPENSUBTITLES_"
+_SECRET_NAME_MARKERS = ("API_KEY", "PASSWORD", "TOKEN", "SECRET")
 _STAGED_INPUT = "input.srt"
 _STAGED_OUTPUT = "aligned.srt"
 _STAGED_LOG = "ffsubsync.log"
@@ -197,14 +203,23 @@ def accept_alignment(
     return True, f"offset {offset_s:+.3f} s, framerate scale {scale:.3f}, score {score:.3f}"
 
 
+def _is_secret_name(name: str) -> bool:
+    """Whether an environment variable may hold a credential (compared in upper case)."""
+    upper = name.upper()
+    return upper.startswith(_OPENSUBTITLES_ENV_PREFIX) or any(
+        marker in upper for marker in _SECRET_NAME_MARKERS
+    )
+
+
 def _child_env(tools: Tools) -> dict[str, str]:
     """A copy of this environment with the ffmpeg (and ffprobe) folders first on PATH.
 
     ffsubsync finds ffmpeg only through PATH. Python's stdio is set to UTF-8 so the log, which
     names the video, is decoded the way `run_tool` reads it, and the console is pinned to plain,
-    wide output.
+    wide output. ffsubsync needs no credentials, so the OpenSubtitles variables and any variable
+    whose name looks like a secret are not passed on.
     """
-    env = dict(os.environ)
+    env = {name: value for name, value in os.environ.items() if not _is_secret_name(name)}
     key = next((name for name in env if name.upper() == "PATH"), "PATH")
     folders = list(dict.fromkeys(str(tool.parent) for tool in (tools.ffmpeg, tools.ffprobe)))
     existing = env.get(key, "")

@@ -107,7 +107,8 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
 
     Skipped without error: anything that is not a regular file, empty files, files over
     *max_bytes*, entries that cannot be read or listed, symlinks and junctions, names that parse
-    to no title, and episodes. The result is sorted by path.
+    to no title, episodes, and names tagged with a language other than English alone ("fr",
+    "spa", "pt-BR", "en.fr"). The result is sorted by path.
     """
     roots: dict[str, str] = {}
     for folder in dirs:
@@ -128,12 +129,21 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
         parsed = parse_release_name(entry.name[: -len(extension)])
         if parsed.is_episode or not normalise_title(parsed.title):
             continue
+        # A name tagged with a language other than English (or with several, English among
+        # them) is not trusted to hold English text. A name with no language tag stays: its
+        # content language is not known here, the resolver checks the content.
+        if parsed.non_english:
+            continue
         found.setdefault(os.path.normcase(entry.path), LocalSubtitle(Path(entry.path), parsed))
     return sorted(found.values(), key=lambda item: str(item.path))
 
 
-def _confidence(file: TitleYear, target: TitleYear) -> float | None:
-    """How sure a file is the target's subtitle, or None when it does not qualify."""
+def title_year_confidence(file: TitleYear, target: TitleYear) -> float | None:
+    """How sure a file is the target's subtitle, or None when it does not qualify.
+
+    Title and year are compared by the thresholds above; the same rule is meant for any
+    candidate that has a title and a year, wherever it comes from.
+    """
     similarity = title_similarity(file.title, target.title)
     if file.year is None or target.year is None:
         if similarity < SIMILARITY_NO_YEAR:
@@ -160,7 +170,7 @@ def match_local(index: Sequence[LocalSubtitle], target: TitleYear) -> LocalCandi
     for item in index:
         if item.parsed.is_episode:
             continue
-        confidence = _confidence(item.parsed, target)
+        confidence = title_year_confidence(item.parsed, target)
         if confidence is not None and confidence > scored.get(item.path, 0.0):
             scored[item.path] = confidence
     if not scored:

@@ -702,9 +702,10 @@ def test_the_numbers_are_read_from_the_whole_log_not_the_last_few_kilobytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     case = Case(tmp_path)
-    # ffsubsync reports the numbers, then prints one line per skipped cue.
+    # ffsubsync warns about every skipped cue while it reads the subtitle, before it reports the
+    # numbers; the numbers must be found wherever they are, while the tail holds only warnings.
     skipped = "           INFO     Skipped subtitle at index 1: Start time < 0      srt.py:305\n"
-    patch_run(monkeypatch, FakeFfsubsync(log=GOOD_LOG + skipped * 5000, tail=skipped * 20))
+    patch_run(monkeypatch, FakeFfsubsync(log=skipped * 5000 + GOOD_LOG, tail=skipped * 20))
     result = case.run()
     assert result.ok
     assert result.offset_s == -3.0
@@ -863,6 +864,33 @@ def test_the_child_console_is_pinned_whatever_the_caller_environment(
     assert env["NO_COLOR"] == "1"
     assert env["TERM"] == "dumb"
     assert int(env["COLUMNS"]) >= 1000
+
+
+def test_the_child_does_not_inherit_credentials_from_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secrets = {
+        "VC_OPENSUBTITLES_API_KEY": "k",
+        "VC_OPENSUBTITLES_USERNAME": "u",
+        "VC_OPENSUBTITLES_PASSWORD": "p",
+        "vc_opensubtitles_other": "o",
+        "SOME_SERVICE_API_KEY": "k",
+        "my_password": "p",
+        "GITHUB_TOKEN": "t",
+        "Client_Secret": "s",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("VC_ALIGN_MARKER", "kept")
+    case = Case(tmp_path)
+    fake = patch_run(monkeypatch, FakeFfsubsync())
+    case.run()
+    env = fake.env_seen
+    assert env is not None
+    present = {name.upper() for name in env}
+    assert not present & {name.upper() for name in secrets}
+    assert env["VC_ALIGN_MARKER"] == "kept"
+    assert "PYTHONIOENCODING" in env
 
 
 _RICH_LOGGER = (
