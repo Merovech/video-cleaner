@@ -24,10 +24,13 @@ from video_cleaner.subtitles.opensubtitles import (
     MAX_JSON_BYTES,
     MAX_RETRIES,
     AuthError,
+    ConnectTimeout,
     HttpResponse,
     OpenSubtitlesClient,
     ProviderError,
     QuotaExhausted,
+    RedirectRefused,
+    RequestNotSent,
     ResponseTooLarge,
     SubtitleResult,
     TransportError,
@@ -516,7 +519,7 @@ def test_every_request_carries_the_key_user_agent_and_bearer_token() -> None:
     h.client.download(found[0], max_bytes=1000)
     login, search, info, link = h.transport.requests
     for request in (login, search, info, link):
-        assert request.headers["User-Agent"] == f"video-cleaner {__version__}"
+        assert request.headers["User-Agent"] == f"video-cleaner v{__version__}"
         assert request.timeout_s > 0
     for request in (login, search, info):
         assert request.headers["Api-Key"] == API_KEY
@@ -533,7 +536,7 @@ def test_user_agent_carries_no_personal_data() -> None:
     h = Harness(fx("login_ok.json"), search_ok([]))
     h.client.search(moviehash=HASH, title=None, year=None)
     agent = h.transport.requests[0].headers["User-Agent"]
-    assert agent == f"video-cleaner {__version__}"
+    assert agent == f"video-cleaner v{__version__}"
     assert USERNAME not in agent
 
 
@@ -1209,4 +1212,162 @@ def test_a_store_that_cannot_delete_the_token_does_not_hide_the_auth_error() -> 
     h = Harness(fx("error_401.json", 401), fx("login_ok.json"), search_ok([item(7)]))
     h.store = Stuck(**{TOKEN: "FAKE-STALE-TOKEN-2222"})
     h.client._store = h.store
+    assert [r.file_id for r in h.client.search(moviehash=HASH, title=None, year=None)] == [7]
+
+
+# --- a download that may have been counted is never retried -----------------------------------
+
+
+@pytest.mark.parametrize("error", [TransportTimeout("read timed out"), TransportError("reset")])
+def test_the_download_post_is_sent_once_when_the_reply_never_came(error: TransportError) -> None:
+    h = Harness(fx("login_ok.json"), error)
+    with pytest.raises(ProviderError, match="not retried"):
+        h.client.download(a_result(), max_bytes=100)
+    assert h.transport.paths() == ["/api/v1/login", "/api/v1/download"]
+    assert h.sleeps == []
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_the_download_post_is_sent_once_when_the_server_answers_5xx(status: int) -> None:
+    h = Harness(fx("login_ok.json"), reply(status))
+    with pytest.raises(ProviderError, match=f"{status}.*not retried"):
+        h.client.download(a_result(), max_bytes=100)
+    assert h.transport.paths() == ["/api/v1/login", "/api/v1/download"]
+    assert h.sleeps == []
+
+
+@pytest.mark.parametrize(
+    "error", [RequestNotSent("connect failed"), ConnectTimeout("connect timed out")]
+)
+def test_the_download_post_is_retried_when_the_request_never_left(error: TransportError) -> None:
+    h = Harness(fx("login_ok.json"), error, fx("download_ok.json"), reply(200, b"data"))
+    assert h.client.download(a_result(), max_bytes=100) == b"data"
+    assert h.transport.paths().count("/api/v1/download") == 2
+    assert h.sleeps == [1.0]
+
+
+def test_the_download_post_gives_up_after_the_retries_when_it_never_connects() -> None:
+    h = Harness(
+        fx("login_ok.json"), *[RequestNotSent("connect failed") for _ in range(MAX_RETRIES + 1)]
+    )
+    with pytest.raises(ProviderError):
+        h.client.download(a_result(), max_bytes=100)
+    assert h.transport.paths().count("/api/v1/download") == MAX_RETRIES + 1
+
+
+def test_the_download_post_is_retried_on_429() -> None:
+    h = Harness(
+        fx("login_ok.json"),
+        reply(429, b"", {"Retry-After": "2"}),
+        fx("download_ok.json"),
+        reply(200, b"data"),
+    )
+    assert h.client.download(a_result(), max_bytes=100) == b"data"
+    assert h.transport.paths().count("/api/v1/download") == 2
+    assert h.sleeps == [2.0]
+
+
+def test_the_download_link_is_still_retried_after_a_lost_reply() -> None:
+    # The link costs nothing ("the file can be downloaded more than once"), so a lost reply is
+    # simply asked for again.
+    h = Harness(
+        fx("login_ok.json"),
+        fx("download_ok.json"),
+        TransportTimeout("t"),
+        TransportError("reset"),
+        reply(503),
+        reply(200, b"data"),
+    )
+    assert h.client.download(a_result(), max_bytes=100) == b"data"
+    assert h.transport.paths().count("/api/v1/download") == 1
+    assert h.sleeps == [1.0, 2.0, 4.0]
+
+
+# --- a redirect that cannot be followed is final ----------------------------------------------
+
+
+def test_an_unfollowable_redirect_is_a_provider_error_without_a_retry_at_login() -> None:
+    h = Harness(RedirectRefused("redirect refused"))
+    with pytest.raises(ProviderError, match="redirect"):
+        h.client.search(moviehash=HASH, title=None, year=None)
+    assert len(h.transport.requests) == 1
+    assert h.sleeps == []
+
+
+@pytest.mark.parametrize("operation", ["search", "download", "link"])
+def test_an_unfollowable_redirect_is_a_provider_error_without_a_retry(operation: str) -> None:
+    refused = RedirectRefused("redirect refused")
+    script: list[HttpResponse | Exception] = [fx("login_ok.json")]
+    if operation == "link":
+        script.append(fx("download_ok.json"))
+    script.append(refused)
+    h = Harness(*script)
+    with pytest.raises(ProviderError, match="redirect"):
+        if operation == "search":
+            h.client.search(moviehash=HASH, title=None, year=None)
+        else:
+            h.client.download(a_result(), max_bytes=100)
+    assert len(h.transport.requests) == len(script)
+    assert h.sleeps == []
+
+
+# --- a refused login is remembered ------------------------------------------------------------
+
+
+def test_after_a_refused_login_later_calls_make_no_request() -> None:
+    h = Harness(fx("error_401.json", 401))
+    with pytest.raises(AuthError):
+        h.client.search(moviehash=HASH, title=None, year=None)
+    assert len(h.transport.requests) == 1
+    with pytest.raises(AuthError):
+        h.client.search(moviehash=HASH, title=None, year=None)
+    with pytest.raises(AuthError):
+        h.client.download(a_result(), max_bytes=100)
+    assert len(h.transport.requests) == 1
+
+
+def test_the_remembered_refusal_keeps_its_text_and_carries_no_secret() -> None:
+    h = Harness(fx("error_401.json", 401))
+    with pytest.raises(AuthError) as first:
+        h.client.search(moviehash=HASH, title=None, year=None)
+    with pytest.raises(AuthError) as second:
+        h.client.search(moviehash=HASH, title=None, year=None)
+    assert str(second.value) == str(first.value)
+    assert_no_secret(str(second.value))
+
+
+def test_a_new_client_starts_without_the_refusal() -> None:
+    first = Harness(fx("error_401.json", 401))
+    with pytest.raises(AuthError):
+        first.client.search(moviehash=HASH, title=None, year=None)
+    fresh = Harness(fx("login_ok.json"), search_ok([item(7)]))
+    assert [r.file_id for r in fresh.client.search(moviehash=HASH, title=None, year=None)] == [7]
+
+
+def test_an_untrusted_base_url_is_remembered_too() -> None:
+    body = dict(fixture_json("login_ok.json"), base_url="https://evil.example")
+    h = Harness(reply(200, body))
+    for _ in range(2):
+        with pytest.raises(AuthError):
+            h.client.search(moviehash=HASH, title=None, year=None)
+    assert len(h.transport.requests) == 1
+
+
+def test_a_session_token_the_server_refuses_twice_is_remembered() -> None:
+    h = Harness(
+        fx("error_401.json", 401),
+        fx("login_ok.json"),
+        fx("error_401.json", 401),
+        token="FAKE-STALE-TOKEN-2222",
+    )
+    for _ in range(2):
+        with pytest.raises(AuthError):
+            h.client.search(moviehash=HASH, title=None, year=None)
+    assert len(h.transport.requests) == 3
+
+
+def test_a_provider_error_at_login_is_not_remembered() -> None:
+    h = Harness(reply(200, b"nope"), fx("login_ok.json"), search_ok([item(7)]))
+    with pytest.raises(ProviderError):
+        h.client.search(moviehash=HASH, title=None, year=None)
     assert [r.file_id for r in h.client.search(moviehash=HASH, title=None, year=None)] == [7]

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import email.utils
 import http.client
+import io
 import json
 import logging
 import re
@@ -27,7 +28,8 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal, Protocol
+from http.client import HTTPMessage
+from typing import IO, Any, Literal, Protocol
 
 from video_cleaner import __version__
 from video_cleaner.credentials import TOKEN, CredentialError, CredentialStore
@@ -88,6 +90,18 @@ class TransportError(Exception):
 
 class TransportTimeout(TransportError):
     """A request, or the reading of its reply, took too long."""
+
+
+class RequestNotSent(TransportError):
+    """The request failed before it was sent (DNS, connect, TLS), so the server never saw it."""
+
+
+class RedirectRefused(TransportError):
+    """A redirect that must not or cannot be followed. Deterministic: never worth a retry."""
+
+
+class ConnectTimeout(TransportTimeout, RequestNotSent):
+    """A timeout while connecting: a timeout, and one that happened before anything was sent."""
 
 
 class ResponseTooLarge(TransportError):
@@ -157,7 +171,41 @@ def https_host(url: object) -> str | None:
 
 
 class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
-    """Follows a redirect only to HTTPS on opensubtitles.com; anything else is refused."""
+    """Follows a redirect only to HTTPS on opensubtitles.com; anything else is refused.
+
+    A redirect's body is never read: urllib would read it whole before following (no size cap,
+    no time limit), so it is closed unread first and urllib is handed an empty one.
+    """
+
+    def http_error_301(
+        self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: HTTPMessage
+    ) -> Any:
+        fp.close()
+        return super().http_error_301(req, io.BytesIO(), code, msg, headers)
+
+    def http_error_302(
+        self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: HTTPMessage
+    ) -> Any:
+        fp.close()
+        return super().http_error_302(req, io.BytesIO(), code, msg, headers)
+
+    def http_error_303(
+        self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: HTTPMessage
+    ) -> Any:
+        fp.close()
+        return super().http_error_303(req, io.BytesIO(), code, msg, headers)
+
+    def http_error_307(
+        self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: HTTPMessage
+    ) -> Any:
+        fp.close()
+        return super().http_error_307(req, io.BytesIO(), code, msg, headers)
+
+    def http_error_308(
+        self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: HTTPMessage
+    ) -> Any:
+        fp.close()
+        return super().http_error_308(req, io.BytesIO(), code, msg, headers)
 
     def redirect_request(
         self,
@@ -169,7 +217,9 @@ class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
         newurl: str,
     ) -> urllib.request.Request | None:
         if https_host(newurl) is None:
-            raise TransportError("redirect to a URL that is not https on opensubtitles.com refused")
+            raise RedirectRefused(
+                "redirect to a URL that is not https on opensubtitles.com refused"
+            )
         return super().redirect_request(req, fp, code, msg, headers, newurl)  # type: ignore[arg-type]
 
 
@@ -215,9 +265,11 @@ class UrllibTransport:
         except TimeoutError:
             raise TransportTimeout("the request timed out") from None
         except urllib.error.URLError as exc:
+            # urllib raises URLError only for what fails while connecting or sending; a failure
+            # while waiting for the reply surfaces as the bare OSError / HTTPException below.
             if isinstance(exc.reason, TimeoutError):
-                raise TransportTimeout("the request timed out") from None
-            raise TransportError("network error (URLError)") from None
+                raise ConnectTimeout("the request timed out before it was sent") from None
+            raise RequestNotSent("network error before the request was sent") from None
         except (OSError, http.client.HTTPException, ValueError) as exc:
             # The text of these can carry a request detail; the type name is enough.
             raise TransportError(f"network error ({type(exc).__name__})") from None
@@ -240,7 +292,7 @@ class UrllibTransport:
         except urllib.error.HTTPError as err:
             with contextlib.closing(err):
                 if 300 <= err.code < 400:
-                    raise TransportError("unexpected redirect or too many redirects") from None
+                    raise RedirectRefused("redirect not followed (or too many)") from None
                 return self._read(err, err.code, max_bytes, deadline)
 
     def _read(self, response: object, status: int, max_bytes: int, deadline: float) -> HttpResponse:
@@ -452,6 +504,7 @@ class OpenSubtitlesClient:
         self._token: str | None = None
         self._base = f"https://{DEFAULT_HOST}{API_PATH}"
         self._quota: QuotaInfo | None = None
+        self._auth_failure: AuthError | None = None
 
     def last_quota(self) -> QuotaInfo | None:
         """The allowance the last download reply reported, or None when none did yet."""
@@ -489,7 +542,11 @@ class OpenSubtitlesClient:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         label = "OpenSubtitles download"
-        resp = self._api("POST", "/download", label, payload={"file_id": result.file_id})
+        # The server counts the download when it gets this POST, so it is never repeated after
+        # it may have arrived (counted=True).
+        resp = self._api(
+            "POST", "/download", label, payload={"file_id": result.file_id}, counted=True
+        )
         if resp.status == 406:
             raise self._exhausted(self._lenient_json(resp.body))
         if resp.status != 200:
@@ -522,17 +579,39 @@ class OpenSubtitlesClient:
         *,
         query: str = "",
         payload: Mapping[str, object] | None = None,
+        counted: bool = False,
     ) -> HttpResponse:
-        """One authenticated API call; a 401 earns one fresh login and one retry."""
+        """One authenticated API call; a 401 earns one fresh login and one retry.
+
+        A refused login is remembered: the service rate-limits logins and the same credentials
+        will be refused again, so this client sends nothing more after one `AuthError`.
+        """
+        if self._auth_failure is not None:
+            raise AuthError(str(self._auth_failure))
+        try:
+            return self._api_checked(method, endpoint, label, query, payload, counted)
+        except AuthError as exc:
+            self._auth_failure = exc
+            raise
+
+    def _api_checked(
+        self,
+        method: str,
+        endpoint: str,
+        label: str,
+        query: str,
+        payload: Mapping[str, object] | None,
+        counted: bool,
+    ) -> HttpResponse:
         fresh = self._ensure_session()
-        resp = self._api_once(method, endpoint, label, query, payload)
+        resp = self._api_once(method, endpoint, label, query, payload, counted)
         if resp.status != 401:
             return resp
         self._forget_token()
         if fresh:
             raise AuthError("OpenSubtitles rejected a session token it had just issued")
         self._login()
-        resp = self._api_once(method, endpoint, label, query, payload)
+        resp = self._api_once(method, endpoint, label, query, payload, counted)
         if resp.status == 401:
             raise AuthError("OpenSubtitles rejected the new session token")
         return resp
@@ -544,6 +623,7 @@ class OpenSubtitlesClient:
         label: str,
         query: str,
         payload: Mapping[str, object] | None,
+        counted: bool,
     ) -> HttpResponse:
         headers = self._plain_headers()
         headers["Api-Key"] = self._creds.api_key
@@ -554,7 +634,7 @@ class OpenSubtitlesClient:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode("utf-8")
         url = f"{self._base}{endpoint}" + (f"?{query}" if query else "")
-        return self._send(method, url, label, headers, body, MAX_JSON_BYTES)
+        return self._send(method, url, label, headers, body, MAX_JSON_BYTES, counted=counted)
 
     def _ensure_session(self) -> bool:
         """Have a token; True when this call had to log in to get one."""
@@ -635,7 +715,7 @@ class OpenSubtitlesClient:
 
     @staticmethod
     def _plain_headers() -> dict[str, str]:
-        return {"User-Agent": f"video-cleaner {__version__}"}
+        return {"User-Agent": f"video-cleaner v{__version__}"}
 
     def _send(
         self,
@@ -645,19 +725,32 @@ class OpenSubtitlesClient:
         headers: Mapping[str, str],
         body: bytes | None,
         max_bytes: int,
+        *,
+        counted: bool = False,
     ) -> HttpResponse:
-        """One request, retried on 429, 5xx, timeouts and connection errors (`MAX_RETRIES`)."""
+        """One request, retried on 429, 5xx, timeouts and connection errors (`MAX_RETRIES`).
+
+        With *counted* (the request the server charges to the user's quota when it receives it)
+        only a 429 and a failure before the request was sent are retried: after a timeout, a lost
+        connection or a 5xx the server may already have counted it, and asking again could spend
+        another download for nothing.
+        """
         self._reporter.stage(label)
         with heartbeat(self._reporter, label, HEARTBEAT_S):
             for attempt in range(MAX_RETRIES + 1):
                 last = attempt == MAX_RETRIES
-                resp = self._attempt(method, url, label, headers, body, max_bytes, last)
+                resp = self._attempt(method, url, label, headers, body, max_bytes, last, counted)
                 if resp is None:  # a timeout or connection error that is worth another try
                     self._sleep(self._retry_delay(None, attempt))
                     continue
                 _log.debug("%s: HTTP %d", label, resp.status)
                 if len(resp.body) > max_bytes:
                     raise ProviderError(f"{label}: the reply is larger than allowed")
+                if resp.status >= 500 and counted:
+                    raise ProviderError(
+                        f"{label} failed: HTTP {resp.status}; not retried, "
+                        "the server may have counted the download"
+                    )
                 if resp.status == 429 or resp.status >= 500:
                     if last:
                         raise ProviderError(
@@ -677,6 +770,7 @@ class OpenSubtitlesClient:
         body: bytes | None,
         max_bytes: int,
         last: bool,
+        counted: bool,
     ) -> HttpResponse | None:
         try:
             return self._transport.request(
@@ -689,10 +783,14 @@ class OpenSubtitlesClient:
             )
         except ResponseTooLarge:
             raise ProviderError(f"{label}: the reply is larger than allowed") from None
-        except TransportTimeout:
-            what = "timed out"
-        except TransportError:
-            what = "network error"
+        except RedirectRefused:
+            raise ProviderError(f"{label}: a redirect was refused") from None
+        except TransportError as exc:
+            what = "timed out" if isinstance(exc, TransportTimeout) else "network error"
+            if counted and not isinstance(exc, RequestNotSent):
+                raise ProviderError(
+                    f"{label} failed: {what}; not retried, the server may have counted the download"
+                ) from None
         if last:
             raise ProviderError(f"{label} failed: {what} after {MAX_RETRIES} retries")
         _log.debug("%s: %s, retrying", label, what)

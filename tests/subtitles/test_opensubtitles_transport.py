@@ -19,6 +19,8 @@ import pytest
 
 from video_cleaner.subtitles.opensubtitles import (
     HttpResponse,
+    RedirectRefused,
+    RequestNotSent,
     ResponseTooLarge,
     TransportError,
     TransportTimeout,
@@ -290,3 +292,147 @@ def test_a_slow_drip_that_never_ends_hits_the_total_time_limit() -> None:
     with pytest.raises(TransportTimeout):
         get(t, URL, max_bytes=10**9)
     assert clock["now"] < 1000.0
+
+
+# --- which failures happened before the request was sent --------------------------------------
+
+
+def test_a_failure_while_connecting_or_sending_is_marked_not_sent() -> None:
+    def responder(req: urllib.request.Request) -> Answer:
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+    t, _ = transport(responder)
+    with pytest.raises(RequestNotSent) as excinfo:
+        get(t, URL)
+    assert not isinstance(excinfo.value, TransportTimeout)
+
+
+def test_a_timeout_while_connecting_is_both_a_timeout_and_not_sent() -> None:
+    def responder(req: urllib.request.Request) -> Answer:
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    t, _ = transport(responder)
+    with pytest.raises(TransportTimeout) as excinfo:
+        get(t, URL)
+    assert isinstance(excinfo.value, RequestNotSent)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("read timed out"),
+        ConnectionResetError("reset"),
+        http.client.RemoteDisconnected("closed"),
+        http.client.IncompleteRead(b"abc"),
+    ],
+)
+def test_a_failure_while_waiting_for_the_reply_is_not_marked_not_sent(error: Exception) -> None:
+    # The server may already have acted on the request.
+    def responder(req: urllib.request.Request) -> Answer:
+        raise error
+
+    t, _ = transport(responder)
+    with pytest.raises(TransportError) as excinfo:
+        get(t, URL)
+    assert not isinstance(excinfo.value, RequestNotSent)
+
+
+def test_a_failure_while_reading_the_body_is_not_marked_not_sent() -> None:
+    class Dies(io.RawIOBase):
+        def readable(self) -> bool:
+            return True
+
+        def readinto(self, buffer: bytearray | memoryview) -> int:  # type: ignore[override]
+            raise ConnectionResetError("reset")
+
+    t, _ = transport(lambda req: (200, {}, io.BufferedReader(Dies())))
+    with pytest.raises(TransportError) as excinfo:
+        get(t, URL)
+    assert not isinstance(excinfo.value, RequestNotSent)
+
+
+# --- redirects: no bodies read, refusals are final --------------------------------------------
+
+
+class _Spy(io.RawIOBase):
+    """A large body (it does end, so a reader that ignores the cap finishes) that records how
+    much was asked of it."""
+
+    def __init__(self, size: int = 8 * 1024 * 1024) -> None:
+        super().__init__()
+        self.asked = 0
+        self._left = size
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:  # type: ignore[override]
+        n = min(len(buffer), self._left)
+        self.asked += n
+        self._left -= n
+        buffer[:n] = b"x" * n
+        return n
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_followed_redirect_never_reads_its_body_and_closes_it(code: int) -> None:
+    spy = _Spy()
+
+    def responder(req: urllib.request.Request) -> Answer:
+        if req.full_url == URL:
+            return code, {"Location": "https://dl.opensubtitles.com/final"}, io.BufferedReader(spy)
+        return 200, {}, b"final"
+
+    t, handler = transport(responder)
+    assert get(t, URL).body == b"final"
+    assert spy.asked == 0
+    assert spy.closed
+    assert len(handler.seen) == 2
+
+
+def test_a_refused_redirect_closes_the_body_without_reading_it() -> None:
+    spy = _Spy()
+    t, _ = transport(
+        lambda req: (302, {"Location": "https://evil.example/x"}, io.BufferedReader(spy))
+    )
+    with pytest.raises(RedirectRefused):
+        get(t, URL)
+    assert spy.asked == 0
+    assert spy.closed
+
+
+def test_a_slow_dripping_redirect_body_costs_no_time() -> None:
+    clock = {"now": 0.0}
+
+    class Drip(_Spy):
+        def readinto(self, buffer: bytearray | memoryview) -> int:  # type: ignore[override]
+            clock["now"] += 30.0
+            return super().readinto(buffer[:1])
+
+    spy = Drip(size=40)
+
+    def responder(req: urllib.request.Request) -> Answer:
+        if req.full_url == URL:
+            return 302, {"Location": "https://dl.opensubtitles.com/final"}, io.BufferedReader(spy)
+        return 200, {}, b"final"
+
+    t, _ = transport(responder, monotonic=lambda: clock["now"])
+    assert get(t, URL).body == b"final"
+    assert clock["now"] == 0.0
+    assert spy.closed
+
+
+def test_an_unfollowable_redirect_is_a_final_refusal() -> None:
+    # urllib will not repeat a POST on 307/308.
+    t, handler = transport(
+        lambda req: (307, {"Location": "https://dl.opensubtitles.com/final"}, b"")
+    )
+    with pytest.raises(RedirectRefused):
+        t.request("POST", URL, headers={}, body=b"{}", timeout_s=3, max_bytes=100)
+    assert len(handler.seen) == 1
+
+
+def test_a_redirect_loop_is_a_final_refusal() -> None:
+    t, _ = transport(lambda req: (302, {"Location": URL}, b""))
+    with pytest.raises(RedirectRefused):
+        get(t, URL)

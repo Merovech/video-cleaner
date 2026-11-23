@@ -5,6 +5,12 @@ the response shapes third-party clients publish. They were not recorded from a l
 Every key, token, id, file name and link in them is an obviously fake placeholder; none is, or
 was ever, real data.
 
+The shapes (field names, nesting, types) were checked against the official OpenAPI export
+(<https://stoplight.io/api/v1/projects/opensubtitles/opensubtitles-api/nodes/open_api.json>) and the
+Best Practices page
+(<https://stoplight.io/api/v1/projects/opensubtitles/opensubtitles-api/nodes/docs/02-Best-Practices.md>);
+the values are synthetic.
+
 The tests replay them through a fake transport (no network).
 
 At the local gate (the run that uses a real account) a recorded login / search / download exchange
