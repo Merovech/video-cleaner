@@ -664,7 +664,10 @@ def test_doctor_fails_when_the_library_is_inside_the_subtitle_cache(tmp_path: Pa
     assert "subtitle cache" in check.detail
 
 
-def test_cli_writing_command_refuses_a_subtitle_cache_in_the_library(tmp_path: Path) -> None:
+def test_cli_writing_command_refuses_a_subtitle_cache_in_the_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("VC_SUBTITLE_CACHE_DIR")  # the conftest default would beat the file
     config = _config(tmp_path)
     config.write_text(
         config.read_text(encoding="utf-8")

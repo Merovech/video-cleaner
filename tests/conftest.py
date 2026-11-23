@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from collections.abc import Iterator
 
 import keyring
@@ -46,3 +47,18 @@ def _no_real_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
     """The keyring library reports "no usable backend", so no test reads or writes the real
     Windows Credential Manager (tests inject fake backends and stores)."""
     monkeypatch.setattr(keyring, "get_keyring", keyring.backends.fail.Keyring)
+
+
+@pytest.fixture(autouse=True)
+def _private_subtitle_cache(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every test gets its own subtitle cache folder through the environment.
+
+    `subtitle_cache_dir` has no default of its own: without LOCALAPPDATA (Linux CI) it must be
+    given, and with LOCALAPPDATA it would point into the user's real profile. Nothing is created
+    on disk unless a test writes there. A test that needs another value, or none, changes the
+    variable itself (``monkeypatch.setenv`` / ``delenv``).
+    """
+    folder = tmp_path_factory.getbasetemp() / "subtitle-cache" / uuid.uuid4().hex
+    monkeypatch.setenv("VC_SUBTITLE_CACHE_DIR", str(folder))
