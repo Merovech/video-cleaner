@@ -29,10 +29,20 @@ IMAGE_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_sub
 UNKNOWN_FIELD_ORDER = "unknown"
 UNDETERMINED_LANGUAGE = "und"
 
-# Titles are matched by word: "Non-forced", "not forced" and "Unforced" are not forced, and
-# "Sdhx" is not SDH.
-_FORCED_TITLE = re.compile(r"(?<!\bnon[-_\s])(?<!\bnot[-_\s])(?<![a-z])forced\b", re.IGNORECASE)
-_SDH_TITLE = re.compile(r"\b(?:sdh|cc|hearing[- ]impaired|closed captions?)\b", re.IGNORECASE)
+# Titles are matched by whole word, with "_" and every other non-letter, non-digit character as
+# a separator: "Non-forced", "not forced", "No_SDH" and "Unforced" are not forced or SDH, and
+# "Sdhx" is not SDH. The words are found by one linear scan, never by backtracking patterns.
+_TITLE_WORD = re.compile(r"[^\W_]+")
+_NEGATIONS = frozenset({"non", "not", "no"})
+# Each phrase is one or more words; a phrase counts unless a negation word comes right before it.
+_SDH_PHRASES = (
+    ("sdh",),
+    ("cc",),
+    ("hearing", "impaired"),
+    ("closed", "caption"),
+    ("closed", "captions"),
+)
+_FORCED_PHRASES = (("forced",),)
 
 _FFPROBE_ARGS = (
     "-v",
@@ -185,14 +195,26 @@ def _video_stream(stream: Mapping[str, Any]) -> VideoStream:
     )
 
 
+def _title_has(title: str, phrases: tuple[tuple[str, ...], ...]) -> bool:
+    """Whether *title* contains one of *phrases* as whole words, not directly after a negation."""
+    words = _TITLE_WORD.findall(title.lower())
+    for start, word in enumerate(words):
+        if start > 0 and words[start - 1] in _NEGATIONS:
+            continue
+        for phrase in phrases:
+            if word == phrase[0] and tuple(words[start : start + len(phrase)]) == phrase:
+                return True
+    return False
+
+
 def _is_sdh(stream: Mapping[str, Any]) -> bool:
     if _flag(stream, "hearing_impaired"):
         return True
-    return _SDH_TITLE.search(_tag(stream, "title")) is not None
+    return _title_has(_tag(stream, "title"), _SDH_PHRASES)
 
 
 def _is_forced(stream: Mapping[str, Any]) -> bool:
-    return _flag(stream, "forced") or _FORCED_TITLE.search(_tag(stream, "title")) is not None
+    return _flag(stream, "forced") or _title_has(_tag(stream, "title"), _FORCED_PHRASES)
 
 
 def _subtitle_stream(stream: Mapping[str, Any]) -> SubtitleStream:
