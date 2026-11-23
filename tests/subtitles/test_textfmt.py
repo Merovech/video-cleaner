@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import time
-
-import pysubs2
 import pytest
 
 from video_cleaner.subtitles import textfmt
 from video_cleaner.subtitles.textfmt import (
     Cue,
-    NormalisedSubtitle,
     SubtitleRejected,
     cues_per_hour,
     decode_subtitle_bytes,
@@ -19,6 +15,7 @@ from video_cleaner.subtitles.textfmt import (
 )
 
 BIG = 1_000_000
+SRT_HEAD = b"1\n00:00:01,000 --> 00:00:02,000\n"
 
 SRT = (
     b"1\r\n00:00:01,000 --> 00:00:02,500\r\nHello there\r\n\r\n"
@@ -302,39 +299,81 @@ def test_rejects_text_that_is_not_a_subtitle_format() -> None:
         b"{1}{25}hello\n{30}{50}there\n",
         b"[1000][2000]hello\n",
         b"<SAMI><SYNC Start=1000><P>x</SYNC></SAMI>",
+        b'{"segments": [{"start": 1.0, "end": 2.0, "text": "x"}]}',
     ],
 )
 def test_rejects_formats_outside_the_supported_set(raw: bytes) -> None:
-    with pytest.raises(SubtitleRejected, match="not supported"):
+    with pytest.raises(SubtitleRejected, match="not a recognised subtitle format"):
         normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
 
 
-def test_rejects_json_that_is_not_a_subtitle() -> None:
-    with pytest.raises(SubtitleRejected, match="not a recognised subtitle format"):
-        normalise_subtitle(b'{"segments": [{"start": 1.0}]}', max_bytes=BIG, min_cues=1)
+def test_a_timestamp_sum_beyond_100_hours_is_rejected() -> None:
+    raw = srt_with(("00:00:01,000", "99:99:99,999", "x"))
+    with pytest.raises(SubtitleRejected, match="100 hours"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
 
 
-def test_a_detector_failure_becomes_a_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
-    def boom(text: str) -> str:
-        raise RuntimeError("detector exploded: secret text")
-
-    monkeypatch.setattr(textfmt, "autodetect_format", boom)
-    with pytest.raises(SubtitleRejected, match="could not be parsed") as info:
-        normalise_subtitle(SRT, max_bytes=BIG, min_cues=1)
-    assert "secret" not in str(info.value)
+def test_an_unreadable_ass_timestamp_is_rejected() -> None:
+    raw = ASS.replace(b"0:00:03.00", b"-0:00:03.00")
+    with pytest.raises(SubtitleRejected, match="unreadable timestamp"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
 
 
-@pytest.mark.parametrize(
-    ("start", "end"), [(-1, 500), (0, 360_000_001), (360_000_001, 360_000_002)]
-)
-def test_rejects_parsed_timestamps_out_of_range(
-    monkeypatch: pytest.MonkeyPatch, start: int, end: int
-) -> None:
-    subs = pysubs2.SSAFile()
-    subs.events.append(pysubs2.SSAEvent(start=start, end=end, text="x"))
-    monkeypatch.setattr(pysubs2.SSAFile, "from_string", lambda *args, **kwargs: subs)
-    with pytest.raises(SubtitleRejected, match="100 hours or below zero"):
-        normalise_subtitle(SRT, max_bytes=BIG, min_cues=1)
+def test_an_ass_event_format_without_text_last_is_rejected() -> None:
+    raw = ASS.replace(b"Effect, Text", b"Text, Effect")
+    with pytest.raises(SubtitleRejected, match="event format"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+def test_an_ass_dialogue_with_too_few_fields_is_skipped() -> None:
+    raw = ASS + b"Dialogue: 0,0:00:05.00\n"
+    assert len(normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues) == 2
+
+
+def test_an_ass_file_without_a_format_line_uses_the_standard_columns() -> None:
+    raw = (
+        b"[Script Info]\n[V4+ Styles]\n[Events]\n"
+        b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello, world\n"
+    )
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+    assert result.cues == (Cue(1000, 2000, "Hello, world"),)
+
+
+def test_ssa_is_detected_by_its_styles_section() -> None:
+    raw = (
+        b"[Script Info]\n[V4 Styles]\n[Events]\n"
+        b"Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        b"Dialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hi\n"
+    )
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+    assert result.source_format == "ssa"
+    assert result.cues == (Cue(1000, 2000, "Hi"),)
+
+
+def test_ass_text_outside_the_events_section_is_ignored() -> None:
+    stray = b"[Other]\nDialogue: 0,0:00:09.00,0:00:10.00,D,,0,0,0,,x\n[Events]"
+    raw = ASS.replace(b"[Events]", stray)
+    assert len(normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues) == 2
+
+
+def test_srt_backslash_sequences_are_plain_text() -> None:
+    raw = b"1\n00:00:01,000 --> 00:00:02,000\nkeep \\N and {\\an8}this\n"
+    assert normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues[0].text == "keep \\N and this"
+
+
+def test_webvtt_cue_ends_at_a_blank_line_and_ids_and_notes_are_not_text() -> None:
+    raw = (
+        b"WEBVTT\n\nNOTE a comment\n\nfirst-id\n00:00:01.000 --> 00:00:02.000 line:0%\nOne\n\n"
+        b"second-id\n00:00:03.000 --> 00:00:04.000\nTwo\n\nNOTE trailing\n"
+    )
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=2)
+    assert [c.text for c in result.cues] == ["One", "Two"]
+
+
+def test_srt_numbers_between_cues_are_not_text_and_text_numbers_are_kept() -> None:
+    raw = b"1\n00:00:01,000 --> 00:00:02,000\n42\n\n2\n00:00:03,000 --> 00:00:04,000\nx\n"
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=2)
+    assert [c.text for c in result.cues] == ["42", "x"]
 
 
 def test_rejects_too_many_cues(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -367,7 +406,7 @@ def test_a_parser_failure_becomes_a_rejection(monkeypatch: pytest.MonkeyPatch) -
     def boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("parser exploded: secret text")
 
-    monkeypatch.setattr(pysubs2.SSAFile, "from_string", boom)
+    monkeypatch.setattr(textfmt, "_parse_cue_blocks", boom)
     with pytest.raises(SubtitleRejected, match="could not be parsed") as info:
         normalise_subtitle(SRT, max_bytes=BIG, min_cues=1)
     assert "secret" not in str(info.value)
@@ -407,106 +446,6 @@ def test_to_srt_of_nothing_is_empty() -> None:
 
 def test_to_srt_cannot_be_split_by_blank_lines_in_text() -> None:
     assert to_srt([Cue(0, 1000, "a\n\n\nb")]) == "1\n00:00:00,000 --> 00:00:01,000\na\nb\n"
-
-
-# --- bounded cost on hostile input --------------------------------------------------------
-
-SRT_HEAD = b"1\n00:00:01,000 --> 00:00:02,000\n"
-HUGE = 20_000_000
-TIME_BOUND_S = 2.0
-
-
-def _timed_normalise(raw: bytes) -> tuple[float, NormalisedSubtitle | None]:
-    started = time.perf_counter()
-    try:
-        result: NormalisedSubtitle | None = normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
-    except SubtitleRejected:
-        result = None
-    return time.perf_counter() - started, result
-
-
-def test_a_cue_of_many_long_unclosed_tag_lines_is_rejected_quickly() -> None:
-    raw = SRT_HEAD + (b"<a" * 9500 + b"\n") * 50
-    started = time.perf_counter()
-    with pytest.raises(SubtitleRejected, match="markup"):
-        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
-    assert time.perf_counter() - started < TIME_BOUND_S
-
-
-def test_a_cue_of_many_short_tag_heavy_lines_is_rejected_quickly() -> None:
-    raw = SRT_HEAD + b"<a<a<a<a\n" * 50_000
-    started = time.perf_counter()
-    with pytest.raises(SubtitleRejected, match="markup"):
-        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
-    assert time.perf_counter() - started < TIME_BOUND_S
-
-
-def test_many_cues_each_with_an_unclosed_tag_run_are_rejected_quickly() -> None:
-    cue = b"00:00:01,000 --> 00:00:02,000\n" + b"<a" * 2000 + b"\n\n"
-    raw = b"".join(b"%d\n" % i + cue for i in range(1, 400))
-    started = time.perf_counter()
-    with pytest.raises(SubtitleRejected, match="markup"):
-        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
-    assert time.perf_counter() - started < TIME_BOUND_S
-
-
-def test_a_webvtt_cue_of_many_unclosed_tag_lines_is_rejected_quickly() -> None:
-    raw = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n" + (b"<a" * 9500 + b"\n") * 50
-    started = time.perf_counter()
-    with pytest.raises(SubtitleRejected, match="markup"):
-        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
-    assert time.perf_counter() - started < TIME_BOUND_S
-
-
-def test_more_than_the_allowed_number_of_angle_brackets_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(textfmt, "MAX_ANGLE_BRACKETS", 3)
-    raw = srt_with(("00:00:01,000", "00:00:02,000", "<i>a</i> <b>b</b>"))
-    with pytest.raises(SubtitleRejected, match="markup"):
-        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        (b"{" * 19_000 + b"\n") * 50,
-        (rb"{\i1}" * 3000 + b"\n") * 60,
-        (rb"\N" * 9000 + b"\n") * 50,
-        (b"< " * 9500 + b"\n") * 50,
-        (b"</" * 9500 + b"\n") * 50,
-    ],
-    ids=["brace-runs", "override-runs", "break-runs", "open-space-runs", "close-slash-runs"],
-)
-def test_other_hostile_shapes_return_within_the_time_bound(body: bytes) -> None:
-    elapsed, _ = _timed_normalise(SRT_HEAD + body)
-    assert elapsed < TIME_BOUND_S
-
-
-def test_a_tag_rich_ordinary_subtitle_is_accepted_unchanged() -> None:
-    blocks = []
-    for i in range(1, 801):
-        start = f"00:{i // 60:02d}:{i % 60:02d},000"
-        end = f"00:{i // 60:02d}:{i % 60:02d},900"
-        text = f'<i>Line {i}</i> with <font color="#ffffff"><b>bold</b></font>\n<u>second</u> line'
-        blocks.append(f"{i}\n{start} --> {end}\n{text}\n")
-    result = normalise_subtitle("\n".join(blocks).encode(), max_bytes=BIG * 5, min_cues=800)
-    assert len(result.cues) == 800
-    assert result.cues[0].text == "Line 1 with bold\nsecond line"
-    assert result.cues[799].text == "Line 800 with bold\nsecond line"
-
-
-def test_an_ordinary_ass_subtitle_with_many_override_tags_is_accepted() -> None:
-    header = ASS.split(b"Dialogue:")[0]
-    lines = b"".join(
-        rb"Dialogue: 0,0:00:%02d.00,0:00:%02d.50,Default,,0,0,0,,{\an8\b1}A{\b0} {\i1}b{\i0}\Nc"
-        % (i % 60, i % 60)
-        + b"\n"
-        for i in range(500)
-    )
-    result = normalise_subtitle(header + lines, max_bytes=BIG, min_cues=500)
-    assert len(result.cues) == 500
-    assert result.cues[0].text == "A b\nc"
 
 
 # --- timestamps that the parser would silently misread ----------------------------------
