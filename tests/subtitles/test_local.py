@@ -575,3 +575,63 @@ def test_a_sequel_subtitle_is_picked_over_the_original_for_the_sequel() -> None:
     result = match_local(index, parse_library_name(Path("Dune Part Two (2024).mkv")))
 
     assert result == LocalCandidate(index[1].path, 1.0)
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Jackass.2.5.2007", "Jackass (2002).mkv"),
+        ("Jackass.2.5.2007", "Jackass (2007).mkv"),
+        ("Jackass.2.5.2007.1080p.BluRay.x264.en", "Jackass (2002).mkv"),
+        ("Naked.Gun.2.5.1991", "Naked Gun (1991).mkv"),
+        ("Naked.Gun.2.5.1991", "The Naked Gun (1988).mkv"),
+        ("Naked.Gun.33.1-3.1994", "Naked Gun (1994).mkv"),
+        ("Naked.Gun.33.1-3.1994", "The Naked Gun (1988).mkv"),
+        # The other way round: the library file carries the number, the subtitle does not.
+        ("Jackass.2002.en", "Jackass 2.5 (2007).mkv"),
+        ("Jackass.en", "Jackass 2.5 (2007).mkv"),
+        ("Naked.Gun.1991", "The Naked Gun 2 1-2 (1991).mkv"),
+        ("Naked.Gun.1991", "The Naked Gun 2½ (1991).mkv"),
+        ("Dune.2021", "Dune Pt 2.mkv"),
+        ("Dune.2021", "Dune Pt. 2.mkv"),
+        ("Dune.2021", "Dune (2021)/Dune Pt 2.mkv"),
+        ("Dune.2021", "Dune (2021)/Dune Pt. 2.mkv"),
+    ],
+)
+def test_a_dropped_or_odd_number_never_leads_to_the_wrong_movie(release: str, library: str) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Jackass.2.5.1080p.en", "Jackass 2.5.mkv"),
+        ("Ocean's.11.2001", "Ocean's 11 (2001).mkv"),
+        ("Se7en.1995", "Se7en (1995).mkv"),
+        ("Apollo.13.1995", "Apollo 13 (1995).mkv"),
+        ("1917.2019", "1917 (2019).mkv"),
+        ("2012.2009", "2012 (2009).mkv"),
+        ("10.Things.I.Hate.About.You.1999", "10 Things I Hate About You (1999).mkv"),
+        ("300.2006", "300 (2006).mkv"),
+        ("21.Jump.Street.2012", "21 Jump Street (2012).mkv"),
+        ("District.9.2009", "District 9 (2009).mkv"),
+        ("Blade.Runner.2049.2017", "Blade Runner 2049 (2017).mkv"),
+        ("Movie.2010.1080p.BluRay.DD5.1.x264-GRP", "Movie (2010).mkv"),
+        ("Movie.2010.AAC2.0.h264", "Movie (2010).mkv"),
+        ("Movie.2010.DTS-HD.7.1", "Movie (2010).mkv"),
+        ("Movie.2010.2160p.HDR.x265.10bit", "Movie (2010).mkv"),
+        ("Movie.2010.720p.WEB-DL.DDP5.1.H.264-GRP", "Movie (2010).mkv"),
+        ("Movie.2010.BluRay.1080p.x264.AC3.5.1-GRP", "Movie (2010).mkv"),
+        ("Movie.2010.WEBRip.x264.AAC.2.0", "Movie (2010).mkv"),
+        ("Promising.Young.Woman.2020.1080p.BluRay.x264.en.MX]", "Promising Young Woman (2020).mkv"),
+    ],
+)
+def test_legitimate_releases_with_numbers_still_match_their_own_library_name(
+    release: str, library: str
+) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is not None
+    assert result.path == Path("subs") / f"{release}.srt"

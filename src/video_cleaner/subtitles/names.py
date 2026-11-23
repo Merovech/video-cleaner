@@ -16,6 +16,7 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
 from guessit import guessit
 
@@ -52,10 +53,12 @@ _NUMBER_WORDS = {
         )
     },
 }
+# guessit results that say nothing about where the title area ends.
+_STRUCTURAL_KEYS = frozenset({"title", "type"})
 _PART_WORDS = frozenset({"part", "volume", "chapter", "episode"})
 _WORD_ALIASES = {"pt": "part", "vol": "volume"}
 # A trailing "pt1"/"cd2"/"part 3" marker, and a "(1922)" year closing the name before it.
-_PART_WORD = re.compile(r"part", re.IGNORECASE)
+_PART_WORD = re.compile(r"part|pt", re.IGNORECASE)
 _YEAR_AT_END = re.compile(r"\((?:18|19|20)[0-9]{2}\)\s*\Z")
 # Titles that differ in a sequel number are different films however alike the rest is.
 _NUMBER_MISMATCH_CAP = 0.5
@@ -80,24 +83,73 @@ def parse_release_name(name: str) -> TitleYear:
     the name without a real extension. The type is forced to "movie" because guessit otherwise
     reads "2020.en.264" as season 2, episode 64; an episode is still told by its season and
     episode numbers. Only the first `MAX_NAME_CHARS` characters are read.
+
+    A number guessit drops from the title would make a different film look the same ("Jackass
+    2.5" is read as the title "Jackass" and a date), so such a name is unmatchable: its title is
+    empty. That is a safe miss rather than a repair, because the lost number cannot be told from
+    a release tag in general; see `_dropped_a_number`.
     """
     text = name[:MAX_NAME_CHARS]
     try:
-        guess = guessit(text, {"type": "movie"})
+        found = guessit(text, {"type": "movie", "advanced": True})
     except Exception:  # guessit's rule engine can fail on odd input; one name must not stop a run
         _log.debug("guessit failed on a name of %d characters", len(text), exc_info=True)
         return _empty()
-    raw_title = guess.get("title")
-    title = raw_title if isinstance(raw_title, str) else ""
-    title = title.strip()
+    guess = {key: _matches(match) for key, match in found.items()}
+    raw_title = _value(guess, "title")
+    title = raw_title.strip() if isinstance(raw_title, str) else ""
+    raw_year = _value(guess, "year")
+    year = raw_year if isinstance(raw_year, int) and _MIN_YEAR <= raw_year <= _MAX_YEAR else None
+    is_episode = _value(guess, "season") is not None or _value(guess, "episode") is not None
+    if title and _dropped_a_number(text, title, guess):
+        return TitleYear(title="", year=year, is_episode=is_episode)
     if title:
         # guessit moves "Part II" and "Vol 2" out of the title; they say which film it is.
-        title = " ".join([title, *_numbered(guess.get("part"), "Part")])
-        title = " ".join([title, *_numbered(guess.get("volume"), "Volume")])
-    raw_year = guess.get("year")
-    year = raw_year if isinstance(raw_year, int) and _MIN_YEAR <= raw_year <= _MAX_YEAR else None
-    is_episode = guess.get("season") is not None or guess.get("episode") is not None
+        title = " ".join([title, *_numbered(_value(guess, "part"), "Part")])
+        title = " ".join([title, *_numbered(_value(guess, "volume"), "Volume")])
     return TitleYear(title=title, year=year, is_episode=is_episode)
+
+
+def _matches(found: object) -> list[Any]:
+    return list(found) if isinstance(found, list) else [found]
+
+
+def _value(guess: dict[str, list[Any]], key: str) -> Any:
+    """The value guessit found for *key* (a list when it found several), or None."""
+    matches = guess.get(key)
+    if not matches:
+        return None
+    values = [match.value for match in matches]
+    return values[0] if len(values) == 1 else values
+
+
+def _dropped_a_number(text: str, title: str, guess: dict[str, list[Any]]) -> bool:
+    """Whether a number in the name's title area did not reach the parsed title.
+
+    The title area is the text before the first tag guessit recognised after the title (the
+    year, a resolution, a part marker...). Digit runs inside tags that came before the title
+    ("[1080p] Movie") are ignored. A date match means guessit read "2.5.2007" or "33.1-3" as a
+    date, which is always a number lost from the title.
+    """
+    if "date" in guess:
+        return True
+    title_start, title_end = guess["title"][0].span  # the caller has a title, so it exists
+    tags = [
+        match.span
+        for key, matches in guess.items()
+        if key not in _STRUCTURAL_KEYS
+        for match in matches
+        if match.span[1] > match.span[0]
+    ]
+    cutoff = min((start for start, _ in tags if start >= title_end), default=len(text))
+    before_title = [(start, end) for start, end in tags if end <= title_start]
+    kept = set(re.findall(r"[0-9]+", title))
+    for run in re.finditer(r"[0-9]+", text[:cutoff]):
+        if any(start <= run.start() < end for start, end in before_title):
+            continue
+        if run.group() not in kept:
+            return True
+    return False
 
 
 def _numbered(value: object, label: str) -> list[str]:
@@ -127,8 +179,8 @@ def _without_extension(name: str) -> str:
 def _without_split_marker(stem: str) -> str:
     """Drop a trailing "pt1"/"cd1" marker that says the file is one piece of the movie.
 
-    A "part" marker only counts after the year ("Title (1922) - pt1"): on a bare name,
-    "Dune Part 2" is a sequel's title.
+    A "part" or "pt" marker only counts after the year ("Title (1922) - pt1"): on a bare name,
+    "Dune Part 2" and "Dune Pt 2" are a sequel's title. A "cd" marker is always a split file.
     """
     split = split_part_marker(stem)
     if split is None:

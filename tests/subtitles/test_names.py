@@ -351,7 +351,11 @@ def test_a_part_marker_is_stripped_only_where_it_marks_a_split_file() -> None:
     assert parse_library_name(Path("Movie (2010) - pt1.mkv")).title == "Movie"
     assert parse_library_name(Path("Movie (2010) - part 2.mkv")).title == "Movie"
     assert parse_library_name(Path("Movie - cd1.mkv")).title == "Movie"
-    assert parse_library_name(Path("Movie.pt2.mkv")).title == "Movie"
+    # No closing year: "pt" is a sequel marker exactly like "part", so the number stays.
+    assert parse_library_name(Path("Movie.pt2.mkv")).title == "Movie Part 2"
+    assert parse_library_name(Path("Movie - pt1.mkv")).title == "Movie Part 1"
+    assert parse_library_name(Path("Dune Pt 2.mkv")).title == "Dune Part 2"
+    assert parse_library_name(Path("Dune Pt. 2.mkv")).title in {"Dune Part 2", "Dune Pt 2"}
     # A bare "Part 2" on a name with no year is a sequel's title, not a split file.
     assert parse_library_name(Path("Dune - Part 2.mkv")).title == "Dune Part 2"
 
@@ -367,3 +371,100 @@ def test_a_name_made_of_separators_is_bounded_before_any_pattern_runs() -> None:
         parse_library_name(Path("Folder " + hostile[:200]) / hostile)
 
     assert time.monotonic() - started < 10.0
+
+
+@pytest.mark.parametrize("name", ["Dune Pt 2.mkv", "Dune Pt. 2.mkv", "Dune - Pt 2.mkv"])
+def test_a_year_less_pt_sequel_keeps_its_number_and_the_folders_year_is_not_borrowed(
+    name: str,
+) -> None:
+    parsed = parse_library_name(Path("Dune (2021)") / name)
+
+    assert normalise_title(parsed.title) == "dune part 2"
+    assert parsed.year is None
+
+
+def test_a_split_file_marker_after_the_year_is_still_stripped() -> None:
+    assert parse_library_name(Path("Dr. Mabuse the Gambler (1922) - pt1.mkv")) == TitleYear(
+        "Dr. Mabuse the Gambler", 1922
+    )
+    assert parse_library_name(Path("Movie (2010) - cd2.mkv")).title == "Movie"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Jackass.2.5.2007",
+        "Jackass.2.5.2007.1080p.BluRay.x264.en",
+        "Naked.Gun.2.5.1991",
+        "Naked.Gun.33.1-3.1994",
+        "Movie.2010.5.1",
+        "The Naked Gun 2 1/2.en",
+    ],
+)
+def test_a_release_whose_number_guessit_dropped_is_unmatchable(name: str) -> None:
+    parsed = parse_release_name(name)
+
+    assert parsed.title == ""
+    assert parsed.is_episode is False
+
+
+@pytest.mark.parametrize(
+    ("name", "title", "year"),
+    [
+        ("Ocean's.11.2001", "Ocean's 11", 2001),
+        ("Se7en.1995", "Se7en", 1995),
+        ("Apollo.13.1995", "Apollo 13", 1995),
+        ("1917.2019", "1917", 2019),
+        ("2012.2009", "2012", 2009),
+        ("10.Things.I.Hate.About.You.1999", "10 Things I Hate About You", 1999),
+        ("300.2006", "300", 2006),
+        ("21.Jump.Street.2012", "21 Jump Street", 2012),
+        ("District.9.2009", "District 9", 2009),
+        ("Blade.Runner.2049.2017", "Blade Runner 2049", 2017),
+        ("Toy.Story.3.2010.en", "Toy Story 3", 2010),
+        ("Mad.Max.2.1981", "Mad Max 2", 1981),
+        ("Alien.3.1992", "Alien 3", 1992),
+        ("Jackass.2.5.1080p", "Jackass 2.5.", None),
+        ("Movie.2010.1080p.BluRay.DD5.1.x264-GRP", "Movie", 2010),
+        ("Movie.2010.AAC2.0.h264", "Movie", 2010),
+        ("Movie.2010.DTS-HD.7.1", "Movie", 2010),
+        ("Movie.2010.2160p.HDR.x265.10bit", "Movie", 2010),
+        ("Movie.2010.720p.WEB-DL.DDP5.1.H.264-GRP", "Movie", 2010),
+        ("Movie.2010.BluRay.1080p.x264.AC3.5.1-GRP", "Movie", 2010),
+        ("Movie.Name.1080p.BluRay.x264.5.1", "Movie Name", None),
+        ("Movie.2010.NF.WEB-DL.DDP2.0.H.264", "Movie", 2010),
+        ("Movie.2010.1080p.BluRay.FLAC.2.0.x264", "Movie", 2010),
+        ("Movie.2010.WEBRip.x264.AAC.2.0", "Movie", 2010),
+        ("Movie.2010.Dual.Audio.DD+5.1", "Movie", 2010),
+        ("Movie.2010.2.0", "Movie", 2010),
+        ("Movie.2010.v2", "Movie", 2010),
+        ("Movie.2010.REPACK2", "Movie", 2010),
+        ("Movie.2010.24fps", "Movie", 2010),
+        ("[1080p] Movie.2010", "Movie", 2010),
+        ("[YTS.MX] Movie.2010.1080p", "Movie", 2010),
+        ("Promising.Young.Woman.2020.1080p.BluRay.x264.en.MX]", "Promising Young Woman", 2020),
+    ],
+)
+def test_legitimate_numbers_in_release_names_still_parse(
+    name: str, title: str, year: int | None
+) -> None:
+    parsed = parse_release_name(name)
+
+    assert (parsed.title, parsed.year) == (title, year)
+
+
+def test_library_names_keep_a_decimal_or_fractional_number() -> None:
+    # A file name cannot hold "1/2", so a fraction is written "1-2" or as the one-half sign.
+    jackass = parse_library_name(Path("Jackass 2.5 (2007).mkv"))
+    dashed = parse_library_name(Path("The Naked Gun 2 1-2 (1991).mkv"))
+    half = parse_library_name(Path("The Naked Gun 2½ (1991).mkv"))
+
+    assert jackass == TitleYear("Jackass 2.5", 2007)
+    assert dashed == TitleYear("The Naked Gun 2 1-2", 1991)
+    assert half == TitleYear("The Naked Gun 2½", 1991)
+    for parsed, original in (
+        (jackass, "Jackass"),
+        (dashed, "The Naked Gun"),
+        (half, "The Naked Gun"),
+    ):
+        assert title_similarity(parsed.title, original) <= 0.5
