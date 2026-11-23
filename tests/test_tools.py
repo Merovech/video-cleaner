@@ -446,6 +446,46 @@ def test_run_tool_stops_heartbeat_thread_after_return() -> None:
     assert leftover == []
 
 
+# --- heartbeat ------------------------------------------------------------------------------
+
+
+def test_heartbeat_beats_while_the_block_runs_and_stops_after() -> None:
+    reporter = FakeReporter()
+    before = {t.name for t in threading.enumerate()}
+    with tools.heartbeat(reporter, "waiting", 0.05):
+        time.sleep(0.4)
+    assert len(reporter.heartbeats) >= 2
+    assert {label for label, _ in reporter.heartbeats} == {"waiting"}
+    elapsed = [e for _, e in reporter.heartbeats]
+    assert elapsed == sorted(elapsed)
+    count = len(reporter.heartbeats)
+    time.sleep(0.2)
+    assert len(reporter.heartbeats) == count  # nothing after the block
+    assert [t for t in threading.enumerate() if t.name not in before] == []
+
+
+def test_heartbeat_stops_when_the_block_raises() -> None:
+    reporter = FakeReporter()
+    with pytest.raises(RuntimeError, match="boom"), tools.heartbeat(reporter, "x", 0.05):
+        raise RuntimeError("boom")
+    count = len(reporter.heartbeats)
+    time.sleep(0.2)
+    assert len(reporter.heartbeats) == count
+
+
+def test_heartbeat_survives_a_failing_reporter(caplog: pytest.LogCaptureFixture) -> None:
+    class Failing(FakeReporter):
+        def heartbeat(self, label: str, elapsed_s: float) -> None:
+            raise RuntimeError("reporter down")
+
+    with (
+        caplog.at_level(logging.ERROR, logger="video_cleaner.tools"),
+        tools.heartbeat(Failing(), "x", 0.05),
+    ):
+        time.sleep(0.2)
+    assert any("heartbeat failed" in r.getMessage() for r in caplog.records)
+
+
 # --- locate_tools ---------------------------------------------------------------------------
 
 

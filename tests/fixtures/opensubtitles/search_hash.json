@@ -1,0 +1,134 @@
+{
+  "total_pages": 1,
+  "total_count": 7,
+  "per_page": 60,
+  "page": 1,
+  "data": [
+    {
+      "id": "1000001",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000001",
+        "language": "en",
+        "download_count": 120,
+        "new_download_count": 20,
+        "hearing_impaired": false,
+        "hd": true,
+        "fps": 23.976,
+        "votes": 0,
+        "ratings": 0.0,
+        "from_trusted": false,
+        "foreign_parts_only": false,
+        "ai_translated": false,
+        "machine_translated": false,
+        "upload_date": "2020-01-01T00:00:00Z",
+        "release": "Fake.Movie.2001.1080p.FAKE.release-GROUPA",
+        "moviehash_match": false,
+        "feature_details": {
+          "feature_id": 1,
+          "feature_type": "Movie",
+          "year": 2001,
+          "title": "Fake Movie",
+          "movie_name": "2001 - Fake Movie",
+          "imdb_id": 1,
+          "tmdb_id": 1
+        },
+        "url": "https://www.opensubtitles.com/en/subtitles/legacy/1000001",
+        "files": [{"file_id": 5000001, "cd_number": 1, "file_name": "FAKE-FILE-NAME-ONE.srt"}]
+      }
+    },
+    {
+      "id": "1000002",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000002",
+        "language": "en",
+        "download_count": 5,
+        "hearing_impaired": false,
+        "foreign_parts_only": false,
+        "release": "Fake.Movie.2001.720p.FAKE.release-GROUPB",
+        "moviehash_match": true,
+        "feature_details": {"year": 2001, "title": "Fake Movie", "movie_name": "2001 - Fake Movie"},
+        "files": [{"file_id": 5000002, "cd_number": 1, "file_name": "FAKE-FILE-NAME-TWO.srt"}]
+      }
+    },
+    {
+      "id": "1000003",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000003",
+        "language": "fr",
+        "download_count": 9999,
+        "hearing_impaired": false,
+        "foreign_parts_only": false,
+        "release": "Fake.Movie.2001.FRENCH.release-GROUPC",
+        "moviehash_match": true,
+        "feature_details": {"year": 2001, "title": "Fake Movie", "movie_name": "2001 - Fake Movie"},
+        "files": [{"file_id": 5000003, "cd_number": 1, "file_name": "FAKE-FILE-NAME-THREE.srt"}]
+      }
+    },
+    {
+      "id": "1000004",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000004",
+        "language": "en",
+        "download_count": 800,
+        "hearing_impaired": false,
+        "foreign_parts_only": true,
+        "release": "Fake.Movie.2001.FPO.release-GROUPD",
+        "moviehash_match": false,
+        "feature_details": {"year": 2001, "title": "Fake Movie"},
+        "files": [{"file_id": 5000004, "cd_number": 1, "file_name": "FAKE-FILE-NAME-FOUR.srt"}]
+      }
+    },
+    {
+      "id": "1000005",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000005",
+        "language": "en",
+        "download_count": 120,
+        "hearing_impaired": true,
+        "foreign_parts_only": false,
+        "release": "Fake.Movie.2001.SDH.release-GROUPE",
+        "moviehash_match": false,
+        "feature_details": {"year": null, "title": null, "movie_name": "Fake Movie"},
+        "files": [{"file_id": 5000005, "cd_number": 1, "file_name": "FAKE-FILE-NAME-FIVE.srt"}]
+      }
+    },
+    {
+      "id": "1000006",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000006",
+        "language": "en",
+        "download_count": 70,
+        "hearing_impaired": false,
+        "foreign_parts_only": false,
+        "release": "Fake.Movie.2001.TWO.CD.release-GROUPF",
+        "moviehash_match": false,
+        "feature_details": {"year": 2001, "title": "Fake Movie"},
+        "files": [
+          {"file_id": 5000006, "cd_number": 1, "file_name": "FAKE-FILE-NAME-SIX-CD1.srt"},
+          {"file_id": 5000007, "cd_number": 2, "file_name": "FAKE-FILE-NAME-SIX-CD2.srt"}
+        ]
+      }
+    },
+    {
+      "id": "1000008",
+      "type": "subtitle",
+      "attributes": {
+        "subtitle_id": "1000008",
+        "language": "en",
+        "download_count": 3,
+        "hearing_impaired": false,
+        "foreign_parts_only": false,
+        "release": null,
+        "moviehash_match": false,
+        "feature_details": {},
+        "files": []
+      }
+    }
+  ]
+}

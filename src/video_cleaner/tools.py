@@ -7,6 +7,7 @@ while it runs and guarantees the process is gone when it returns or raises.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -301,6 +302,36 @@ def _heartbeat_loop(
             _log.exception("heartbeat failed")
 
 
+@contextlib.contextmanager
+def heartbeat(
+    reporter: Reporter,
+    label: str,
+    interval_s: float,
+    *,
+    started: float | None = None,
+    join_timeout_s: float = _DEFAULT_JOIN_TIMEOUT_S,
+) -> Iterator[None]:
+    """Call ``reporter.heartbeat(label, elapsed)`` every *interval_s* while the block runs.
+
+    *started* is the `time.monotonic` reading the elapsed time counts from (the block's start
+    by default). The beating thread is stopped when the block ends or raises, so nothing beats
+    afterwards. A reporter that raises is logged and the beat goes on.
+    """
+    stop = threading.Event()
+    beat = threading.Thread(
+        target=_heartbeat_loop,
+        args=(stop, reporter, label, interval_s, time.monotonic() if started is None else started),
+        name="vc-heartbeat",
+        daemon=True,
+    )
+    beat.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        beat.join(timeout=join_timeout_s)
+
+
 def _wait_interruptibly(proc: subprocess.Popen[str]) -> int:
     """`proc.wait()` in slices of `_WAIT_SLICE_S`, so a KeyboardInterrupt is never stuck."""
     while True:
@@ -417,30 +448,24 @@ def run_tool(
         raise RuntimeError("subprocess pipes were not created")
     out = _StdoutCapture(proc.stdout, parser, reporter)
     err = _StderrCapture(proc.stderr, stderr_log)
-    stop = threading.Event()
     readers = [
         threading.Thread(target=out.run, name="vc-stdout", daemon=True),
         threading.Thread(target=err.run, name="vc-stderr", daemon=True),
     ]
-    beat = threading.Thread(
-        target=_heartbeat_loop,
-        args=(stop, reporter, label, heartbeat_s, started),
-        name="vc-heartbeat",
-        daemon=True,
-    )
     stuck: list[str] = []
     try:
-        for thread in (*readers, beat):
+        for thread in readers:
             thread.start()
-        returncode = _wait_interruptibly(proc)
+        with heartbeat(
+            reporter, label, heartbeat_s, started=started, join_timeout_s=join_timeout_s
+        ):
+            returncode = _wait_interruptibly(proc)
     except BaseException:
         _stop_process(proc)
         raise
     finally:
-        stop.set()
         # One shared deadline, so two stuck readers cost one timeout, not two.
         deadline = time.monotonic() + join_timeout_s
-        beat.join(timeout=max(0.0, deadline - time.monotonic()))
         for thread, capture in zip(readers, (out, err), strict=True):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
