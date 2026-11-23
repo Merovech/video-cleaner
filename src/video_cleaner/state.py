@@ -24,8 +24,9 @@ from types import TracebackType
 from typing import Any
 
 from video_cleaner.probe import MediaInfo
+from video_cleaner.subtitles.models import QuotaInfo
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _BUSY_TIMEOUT_S = 30.0
 
 
@@ -53,6 +54,14 @@ class Status(StrEnum):
     FLAGGED = "flagged"
     RETRY = "retry"
     STALE = "stale"
+
+
+class SubtitleStatus(StrEnum):
+    WANTED = "wanted"
+    FOUND = "found"
+    NOT_NEEDED = "not_needed"
+    UNAVAILABLE = "unavailable"
+    UNCLEAR = "unclear"
 
 
 # decision -> status a freshly planned file starts in
@@ -87,7 +96,33 @@ IN_PROGRESS = (
 )
 _INTERRUPTED_NOTE = "reset after interrupted run"
 
-_SCHEMA = """
+# One row per (first-part path, size, mtime), like `files`, so an original that was overwritten
+# starts with a fresh subtitle outcome. Created for a new database by `_SCHEMA` and added to an
+# older one by migration 4; hence "IF NOT EXISTS".
+_SUBTITLES_TABLE = """
+CREATE TABLE IF NOT EXISTS subtitles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime REAL NOT NULL,
+    status TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT '',
+    cache_path TEXT,
+    sha256 TEXT NOT NULL DEFAULT '',
+    provenance TEXT NOT NULL DEFAULT '',
+    hash_exact INTEGER NOT NULL DEFAULT 0,
+    english_audio INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    tried_ids TEXT NOT NULL DEFAULT '[]',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    UNIQUE (path, size, mtime)
+)
+"""
+_SUBTITLES_INDEX = "CREATE INDEX IF NOT EXISTS subtitles_status ON subtitles (status)"
+
+_SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,8 +148,15 @@ CREATE TABLE IF NOT EXISTS events (
     line TEXT NOT NULL
 );
 """
+    + _SUBTITLES_TABLE
+    + ";\n"
+    + _SUBTITLES_INDEX
+    + ";\n"
+)
 
 _PLAN_HASH_KEY = "plan_ack_hash"
+_QUOTA_REMAINING_KEY = "subtitle_quota_remaining"
+_QUOTA_RESET_KEY = "subtitle_quota_reset_at"
 _CALIBRATION_KEY = "calibration"
 _CALIBRATION_SWEPT_KEY = "calibration_swept_at"
 # The only text interpolated into SQL (the `nosec B608` lines) is this constant and runs of
@@ -127,7 +169,13 @@ _COLUMNS = (
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     2: ("ALTER TABLE files ADD COLUMN movie_hash TEXT",),
     3: ("ALTER TABLE files ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",),
+    4: (_SUBTITLES_TABLE, _SUBTITLES_INDEX),
 }
+_SUB_COLUMNS = (
+    "path, size, mtime, status, provider, cache_path, sha256, provenance, hash_exact, "
+    "english_audio, reason, tried_ids, attempts"
+)
+_SUB_COLUMNS_S = ", ".join(f"s.{c.strip()}" for c in _SUB_COLUMNS.split(","))
 
 
 @dataclass(frozen=True)
@@ -145,6 +193,26 @@ class FileRecord:
     # member part has its own record and hash). None when not computed or not computable.
     movie_hash: str | None = None
     # Runs that ended for this file in a RETRY it caused (tool failure, I/O error).
+    attempts: int = 0
+
+
+@dataclass(frozen=True)
+class SubtitleRecord:
+    """The subtitle outcome for one file, keyed like its `FileRecord` (path, size, mtime)."""
+
+    path: Path
+    size: int
+    mtime: float
+    status: SubtitleStatus
+    provider: str = ""  # "embedded" | "sidecar" | "local" | "opensubtitles"
+    cache_path: Path | None = None
+    sha256: str = ""
+    provenance: str = ""  # the track title to mux
+    hash_exact: bool = False
+    english_audio: bool = False  # the video has an English audio track
+    reason: str = ""
+    # Provider file ids already downloaded and rejected for this file, never tried again.
+    tried_ids: tuple[int, ...] = ()
     attempts: int = 0
 
 
@@ -177,6 +245,41 @@ def _record(row: Sequence[Any]) -> FileRecord:
         note=str(row[8]),
         movie_hash=None if row[9] is None else str(row[9]),
         attempts=int(row[10]),
+    )
+
+
+def _tried_ids(raw: object) -> tuple[int, ...]:
+    """The ids in a stored ``tried_ids`` value; anything but a JSON array of non-negative ints
+    reads as empty, so a damaged row costs a repeat download at worst and never an error."""
+    try:
+        data = json.loads(str(raw))
+    except ValueError:
+        return ()
+    if not isinstance(data, list):
+        return ()
+    ids: list[int] = []
+    for item in data:
+        if type(item) is not int or item < 0:
+            return ()
+        ids.append(item)
+    return tuple(ids)
+
+
+def _subtitle_record(row: Sequence[Any]) -> SubtitleRecord:
+    return SubtitleRecord(
+        path=Path(row[0]),
+        size=int(row[1]),
+        mtime=float(row[2]),
+        status=SubtitleStatus(row[3]),
+        provider=str(row[4]),
+        cache_path=None if row[5] is None else Path(row[5]),
+        sha256=str(row[6]),
+        provenance=str(row[7]),
+        hash_exact=bool(row[8]),
+        english_audio=bool(row[9]),
+        reason=str(row[10]),
+        tried_ids=_tried_ids(row[11]),
+        attempts=int(row[12]),
     )
 
 
@@ -495,6 +598,190 @@ class State:
         for status, n in rows:
             result[Status(status)] = int(n)
         return result
+
+    # -- subtitles --------------------------------------------------------------------------
+
+    def subtitle(self, path: Path, size: int, mtime: float) -> SubtitleRecord | None:
+        """The subtitle record for exactly this (path, size, mtime), or None."""
+        key = _key(path)
+        with self._tx() as conn:
+            row = self._subtitle_row(conn, key, size, mtime)
+        return None if row is None else _subtitle_record(row)
+
+    @staticmethod
+    def _subtitle_row(
+        conn: sqlite3.Connection, key: str, size: int, mtime: float
+    ) -> Sequence[Any] | None:
+        row: Sequence[Any] | None = conn.execute(
+            f"SELECT {_SUB_COLUMNS} FROM subtitles "  # noqa: S608  # nosec B608
+            "WHERE path = ? AND size = ? AND mtime = ?",
+            (key, size, mtime),
+        ).fetchone()
+        return row
+
+    def set_subtitle(self, rec: SubtitleRecord) -> None:
+        """Store *rec*, replacing any record for its (path, size, mtime), in one transaction.
+
+        A FOUND record is never downgraded to WANTED (a stale writer cannot undo a result);
+        that write changes nothing. Every other change goes through, including FOUND to
+        another outcome. Raises ValueError for a *tried_ids* entry that is not a
+        non-negative int.
+        """
+        key = _key(rec.path)
+        cache = None if rec.cache_path is None else _key(rec.cache_path)
+        if any(type(i) is not int or i < 0 for i in rec.tried_ids):
+            raise ValueError(f"tried_ids must be non-negative ints, got {rec.tried_ids!r}")
+        tried = json.dumps(list(rec.tried_ids))
+        with self._tx(write=True) as conn:
+            existing = self._subtitle_row(conn, key, rec.size, rec.mtime)
+            old = None if existing is None else SubtitleStatus(existing[3])
+            if old is SubtitleStatus.FOUND and rec.status is SubtitleStatus.WANTED:
+                return
+            conn.execute(
+                "INSERT INTO subtitles (path, size, mtime, status, provider, cache_path, sha256, "
+                "provenance, hash_exact, english_audio, reason, tried_ids, attempts, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(path, size, mtime) DO UPDATE SET status = excluded.status, "
+                "provider = excluded.provider, cache_path = excluded.cache_path, "
+                "sha256 = excluded.sha256, provenance = excluded.provenance, "
+                "hash_exact = excluded.hash_exact, english_audio = excluded.english_audio, "
+                "reason = excluded.reason, tried_ids = excluded.tried_ids, "
+                "attempts = excluded.attempts, updated_at = excluded.updated_at",
+                (
+                    key,
+                    rec.size,
+                    rec.mtime,
+                    rec.status.value,
+                    rec.provider,
+                    cache,
+                    rec.sha256,
+                    rec.provenance,
+                    int(rec.hash_exact),
+                    int(rec.english_audio),
+                    rec.reason,
+                    tried,
+                    rec.attempts,
+                    _now(),
+                ),
+            )
+            if old is not rec.status:
+                self._event(
+                    conn,
+                    f"{key}: subtitle {'new' if old is None else old.value} -> {rec.status.value}",
+                )
+
+    def ensure_wanted(
+        self, path: Path, size: int, mtime: float, *, english_audio: bool
+    ) -> SubtitleRecord:
+        """The subtitle record for this (path, size, mtime), creating a WANTED one if absent.
+
+        An existing record is never overwritten; only a still-WANTED one takes the new
+        *english_audio* flag. Returns the record as stored.
+        """
+        key = _key(path)
+        with self._tx(write=True) as conn:
+            row = self._subtitle_row(conn, key, size, mtime)
+            if row is None:
+                conn.execute(
+                    "INSERT INTO subtitles (path, size, mtime, status, english_audio, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (key, size, mtime, SubtitleStatus.WANTED.value, int(english_audio), _now()),
+                )
+                self._event(conn, f"{key}: subtitle new -> {SubtitleStatus.WANTED.value}")
+            elif (
+                SubtitleStatus(row[3]) is SubtitleStatus.WANTED
+                and bool(row[9]) is not english_audio
+            ):
+                conn.execute(
+                    "UPDATE subtitles SET english_audio = ?, updated_at = ? "
+                    "WHERE path = ? AND size = ? AND mtime = ?",
+                    (int(english_audio), _now(), key, size, mtime),
+                )
+            stored = self._subtitle_row(conn, key, size, mtime)
+        if stored is None:  # pragma: no cover - inserted or found above, in the same transaction
+            raise StateError(f"subtitle record for {path} vanished during its own transaction")
+        return _subtitle_record(stored)
+
+    def wanted_subtitles(self, limit: int | None = None) -> list[SubtitleRecord]:
+        """WANTED subtitle records, ordered like the encode queue.
+
+        Largest estimated saving first, taken from the live `files` record for the same
+        (path, size, mtime); ties by path; a record with no live match comes last. *limit*
+        keeps the first that many (none for zero or less).
+        """
+        if limit is not None and limit <= 0:
+            return []
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT {_SUB_COLUMNS_S} FROM subtitles AS s "  # noqa: S608  # nosec B608
+                "LEFT JOIN files AS f ON f.path = s.path AND f.size = s.size "
+                "AND f.mtime = s.mtime AND f.status != ? "
+                "WHERE s.status = ? "
+                "ORDER BY f.id IS NULL, f.est_saving_bytes DESC, s.path, s.size, s.mtime "
+                "LIMIT ?",
+                (Status.STALE.value, SubtitleStatus.WANTED.value, -1 if limit is None else limit),
+            ).fetchall()
+        return [_subtitle_record(r) for r in rows]
+
+    def subtitle_counts(self) -> dict[SubtitleStatus, int]:
+        """Number of subtitle records per status, with every status present (zero when none)."""
+        with self._tx() as conn:
+            rows = conn.execute("SELECT status, COUNT(*) FROM subtitles GROUP BY status").fetchall()
+        result = dict.fromkeys(SubtitleStatus, 0)
+        for status, n in rows:
+            result[SubtitleStatus(status)] = int(n)
+        return result
+
+    def reset_subtitle(self, path: Path, size: int, mtime: float) -> None:
+        """Make an UNAVAILABLE or UNCLEAR record WANTED again, forgetting what was tried.
+
+        Clears the tried ids, reason and attempt count so the next search starts afresh. A
+        record in any other status, or none, is left as it is.
+        """
+        key = _key(path)
+        with self._tx(write=True) as conn:
+            changed = conn.execute(
+                "UPDATE subtitles SET status = ?, tried_ids = '[]', reason = '', attempts = 0, "
+                "updated_at = ? WHERE path = ? AND size = ? AND mtime = ? AND status IN (?, ?)",
+                (
+                    SubtitleStatus.WANTED.value,
+                    _now(),
+                    key,
+                    size,
+                    mtime,
+                    SubtitleStatus.UNAVAILABLE.value,
+                    SubtitleStatus.UNCLEAR.value,
+                ),
+            ).rowcount
+            if changed:
+                self._event(conn, f"{key}: subtitle reset -> {SubtitleStatus.WANTED.value}")
+
+    # -- subtitle download allowance --------------------------------------------------------
+
+    def quota(self) -> QuotaInfo | None:
+        """The last stored download allowance, or None when none is stored or it is unreadable."""
+        with self._tx() as conn:
+            rows = dict(
+                conn.execute(
+                    "SELECT key, value FROM meta WHERE key IN (?, ?)",
+                    (_QUOTA_REMAINING_KEY, _QUOTA_RESET_KEY),
+                ).fetchall()
+            )
+        try:
+            remaining = int(rows[_QUOTA_REMAINING_KEY])
+            if remaining < 0:
+                return None
+            return QuotaInfo(
+                remaining=remaining, reset_at=datetime.fromisoformat(rows[_QUOTA_RESET_KEY])
+            )
+        except (KeyError, ValueError):
+            return None
+
+    def set_quota(self, q: QuotaInfo) -> None:
+        """Store the download allowance (both values in one transaction)."""
+        with self._tx(write=True) as conn:
+            self._set_meta(conn, _QUOTA_REMAINING_KEY, str(q.remaining))
+            self._set_meta(conn, _QUOTA_RESET_KEY, q.reset_at.astimezone(UTC).isoformat())
 
     # -- plan acknowledgement and events ----------------------------------------------------
 

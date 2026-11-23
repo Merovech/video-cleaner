@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
@@ -18,8 +19,11 @@ from video_cleaner.state import (
     State,
     StateError,
     Status,
+    SubtitleRecord,
+    SubtitleStatus,
     UnrepresentablePath,
 )
+from video_cleaner.subtitles.models import QuotaInfo
 
 SIZE = 8_000_000_000
 MTIME = 1_700_000_000.5
@@ -696,5 +700,442 @@ def test_failed_commit_rolls_back_and_leaves_the_handle_usable(tmp_path: Path) -
         assert state.get(make_info().path) is None  # rolled back, nothing half-written
         upsert(state, make_info())  # the next transaction works: no "within a transaction"
         assert state.get(make_info().path) is not None
+    finally:
+        state.close()
+
+
+# -- subtitle outcomes and the quota ledger ----------------------------------------------------
+
+SUB_PATH = Path("/media/movies/a.mkv")
+
+
+def sub_rec(
+    status: SubtitleStatus = SubtitleStatus.WANTED,
+    path: Path = SUB_PATH,
+    size: int = SIZE,
+    mtime: float = MTIME,
+    **fields: Any,
+) -> SubtitleRecord:
+    return SubtitleRecord(path=path, size=size, mtime=mtime, status=status, **fields)
+
+
+def test_fresh_database_has_the_subtitle_table_at_the_current_version(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    State.open(db).close()
+    raw = sqlite3.connect(db)
+    try:
+        assert SCHEMA_VERSION == 4
+        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(4,)]
+        assert raw.execute("SELECT COUNT(*) FROM subtitles").fetchone() == (0,)
+    finally:
+        raw.close()
+
+
+def test_version_3_database_migrates_without_losing_rows(tmp_path: Path) -> None:
+    db = tmp_path / "v3.db"
+    with State.open(db) as s:
+        upsert(s, make_info(), saving=42)
+        s.set_status(make_info().path, Status.COMPLETED, "done")
+        s.acknowledge_plan("abc")
+    raw = sqlite3.connect(db)
+    raw.executescript("DROP TABLE subtitles; UPDATE schema_version SET version = 3;")
+    raw.close()
+    with State.open(db) as s:
+        rec = s.get(make_info().path)
+        assert rec is not None
+        assert (rec.status, rec.est_saving_bytes, rec.note) == (Status.COMPLETED, 42, "done")
+        assert s.plan_acknowledged() == "abc"
+        assert s.subtitle(SUB_PATH, SIZE, MTIME) is None
+        s.set_subtitle(sub_rec(SubtitleStatus.FOUND, provider="local"))
+        assert s.subtitle_counts()[SubtitleStatus.FOUND] == 1
+    raw = sqlite3.connect(db)
+    try:
+        assert raw.execute("SELECT version FROM schema_version").fetchall() == [(SCHEMA_VERSION,)]
+    finally:
+        raw.close()
+
+
+def test_schema_newer_than_this_version_is_still_refused(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    State.open(db).close()
+    raw = sqlite3.connect(db)
+    raw.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION + 1,))
+    raw.commit()
+    raw.close()
+    with pytest.raises(StateError, match="newer"):
+        State.open(db)
+
+
+def test_subtitle_statuses_are_the_stored_words() -> None:
+    assert [s.value for s in SubtitleStatus] == [
+        "wanted",
+        "found",
+        "not_needed",
+        "unavailable",
+        "unclear",
+    ]
+
+
+def test_unknown_subtitle_is_none(state: State) -> None:
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) is None
+
+
+def test_set_subtitle_round_trips_every_field(state: State) -> None:
+    rec = SubtitleRecord(
+        path=SUB_PATH,
+        size=SIZE,
+        mtime=MTIME,
+        status=SubtitleStatus.FOUND,
+        provider="opensubtitles",
+        cache_path=Path("/cache/subs/ab/abcdef.srt"),
+        sha256="ab" * 32,
+        provenance="English (OpenSubtitles)",
+        hash_exact=True,
+        english_audio=True,
+        reason="hash match",
+        tried_ids=(11, 4_000_000_000, 7),
+        attempts=3,
+    )
+    state.set_subtitle(rec)
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == rec
+
+
+def test_subtitle_defaults_round_trip(state: State) -> None:
+    state.set_subtitle(sub_rec())
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got == sub_rec()
+    assert got is not None and got.cache_path is None and got.tried_ids == ()
+
+
+def test_subtitle_windows_style_paths_round_trip(state: State) -> None:
+    path = Path(r"D:\Movies\Some Film (2020)\Some Film.mkv")
+    cache = Path(r"C:\Users\x\AppData\Local\video-cleaner\subs\a.srt")
+    state.set_subtitle(sub_rec(SubtitleStatus.FOUND, path=path, cache_path=cache))
+    got = state.subtitle(path, SIZE, MTIME)
+    assert got is not None
+    assert (got.path, got.cache_path) == (path, cache)
+
+
+def test_subtitle_paths_are_stored_posix_style(state: State) -> None:
+    path = Path(r"D:\Movies\a.mkv")
+    state.set_subtitle(sub_rec(path=path))
+    raw = sqlite3.connect(state._db_path)
+    try:
+        stored = raw.execute("SELECT path FROM subtitles").fetchone()[0]
+    finally:
+        raw.close()
+    assert stored == path.as_posix()
+    if os.name == "nt":
+        assert stored == "D:/Movies/a.mkv"
+
+
+def test_set_subtitle_updates_in_place(state: State) -> None:
+    state.set_subtitle(sub_rec(attempts=1))
+    state.set_subtitle(sub_rec(SubtitleStatus.UNAVAILABLE, reason="no results", attempts=2))
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got is not None
+    assert (got.status, got.reason, got.attempts) == (SubtitleStatus.UNAVAILABLE, "no results", 2)
+    assert sum(state.subtitle_counts().values()) == 1
+
+
+def test_found_subtitle_survives_a_wanted_write(state: State) -> None:
+    found = sub_rec(SubtitleStatus.FOUND, provider="sidecar", sha256="cd" * 32)
+    state.set_subtitle(found)
+    state.set_subtitle(sub_rec(SubtitleStatus.WANTED, english_audio=True))
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == found
+
+
+def test_found_subtitle_may_still_be_replaced_by_another_outcome(state: State) -> None:
+    state.set_subtitle(sub_rec(SubtitleStatus.FOUND, provider="sidecar"))
+    state.set_subtitle(sub_rec(SubtitleStatus.NOT_NEEDED, reason="embedded english"))
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got is not None and got.status is SubtitleStatus.NOT_NEEDED
+
+
+def test_subtitles_are_keyed_by_path_size_and_mtime(state: State) -> None:
+    state.set_subtitle(sub_rec(SubtitleStatus.FOUND, provider="local"))
+    assert state.subtitle(SUB_PATH, SIZE + 1, MTIME) is None  # overwritten original: fresh
+    assert state.subtitle(SUB_PATH, SIZE, MTIME + 1) is None
+    assert state.subtitle(Path("/media/movies/b.mkv"), SIZE, MTIME) is None
+    fresh = state.ensure_wanted(SUB_PATH, SIZE + 1, MTIME, english_audio=False)
+    assert fresh.status is SubtitleStatus.WANTED
+    old = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert old is not None and old.status is SubtitleStatus.FOUND
+    assert sum(state.subtitle_counts().values()) == 2
+
+
+def test_ensure_wanted_inserts_a_wanted_row(state: State) -> None:
+    rec = state.ensure_wanted(SUB_PATH, SIZE, MTIME, english_audio=True)
+    assert rec == sub_rec(english_audio=True)
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == rec
+
+
+@pytest.mark.parametrize("status", [SubtitleStatus.FOUND, SubtitleStatus.UNAVAILABLE])
+def test_ensure_wanted_never_overwrites_a_decided_row(state: State, status: SubtitleStatus) -> None:
+    decided = sub_rec(status, provider="local", reason="r", tried_ids=(5,), english_audio=False)
+    state.set_subtitle(decided)
+    got = state.ensure_wanted(SUB_PATH, SIZE, MTIME, english_audio=True)
+    assert got == decided
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == decided
+
+
+@pytest.mark.parametrize("status", [SubtitleStatus.NOT_NEEDED, SubtitleStatus.UNCLEAR])
+def test_ensure_wanted_keeps_other_decided_rows_untouched(
+    state: State, status: SubtitleStatus
+) -> None:
+    decided = sub_rec(status, english_audio=False)
+    state.set_subtitle(decided)
+    assert state.ensure_wanted(SUB_PATH, SIZE, MTIME, english_audio=True) == decided
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == decided
+
+
+def test_ensure_wanted_refreshes_the_audio_flag_of_a_wanted_row(state: State) -> None:
+    state.set_subtitle(sub_rec(tried_ids=(9,), attempts=2))
+    got = state.ensure_wanted(SUB_PATH, SIZE, MTIME, english_audio=True)
+    assert got == sub_rec(english_audio=True, tried_ids=(9,), attempts=2)
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == got
+    assert state.ensure_wanted(SUB_PATH, SIZE, MTIME, english_audio=False).english_audio is False
+
+
+def test_wanted_subtitles_are_ordered_like_the_encode_queue(state: State) -> None:
+    big, mid, small, tie_a, tie_b, orphan = (Path(f"/m/{n}.mkv") for n in "bmstuo")
+    for path, saving in ((big, 900), (mid, 500), (small, 5), (tie_a, 500), (tie_b, 500)):
+        upsert(state, make_info(path), saving=saving)
+        state.ensure_wanted(path, SIZE, MTIME, english_audio=False)
+    state.ensure_wanted(orphan, SIZE, MTIME, english_audio=False)  # no files row: last
+    got = [r.path for r in state.wanted_subtitles()]
+    assert got == [big, mid, tie_a, tie_b, small, orphan]
+    assert [r.path for r in state.wanted_subtitles(limit=2)] == [big, mid]
+    assert state.wanted_subtitles(limit=0) == []
+    assert len(state.wanted_subtitles(limit=None)) == 6
+
+
+def test_wanted_subtitles_exclude_other_statuses_and_rank_by_the_live_source(
+    state: State,
+) -> None:
+    a, b, c, d = (Path(f"/m/{n}.mkv") for n in "abcd")
+    for path in (a, b, c):
+        upsert(state, make_info(path), saving=10)
+    state.set_subtitle(sub_rec(SubtitleStatus.FOUND, path=a))
+    state.set_subtitle(sub_rec(SubtitleStatus.UNAVAILABLE, path=b))
+    state.ensure_wanted(c, SIZE, MTIME, english_audio=False)
+    assert [r.path for r in state.wanted_subtitles()] == [c]
+    upsert(state, make_info(d), saving=50)
+    state.ensure_wanted(d, SIZE, MTIME, english_audio=False)
+    assert [r.path for r in state.wanted_subtitles()] == [d, c]
+    # c's original is replaced: its old subtitle row matches no live file, so it ranks last.
+    upsert(state, make_info(c, size=SIZE + 1), saving=999_999)
+    assert [r.path for r in state.wanted_subtitles()] == [d, c]
+    state.ensure_wanted(c, SIZE + 1, MTIME, english_audio=False)
+    assert [(r.path, r.size) for r in state.wanted_subtitles()] == [
+        (c, SIZE + 1),
+        (d, SIZE),
+        (c, SIZE),
+    ]
+
+
+def test_subtitle_counts_has_every_status(state: State) -> None:
+    assert state.subtitle_counts() == dict.fromkeys(SubtitleStatus, 0)
+    state.set_subtitle(sub_rec(SubtitleStatus.FOUND, path=Path("/m/1.mkv")))
+    state.set_subtitle(sub_rec(SubtitleStatus.FOUND, path=Path("/m/2.mkv")))
+    state.set_subtitle(sub_rec(SubtitleStatus.UNCLEAR, path=Path("/m/3.mkv")))
+    state.ensure_wanted(Path("/m/4.mkv"), SIZE, MTIME, english_audio=False)
+    counts = state.subtitle_counts()
+    assert counts[SubtitleStatus.FOUND] == 2
+    assert counts[SubtitleStatus.UNCLEAR] == 1
+    assert counts[SubtitleStatus.WANTED] == 1
+    assert counts[SubtitleStatus.UNAVAILABLE] == counts[SubtitleStatus.NOT_NEEDED] == 0
+
+
+@pytest.mark.parametrize("status", [SubtitleStatus.UNAVAILABLE, SubtitleStatus.UNCLEAR])
+def test_reset_subtitle_makes_it_wanted_and_forgets_tried_ids(
+    state: State, status: SubtitleStatus
+) -> None:
+    state.set_subtitle(
+        sub_rec(status, tried_ids=(1, 2, 3), reason="no luck", attempts=4, english_audio=True)
+    )
+    state.reset_subtitle(SUB_PATH, SIZE, MTIME)
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == sub_rec(english_audio=True)
+
+
+@pytest.mark.parametrize(
+    "status", [SubtitleStatus.FOUND, SubtitleStatus.NOT_NEEDED, SubtitleStatus.WANTED]
+)
+def test_reset_subtitle_leaves_other_statuses_alone(state: State, status: SubtitleStatus) -> None:
+    rec = sub_rec(status, provider="local", tried_ids=(1, 2), reason="kept")
+    state.set_subtitle(rec)
+    state.reset_subtitle(SUB_PATH, SIZE, MTIME)
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == rec
+
+
+def test_reset_subtitle_of_an_unknown_row_is_a_no_op(state: State) -> None:
+    state.reset_subtitle(SUB_PATH, SIZE, MTIME)
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) is None
+
+
+@pytest.mark.parametrize(
+    "stored",
+    ["not json", '{"a": 1}', '"7"', '[1, "2"]', "[true]", "[1.5]", "[-3]", "[[1]]", "", "null"],
+)
+def test_corrupt_tried_ids_read_as_empty_and_never_crash_a_read(state: State, stored: str) -> None:
+    state.set_subtitle(sub_rec(tried_ids=(1, 2)))
+    raw = sqlite3.connect(state._db_path)
+    raw.execute("UPDATE subtitles SET tried_ids = ?", (stored,))
+    raw.commit()
+    raw.close()
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got is not None and got.tried_ids == ()
+    assert [r.tried_ids for r in state.wanted_subtitles()] == [()]
+
+
+def test_tried_ids_are_stored_as_a_json_array_of_ints(state: State) -> None:
+    state.set_subtitle(sub_rec(tried_ids=(3, 1, 2)))
+    raw = sqlite3.connect(state._db_path)
+    try:
+        assert raw.execute("SELECT tried_ids FROM subtitles").fetchone() == ("[3, 1, 2]",)
+    finally:
+        raw.close()
+
+
+@pytest.mark.parametrize("bad", [(-1,), (True,), (1.5,), ("7",)])
+def test_tried_ids_that_are_not_non_negative_ints_are_refused(state: State, bad: Any) -> None:
+    with pytest.raises(ValueError, match="tried_ids"):
+        state.set_subtitle(sub_rec(tried_ids=bad))
+    assert sum(state.subtitle_counts().values()) == 0
+
+
+def test_hostile_text_is_stored_as_data(state: State) -> None:
+    nasty = "x'); DROP TABLE subtitles; --"
+    state.set_subtitle(sub_rec(provenance=nasty, reason=nasty, provider=nasty))
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got is not None
+    assert (got.provenance, got.reason, got.provider) == (nasty, nasty, nasty)
+
+
+def test_subtitle_path_that_cannot_be_stored_is_refused(state: State) -> None:
+    with pytest.raises(UnrepresentablePath):
+        state.set_subtitle(sub_rec(path=Path("bad\udc80.mkv")))
+    assert sum(state.subtitle_counts().values()) == 0
+
+
+def test_set_subtitle_is_one_transaction(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    State.open(db).close()
+    raw = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+    state = State(_FailingCommit(raw), db)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            state.set_subtitle(sub_rec())
+        assert state.subtitle(SUB_PATH, SIZE, MTIME) is None  # rolled back
+        state.set_subtitle(sub_rec())  # handle still usable
+        assert state.subtitle(SUB_PATH, SIZE, MTIME) is not None
+    finally:
+        state.close()
+
+
+def test_subtitle_rows_survive_reopen(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    rec = sub_rec(SubtitleStatus.FOUND, tried_ids=(8, 9), provider="local")
+    with State.open(db) as s:
+        s.set_subtitle(rec)
+    with State.open(db) as s2:
+        assert s2.subtitle(SUB_PATH, SIZE, MTIME) == rec
+
+
+def test_concurrent_subtitle_writes_from_threads(state: State) -> None:
+    errors: list[BaseException] = []
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(20):
+                state.ensure_wanted(Path(f"/m/t{n}-{i}.mkv"), SIZE, MTIME, english_audio=False)
+                state.wanted_subtitles(limit=5)
+                state.subtitle_counts()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert state.subtitle_counts()[SubtitleStatus.WANTED] == 100
+
+
+RESET = datetime(2026, 11, 24, 0, 0, 0, tzinfo=UTC)
+
+
+def test_quota_is_none_until_stored(state: State) -> None:
+    assert state.quota() is None
+
+
+def test_quota_round_trips_through_meta(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    q = QuotaInfo(remaining=17, reset_at=RESET)
+    with State.open(db) as s:
+        s.set_quota(q)
+        assert s.quota() == q
+        s.set_quota(QuotaInfo(remaining=0, reset_at=RESET))
+        assert s.quota() == QuotaInfo(remaining=0, reset_at=RESET)
+    with State.open(db) as s2:
+        assert s2.quota() == QuotaInfo(remaining=0, reset_at=RESET)
+    raw = sqlite3.connect(db)
+    try:
+        stored = dict(raw.execute("SELECT key, value FROM meta WHERE key LIKE '%quota%'"))
+    finally:
+        raw.close()
+    assert sorted(stored.values()) == ["0", "2026-11-24T00:00:00+00:00"]
+
+
+def test_quota_reset_time_comes_back_in_utc(state: State) -> None:
+    local = datetime(2026, 11, 24, 2, 0, tzinfo=timezone(timedelta(hours=2)))
+    state.set_quota(QuotaInfo(remaining=5, reset_at=local))
+    got = state.quota()
+    assert got is not None
+    assert got.reset_at == local
+    assert got.reset_at.utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    ("remaining", "reset_at"),
+    [
+        ("abc", "2026-11-24T00:00:00+00:00"),
+        ("5", "not a time"),
+        ("5", "2026-11-24T00:00:00"),  # naive
+        ("-1", "2026-11-24T00:00:00+00:00"),
+        ("5", ""),
+    ],
+)
+def test_unreadable_stored_quota_reads_as_none(state: State, remaining: str, reset_at: str) -> None:
+    state.set_quota(QuotaInfo(remaining=3, reset_at=RESET))
+    raw = sqlite3.connect(state._db_path)
+    raw.execute("UPDATE meta SET value = ? WHERE key LIKE '%remaining'", (remaining,))
+    raw.execute("UPDATE meta SET value = ? WHERE key LIKE '%reset_at'", (reset_at,))
+    raw.commit()
+    raw.close()
+    assert state.quota() is None
+
+
+def test_half_stored_quota_reads_as_none(state: State) -> None:
+    state.set_quota(QuotaInfo(remaining=3, reset_at=RESET))
+    raw = sqlite3.connect(state._db_path)
+    raw.execute("DELETE FROM meta WHERE key LIKE '%reset_at'")
+    raw.commit()
+    raw.close()
+    assert state.quota() is None
+
+
+def test_set_quota_is_one_transaction(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    State.open(db).close()
+    raw = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+    state = State(_FailingCommit(raw), db)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            state.set_quota(QuotaInfo(remaining=9, reset_at=RESET))
+        assert state.quota() is None  # neither half was written
+        state.set_quota(QuotaInfo(remaining=9, reset_at=RESET))
+        assert state.quota() == QuotaInfo(remaining=9, reset_at=RESET)
     finally:
         state.close()
