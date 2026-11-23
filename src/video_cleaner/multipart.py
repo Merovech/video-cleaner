@@ -49,9 +49,9 @@ class PartGroup:
     parts: tuple[Path, ...]
 
 
-def _split_marker(path: Path) -> tuple[str, int] | None:
-    """Return (base name, part number) if *path* ends in a part marker, else None."""
-    match = _PART_MARKER.fullmatch(path.stem)
+def split_part_marker(stem: str) -> tuple[str, int] | None:
+    """Return (base name, part number) if the file *stem* ends in a part marker, else None."""
+    match = _PART_MARKER.fullmatch(stem)
     if match is None:
         return None
     base = match.group("base")
@@ -72,7 +72,7 @@ def find_part_groups(files: Sequence[Path]) -> list[PartGroup]:
     # Files of one folder whose names agree up to the part marker (compared ignoring case).
     candidates: dict[tuple[Path, str], list[_Part]] = defaultdict(list)
     for path in files:
-        split = _split_marker(path)
+        split = split_part_marker(path.stem)
         if split is not None:
             base, number = split
             candidates[(path.parent, base.casefold())].append(_Part(number, base, path))
