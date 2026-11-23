@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 
+import keyring
+import keyring.backends.fail
 import pytest
 
 from video_cleaner import power
@@ -37,3 +39,10 @@ def _no_registered_secrets() -> Iterator[None]:
     _reset_registered_secrets()
     yield
     _reset_registered_secrets()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The keyring library reports "no usable backend", so no test reads or writes the real
+    Windows Credential Manager (tests inject fake backends and stores)."""
+    monkeypatch.setattr(keyring, "get_keyring", keyring.backends.fail.Keyring)

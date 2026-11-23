@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -296,3 +297,127 @@ def test_config_file_with_utf8_bom_is_read(tmp_path: Path) -> None:
     cfg = tmp_path / "bom.toml"
     cfg.write_bytes(b"\xef\xbb\xbf" + (_paths_toml() + "vmaf_target = 94.0\n").encode("utf-8"))
     assert load_settings(cfg, _env(tmp_path)).vmaf_target == 94.0
+
+
+# --- subtitle settings ---------------------------------------------------------------
+
+
+def test_subtitle_defaults(tmp_path: Path) -> None:
+    s = load_settings(None, _env(tmp_path))
+    assert s.subtitle_cache_dir == tmp_path / "local" / "video-cleaner" / "subtitles"
+    assert s.local_subtitle_dirs == ()
+    assert s.forced_full_cues_per_hour == 250.0
+    assert s.align_max_offset_s == 120.0
+    assert s.align_scale_tolerance == 0.05
+    assert s.align_min_score == 0.0
+    assert s.subtitle_max_bytes == 2_000_000
+    assert s.subtitle_min_cues == 20
+    assert s.subtitle_candidates_per_file == 3
+
+
+def test_subtitle_cache_dir_without_localappdata_needs_an_explicit_value(tmp_path: Path) -> None:
+    env = _env(tmp_path, VC_STATE_DB=str(tmp_path / "s.db"), VC_LOG_DIR=str(tmp_path / "logs"))
+    del env["LOCALAPPDATA"]
+    with pytest.raises(ConfigError, match="subtitle_cache_dir"):
+        load_settings(None, env)
+    env["VC_SUBTITLE_CACHE_DIR"] = str(tmp_path / "subs")
+    assert load_settings(None, env).subtitle_cache_dir == tmp_path / "subs"
+
+
+def test_subtitle_cache_dir_from_toml_beats_the_derived_default(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "c.toml", _paths_toml() + f"subtitle_cache_dir = '{tmp_path / 'c'}'\n")
+    assert load_settings(cfg, _env(tmp_path)).subtitle_cache_dir == tmp_path / "c"
+
+
+def test_subtitle_scalars_from_toml_and_env(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "c.toml",
+        _paths_toml()
+        + "forced_full_cues_per_hour = 300\nalign_max_offset_s = 60\n"
+        + "align_scale_tolerance = 0.1\nalign_min_score = 5.5\n"
+        + "subtitle_max_bytes = 1000000\nsubtitle_min_cues = 10\n"
+        + "subtitle_candidates_per_file = 5\n",
+    )
+    s = load_settings(cfg, _env(tmp_path))
+    assert (s.forced_full_cues_per_hour, s.align_max_offset_s) == (300.0, 60.0)
+    assert (s.align_scale_tolerance, s.align_min_score) == (0.1, 5.5)
+    assert (s.subtitle_max_bytes, s.subtitle_min_cues, s.subtitle_candidates_per_file) == (
+        1_000_000,
+        10,
+        5,
+    )
+    s = load_settings(cfg, _env(tmp_path, VC_SUBTITLE_MIN_CUES="30", VC_ALIGN_MIN_SCORE="0"))
+    assert s.subtitle_min_cues == 30
+    assert s.align_min_score == 0.0
+
+
+def test_local_subtitle_dirs_from_a_toml_array(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "c.toml",
+        _paths_toml() + "local_subtitle_dirs = ['D:/subs/a', 'Z:/more subs']\n",
+    )
+    s = load_settings(cfg, _env(tmp_path))
+    assert s.local_subtitle_dirs == (Path("D:/subs/a"), Path("Z:/more subs"))
+    assert isinstance(s.local_subtitle_dirs, tuple)
+
+
+def test_local_subtitle_dirs_from_env_split_on_the_path_separator(tmp_path: Path) -> None:
+    one, two = str(tmp_path / "one"), str(tmp_path / "two words")
+    value = os.pathsep.join([one, "", two]) + os.pathsep  # empty segments are skipped
+    s = load_settings(None, _env(tmp_path, VC_LOCAL_SUBTITLE_DIRS=value))
+    assert s.local_subtitle_dirs == (Path(one), Path(two))
+
+
+def test_local_subtitle_dirs_env_beats_the_file(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "c.toml", _paths_toml() + "local_subtitle_dirs = ['D:/from-file']\n")
+    s = load_settings(cfg, _env(tmp_path, VC_LOCAL_SUBTITLE_DIRS=str(tmp_path / "env")))
+    assert s.local_subtitle_dirs == (tmp_path / "env",)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "local_subtitle_dirs = 'D:/subs'",  # a string, not an array
+        "local_subtitle_dirs = [1]",
+        "local_subtitle_dirs = ['relative/subs']",
+        "local_subtitle_dirs = ['']",
+        "forced_full_cues_per_hour = 'many'",
+        "align_max_offset_s = true",
+        "align_scale_tolerance = [1]",
+        "subtitle_max_bytes = 1.5",
+        "subtitle_min_cues = 'ten'",
+        "subtitle_candidates_per_file = 2.5",
+        "subtitle_cache_dir = 7",
+    ],
+)
+def test_wrong_subtitle_toml_types_raise(tmp_path: Path, line: str) -> None:
+    cfg = _write(tmp_path / "c.toml", _paths_toml() + line + "\n")
+    with pytest.raises(ConfigError):
+        load_settings(cfg, _env(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("VC_LOCAL_SUBTITLE_DIRS", "relative/subs"),
+        ("VC_FORCED_FULL_CUES_PER_HOUR", "0"),
+        ("VC_FORCED_FULL_CUES_PER_HOUR", "nan"),
+        ("VC_ALIGN_MAX_OFFSET_S", "0"),
+        ("VC_ALIGN_MAX_OFFSET_S", "-1"),
+        ("VC_ALIGN_SCALE_TOLERANCE", "-0.01"),
+        ("VC_ALIGN_SCALE_TOLERANCE", "1"),
+        ("VC_ALIGN_MIN_SCORE", "-1"),
+        ("VC_SUBTITLE_MAX_BYTES", "0"),
+        ("VC_SUBTITLE_MIN_CUES", "-1"),
+        ("VC_SUBTITLE_CANDIDATES_PER_FILE", "0"),
+        ("VC_SUBTITLE_CACHE_DIR", "relative"),
+    ],
+)
+def test_invalid_subtitle_values_raise(tmp_path: Path, var: str, value: str) -> None:
+    with pytest.raises(ConfigError):
+        load_settings(None, _env(tmp_path, **{var: value}))
+
+
+def test_a_bad_local_subtitle_dir_names_its_source(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match=r"local_subtitle_dirs.*VC_LOCAL_SUBTITLE_DIRS"):
+        load_settings(None, _env(tmp_path, VC_LOCAL_SUBTITLE_DIRS="relative"))

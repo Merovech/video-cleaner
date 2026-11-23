@@ -20,6 +20,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from video_cleaner import credentials as creds
 from video_cleaner.config import Settings, default_config_path
 from video_cleaner.paths import library_overlaps
 from video_cleaner.tools import ToolNotFound, locate_tool
@@ -130,6 +131,7 @@ class _Doctor:
         python_version: tuple[int, int],
         windows: bool,
         file_mode: FileModeFn,
+        credential_store: creds.CredentialStore | None,
     ) -> None:
         self.settings = settings
         self.env = env
@@ -139,6 +141,7 @@ class _Doctor:
         self.python_version = python_version
         self.windows = windows
         self.file_mode = file_mode
+        self.credential_store = credential_store
         self.ffmpeg: Path | None = None
 
     def _run(self, cmd: Sequence[str]) -> tuple[int, str]:
@@ -264,34 +267,63 @@ class _Doctor:
             return Check(name, False, f"{directory} not writable: {exc}")
         return Check(name, True, f"{directory} writable")
 
+    def _owner_only(self, name: str, path: Path, fix: str) -> Check:
+        """Informational check that *path* (an existing file) is closed to other users."""
+        if self.windows:
+            code, output = self._run([self._system_tool("icacls"), str(path)])
+            if code != 0:
+                detail = f"icacls failed (exit {code}): {_first_line(output)}"
+                return Check(name, False, detail, required=False)
+            loose = loose_acl_entries(output)
+            if loose:
+                detail = f"{path} readable by {', '.join(loose)}; {fix}"
+                return Check(name, False, detail, required=False)
+        else:
+            mode = self.file_mode(path)
+            if mode & 0o077:
+                return Check(name, False, f"{path} mode {mode:o}; run chmod 600", required=False)
+        return Check(name, True, f"{path} restricted to the owner", required=False)
+
     def config_permissions(self) -> Iterator[Check]:
         name = "config permissions"
         path = self.config_path
         if path is None or not path.is_file():
             yield Check(name, True, "no config file (defaults and VC_* only)", required=False)
             return
-        if self.windows:
-            code, output = self._run([self._system_tool("icacls"), str(path)])
-            if code != 0:
-                detail = f"icacls failed (exit {code}): {_first_line(output)}"
-                yield Check(name, False, detail, required=False)
-                return
-            loose = loose_acl_entries(output)
-            if loose:
-                detail = f"{path} readable by {', '.join(loose)}; restrict it with icacls"
-                yield Check(name, False, detail, required=False)
-                return
+        yield self._owner_only(name, path, "restrict it with icacls")
+
+    def credentials_file_permissions(self) -> Iterator[Check]:
+        name = "credentials file permissions"
+        path = creds.credentials_file_path(self.env)
+        if path is None or not path.is_file():
+            yield Check(name, True, "no fallback credentials file", required=False)
+            return
+        yield self._owner_only(name, path, "restrict it with icacls or run `auth` again")
+
+    def credentials(self) -> Iterator[Check]:
+        """OpenSubtitles credentials present (a warning, not a failure, when they are not)."""
+        name = "credentials"
+        try:
+            store = (
+                creds.open_store(self.env)
+                if self.credential_store is None
+                else self.credential_store
+            )
+            missing = creds.missing_names(store, self.env)
+        except creds.CredentialError as exc:
+            yield Check(name, False, f"credential store unusable: {exc}", required=False)
+            return
+        if missing:
+            detail = (
+                f"not set: {', '.join(missing)}; run `video-cleaner auth` (subtitles need them)"
+            )
+            yield Check(name, False, detail, required=False)
         else:
-            mode = self.file_mode(path)
-            if mode & 0o077:
-                detail = f"{path} mode {mode:o}; run chmod 600"
-                yield Check(name, False, detail, required=False)
-                return
-        yield Check(name, True, f"{path} restricted to the owner", required=False)
+            yield Check(name, True, "OpenSubtitles credentials are set", required=False)
 
     def keyring(self) -> Iterator[Check]:
         found = importlib.util.find_spec("keyring") is not None
-        detail = "importable" if found else "not installed (needed from Phase 2 for credentials)"
+        detail = "importable" if found else "not installed (needed for credentials)"
         yield Check("keyring", found, detail, required=False)
 
 
@@ -305,12 +337,14 @@ def run_doctor(
     python_version: tuple[int, int] | None = None,
     windows: bool | None = None,
     file_mode: FileModeFn | None = None,
+    credential_store: creds.CredentialStore | None = None,
 ) -> list[Check]:
     """Run every environment check and return the results; never raises.
 
     *config_path* defaults to `config.default_config_path` for *env*, the file `load_settings`
     reads when it is given no path. The other
-    keyword arguments exist for tests and default to the real system.
+    keyword arguments exist for tests and default to the real system (*credential_store*:
+    `credentials.open_store` for *env*).
     """
     environ: Mapping[str, str] = os.environ if env is None else env
     doc = _Doctor(
@@ -322,6 +356,7 @@ def run_doctor(
         python_version or (sys.version_info.major, sys.version_info.minor),
         os.name == "nt" if windows is None else windows,
         file_mode or _file_mode,
+        credential_store,
     )
     groups: list[tuple[str, Callable[[], Iterator[Check]]]] = [
         ("python", doc.python),
@@ -332,6 +367,8 @@ def run_doctor(
         ("output dirs", doc.writable_dirs),
         ("config permissions", doc.config_permissions),
         ("keyring", doc.keyring),
+        ("credentials", doc.credentials),
+        ("credentials file permissions", doc.credentials_file_permissions),
     ]
     checks: list[Check] = []
     for label, group in groups:

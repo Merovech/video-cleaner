@@ -1,0 +1,606 @@
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+import keyring
+import keyring.backends.fail
+import keyring.backends.null
+import keyring.errors
+import pytest
+from typer.testing import CliRunner
+
+from video_cleaner import credentials
+from video_cleaner.cli import app
+from video_cleaner.credentials import (
+    ALL_NAMES,
+    API_KEY,
+    PASSWORD,
+    SERVICE,
+    TOKEN,
+    USERNAME,
+    CredentialError,
+    FileStore,
+    KeyringStore,
+    OpenSubtitlesCredentials,
+    credentials_file_path,
+    load_credentials,
+    open_store,
+    restrict_to_owner,
+)
+from video_cleaner.logging_setup import redact
+
+API = "k3y-abcdef-123456"
+USER = "someuser"
+PHRASE = "hunter2-hunter2"
+
+
+class MemoryStore:
+    """In-memory `CredentialStore`."""
+
+    def __init__(self, values: Mapping[str, str] | None = None) -> None:
+        self.values = dict(values or {})
+
+    def get(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    def set(self, name: str, value: str) -> None:
+        self.values[name] = value
+
+    def delete(self, name: str) -> None:
+        self.values.pop(name, None)
+
+
+class FakeBackend:
+    """What `KeyringStore` needs from a keyring backend, with the real error types."""
+
+    def __init__(self) -> None:
+        self.passwords: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.passwords.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.passwords[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        if (service, username) not in self.passwords:
+            raise keyring.errors.PasswordDeleteError("not found")
+        del self.passwords[(service, username)]
+
+
+class BrokenBackend(FakeBackend):
+    def get_password(self, service: str, username: str) -> str | None:
+        raise keyring.errors.KeyringError(f"locked, was reading {PHRASE}")
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        raise keyring.errors.PasswordSetError("denied")
+
+    def delete_password(self, service: str, username: str) -> None:
+        raise keyring.errors.KeyringError("locked")
+
+
+FULL = {API_KEY: API, USERNAME: USER, PASSWORD: PHRASE}
+
+
+# --- FileStore ------------------------------------------------------------------------
+
+
+def test_file_store_round_trip(tmp_path: Path) -> None:
+    store = FileStore(tmp_path / "sub" / "credentials.json")
+    assert store.get(API_KEY) is None  # no file yet
+    store.set(API_KEY, API)
+    store.set(USERNAME, USER)
+    assert store.get(API_KEY) == API
+    assert store.get(USERNAME) == USER
+    assert FileStore(tmp_path / "sub" / "credentials.json").get(API_KEY) == API  # persisted
+    store.set(API_KEY, "other-value")
+    assert store.get(API_KEY) == "other-value"
+    store.delete(API_KEY)
+    assert store.get(API_KEY) is None
+    assert store.get(USERNAME) == USER
+    store.delete(API_KEY)  # deleting what is not there is fine
+
+
+def test_file_store_delete_without_a_file_creates_nothing(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    FileStore(path).delete(API_KEY)
+    assert not path.exists()
+
+
+def test_file_store_leaves_no_temp_files(tmp_path: Path) -> None:
+    store = FileStore(tmp_path / "credentials.json")
+    store.set(API_KEY, API)
+    store.set(API_KEY, "again")
+    assert [p.name for p in tmp_path.iterdir()] == ["credentials.json"]
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]", '{"a": 1}', ""])
+def test_file_store_rejects_a_damaged_file_without_echoing_it(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "credentials.json"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(CredentialError, match=r"credentials.json"):
+        FileStore(path).get(API_KEY)
+
+
+def test_file_store_reports_an_unreadable_file(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    path.mkdir()  # a folder where the file should be
+    with pytest.raises(CredentialError, match=r"cannot read"):
+        FileStore(path).get(API_KEY)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_file_store_file_is_owner_only_on_posix(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    store = FileStore(path)
+    store.set(API_KEY, API)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    store.set(API_KEY, "again")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_file_store_restricts_before_it_writes_the_secret(tmp_path: Path) -> None:
+    path = tmp_path / "credentials.json"
+    seen: list[str] = []
+
+    def restrict(target: Path) -> None:
+        seen.append(target.read_text(encoding="utf-8"))  # what is in the file when it is locked
+
+    FileStore(path, restrict=restrict).set(API_KEY, API)
+    assert len(seen) == 1
+    assert API not in seen[0]
+    assert path.read_text(encoding="utf-8") != seen[0]
+
+
+def test_file_store_failed_restriction_leaves_no_secret_behind(tmp_path: Path) -> None:
+    def restrict(target: Path) -> None:
+        raise CredentialError("icacls failed")
+
+    path = tmp_path / "credentials.json"
+    with pytest.raises(CredentialError, match="icacls"):
+        FileStore(path, restrict=restrict).set(API_KEY, API)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_restrict_to_owner_runs_icacls_without_a_shell_on_windows(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        calls.append(list(cmd))
+        return 0, ""
+
+    target = tmp_path / "credentials.json"
+    restrict_to_owner(target, windows=True, user="ari", system_root="C:/Win", run=run)
+    assert calls == [
+        [
+            str(Path("C:/Win") / "System32" / "icacls.exe"),
+            str(target),
+            "/inheritance:r",
+            "/grant:r",
+            "ari:F",
+        ]
+    ]
+
+
+def test_restrict_to_owner_reports_an_icacls_failure(tmp_path: Path) -> None:
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        return 5, "Access is denied.\n"
+
+    with pytest.raises(CredentialError, match="Access is denied"):
+        restrict_to_owner(tmp_path / "x", windows=True, user="ari", system_root="C:/Win", run=run)
+
+
+def test_restrict_to_owner_reports_a_missing_icacls(tmp_path: Path) -> None:
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        raise FileNotFoundError("icacls")
+
+    with pytest.raises(CredentialError, match="icacls"):
+        restrict_to_owner(tmp_path / "x", windows=True, user="ari", system_root="C:/Win", run=run)
+
+
+def test_restrict_to_owner_uses_chmod_on_posix(tmp_path: Path) -> None:
+    target = tmp_path / "credentials.json"
+    target.write_text("{}", encoding="utf-8")
+    calls: list[tuple[Path, int]] = []
+    restrict_to_owner(target, windows=False, chmod=lambda p, m: calls.append((p, m)))
+    assert calls == [(target, 0o600)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="icacls is Windows only")
+def test_file_store_is_owner_only_on_windows_with_the_real_icacls(tmp_path: Path) -> None:
+    from video_cleaner.doctor import loose_acl_entries
+
+    path = tmp_path / "credentials.json"
+    store = FileStore(path)
+    store.set(API_KEY, API)
+    store.set(API_KEY, "again")  # the replace keeps the restriction
+    root = os.environ.get("SYSTEMROOT", "C:/Windows")
+    out = subprocess.run(  # noqa: S603  # nosec B603
+        [str(Path(root) / "System32" / "icacls.exe"), str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert loose_acl_entries(out) == []
+    assert "(I)" not in out  # nothing inherited from the folder
+    assert store.get(API_KEY) == "again"
+
+
+# --- KeyringStore ---------------------------------------------------------------------
+
+
+def test_keyring_store_round_trip_uses_the_service_name() -> None:
+    backend = FakeBackend()
+    store = KeyringStore(backend)
+    assert store.get(API_KEY) is None
+    store.set(API_KEY, API)
+    assert backend.passwords == {(SERVICE, API_KEY): API}
+    assert store.get(API_KEY) == API
+    store.delete(API_KEY)
+    assert store.get(API_KEY) is None
+    store.delete(API_KEY)  # already gone: not an error
+
+
+def test_keyring_store_wraps_backend_errors_without_the_secret() -> None:
+    store = KeyringStore(BrokenBackend())
+    with pytest.raises(CredentialError) as info:
+        store.get(API_KEY)
+    assert PHRASE not in str(info.value)
+    with pytest.raises(CredentialError):
+        store.set(API_KEY, API)
+    with pytest.raises(CredentialError):
+        store.delete(API_KEY)
+
+
+def test_service_name() -> None:
+    assert SERVICE == "video-cleaner"
+    assert set(ALL_NAMES) == {
+        "opensubtitles_api_key",
+        "opensubtitles_username",
+        "opensubtitles_password",
+        "opensubtitles_token",
+    }
+
+
+# --- open_store -----------------------------------------------------------------------
+
+
+def _env(tmp_path: Path) -> dict[str, str]:
+    return {"LOCALAPPDATA": str(tmp_path / "local")}
+
+
+def test_credentials_file_path_is_under_localappdata(tmp_path: Path) -> None:
+    expected = tmp_path / "local" / "video-cleaner" / "credentials.json"
+    assert credentials_file_path(_env(tmp_path)) == expected
+    assert credentials_file_path({}) is None
+
+
+def test_open_store_uses_a_usable_keyring(tmp_path: Path) -> None:
+    backend = FakeBackend()
+    store = open_store(_env(tmp_path), backend_factory=lambda: backend)
+    assert isinstance(store, KeyringStore)
+    store.set(API_KEY, API)
+    assert backend.passwords[(SERVICE, API_KEY)] == API
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        None,
+        keyring.backends.fail.Keyring(),  # type: ignore[no-untyped-call]
+        keyring.backends.null.Keyring(),  # type: ignore[no-untyped-call]
+    ],
+    ids=["no keyring", "fail backend", "null backend"],
+)
+def test_open_store_falls_back_to_the_owner_only_file(tmp_path: Path, backend: object) -> None:
+    store = open_store(_env(tmp_path), backend_factory=lambda: backend)
+    assert isinstance(store, FileStore)
+    assert store.path == tmp_path / "local" / "video-cleaner" / "credentials.json"
+
+
+def test_open_store_falls_back_when_the_keyring_cannot_be_loaded(tmp_path: Path) -> None:
+    def broken() -> object:
+        raise RuntimeError("no dbus")
+
+    assert isinstance(open_store(_env(tmp_path), backend_factory=broken), FileStore)
+
+
+def test_open_store_without_keyring_or_localappdata_is_an_error() -> None:
+    with pytest.raises(CredentialError, match="LOCALAPPDATA"):
+        open_store({}, backend_factory=lambda: None)
+
+
+def test_open_store_default_asks_the_keyring_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(keyring, "get_keyring", lambda: backend)
+    assert isinstance(open_store(_env(tmp_path)), KeyringStore)
+    monkeypatch.setattr(keyring, "get_keyring", keyring.backends.fail.Keyring)
+    assert isinstance(open_store(_env(tmp_path)), FileStore)
+
+
+def test_the_suite_never_reaches_the_real_keyring(tmp_path: Path) -> None:
+    # conftest makes the keyring library report "no usable backend" for every test.
+    assert isinstance(open_store(_env(tmp_path)), FileStore)
+
+
+# --- load_credentials -----------------------------------------------------------------
+
+
+def test_load_credentials_from_the_store() -> None:
+    assert load_credentials(MemoryStore(FULL), {}) == OpenSubtitlesCredentials(API, USER, PHRASE)
+
+
+@pytest.mark.parametrize("missing", [API_KEY, USERNAME, PASSWORD])
+def test_load_credentials_is_none_when_any_one_is_missing(missing: str) -> None:
+    values = {k: v for k, v in FULL.items() if k != missing}
+    assert load_credentials(MemoryStore(values), {}) is None
+
+
+def test_load_credentials_is_none_for_empty_values() -> None:
+    assert load_credentials(MemoryStore({**FULL, API_KEY: ""}), {}) is None
+
+
+def test_environment_beats_the_store() -> None:
+    env = {
+        "VC_OPENSUBTITLES_API_KEY": "env-api-key",
+        "VC_OPENSUBTITLES_USERNAME": "env-user",
+        "VC_OPENSUBTITLES_PASSWORD": "env-password",
+    }
+    creds = load_credentials(MemoryStore(FULL), env)
+    assert creds == OpenSubtitlesCredentials("env-api-key", "env-user", "env-password")
+
+
+def test_environment_and_store_can_each_supply_part() -> None:
+    store = MemoryStore({USERNAME: USER, PASSWORD: PHRASE})
+    creds = load_credentials(store, {"VC_OPENSUBTITLES_API_KEY": API})
+    assert creds == OpenSubtitlesCredentials(API, USER, PHRASE)
+
+
+def test_an_empty_environment_variable_does_not_hide_the_store() -> None:
+    creds = load_credentials(MemoryStore(FULL), {"VC_OPENSUBTITLES_API_KEY": ""})
+    assert creds is not None
+    assert creds.api_key == API
+
+
+def test_load_credentials_reads_os_environ_when_no_env_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "from-os-environ")
+    creds = load_credentials(MemoryStore({USERNAME: USER, PASSWORD: PHRASE}))
+    assert creds is not None
+    assert creds.api_key == "from-os-environ"
+
+
+def test_loaded_credentials_are_registered_for_redaction() -> None:
+    text = f"GET /login key={API} user={USER} pw={PHRASE}"
+    assert API in redact(text)  # nothing registered yet
+    assert load_credentials(MemoryStore(FULL), {}) is not None
+    masked = redact(text)
+    assert API not in masked
+    assert USER not in masked
+    assert PHRASE not in masked
+
+
+def test_environment_credentials_are_registered_for_redaction() -> None:
+    env = {
+        "VC_OPENSUBTITLES_API_KEY": "env-api-key",
+        "VC_OPENSUBTITLES_USERNAME": "env-user",
+        "VC_OPENSUBTITLES_PASSWORD": "env-password",
+    }
+    assert load_credentials(MemoryStore(), env) is not None
+    assert "env-password" not in redact("sent env-password")
+
+
+def test_credentials_repr_does_not_show_the_secret_values() -> None:
+    creds = OpenSubtitlesCredentials(API, USER, PHRASE)
+    assert API not in repr(creds)
+    assert PHRASE not in repr(creds)
+
+
+def test_missing_names_lists_what_is_not_set() -> None:
+    store = MemoryStore({USERNAME: USER})
+    assert credentials.missing_names(store, {"VC_OPENSUBTITLES_PASSWORD": PHRASE}) == [API_KEY]
+    assert credentials.missing_names(MemoryStore(FULL), {}) == []
+
+
+# --- `auth` command -------------------------------------------------------------------
+
+
+@pytest.fixture
+def cli_store(monkeypatch: pytest.MonkeyPatch) -> MemoryStore:
+    store = MemoryStore()
+    monkeypatch.setattr(credentials, "open_store", lambda env=None: store)
+    return store
+
+
+def _config(tmp_path: Path) -> Path:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"library_root = '{tmp_path / 'library'}'\n"
+        f"scratch_dir = '{tmp_path / 'scratch'}'\n"
+        f"completed_dir = '{tmp_path / 'completed'}'\n"
+        f"state_db = '{tmp_path / 'state.db'}'\n"
+        f"log_dir = '{tmp_path / 'logs'}'\n"
+        f"subtitle_cache_dir = '{tmp_path / 'subs'}'\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def _auth(
+    tmp_path: Path, *args: str, input_text: str | None = None, env: dict[str, str] | None = None
+) -> tuple[int, str]:
+    result = CliRunner().invoke(
+        app, ["auth", "--config", str(_config(tmp_path)), *args], input=input_text, env=env
+    )
+    return result.exit_code, result.output
+
+
+def test_auth_prompts_for_the_three_values_and_stores_them(
+    tmp_path: Path, cli_store: MemoryStore
+) -> None:
+    code, output = _auth(tmp_path, input_text=f"{API}\n{USER}\n{PHRASE}\n")
+    assert code == 0, output
+    assert cli_store.values == FULL
+    for typed in (API, USER, PHRASE):
+        assert typed not in output  # a hidden prompt never echoes
+    assert "[ OK ] stored opensubtitles_password" in output
+
+
+def test_auth_never_echoes_the_typed_password(tmp_path: Path, cli_store: MemoryStore) -> None:
+    _, output = _auth(tmp_path, input_text=f"{API}\n{USER}\n{PHRASE}\n")
+    assert PHRASE not in output
+
+
+def test_auth_prompts_through_typer_with_hidden_input(
+    tmp_path: Path, cli_store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import typer
+
+    calls: list[bool] = []
+    answers = iter([API, USER, PHRASE])
+
+    def fake_prompt(text: str, **kwargs: object) -> str:
+        calls.append(bool(kwargs.get("hide_input")))
+        return next(answers)
+
+    monkeypatch.setattr(typer, "prompt", fake_prompt)
+    code, _ = _auth(tmp_path)
+    assert code == 0
+    assert calls == [True, True, True]
+
+
+def test_auth_forgets_a_cached_login_token(tmp_path: Path, cli_store: MemoryStore) -> None:
+    cli_store.values[TOKEN] = "stale-token-value"
+    code, _ = _auth(tmp_path, input_text=f"{API}\n{USER}\n{PHRASE}\n")
+    assert code == 0
+    assert TOKEN not in cli_store.values
+
+
+def test_auth_registers_what_it_was_given_for_redaction(
+    tmp_path: Path, cli_store: MemoryStore
+) -> None:
+    _auth(tmp_path, input_text=f"{API}\n{USER}\n{PHRASE}\n")
+    assert PHRASE not in redact(f"password was {PHRASE}")
+
+
+def test_auth_strips_surrounding_whitespace(tmp_path: Path, cli_store: MemoryStore) -> None:
+    code, _ = _auth(tmp_path, input_text=f"  {API} \n{USER}\n\t{PHRASE}\n")
+    assert code == 0
+    assert cli_store.values == FULL
+
+
+def test_auth_stores_nothing_when_input_ends_early(tmp_path: Path, cli_store: MemoryStore) -> None:
+    code, _ = _auth(tmp_path, input_text=f"{API}\n")
+    assert code != 0
+    assert cli_store.values == {}
+
+
+def test_auth_rejects_a_blank_value_and_stores_nothing(
+    tmp_path: Path, cli_store: MemoryStore
+) -> None:
+    code, output = _auth(tmp_path, input_text=f"{API}\n{USER}\n   \n")
+    assert code == 2
+    assert "[FAIL]" in output
+    assert cli_store.values == {}
+
+
+def test_auth_status_lists_names_and_never_values(tmp_path: Path, cli_store: MemoryStore) -> None:
+    cli_store.values.update({API_KEY: API, PASSWORD: PHRASE})
+    code, output = _auth(tmp_path, "--status")
+    assert code == 0, output
+    assert "[ OK ] opensubtitles_api_key: set" in output
+    assert "[WARN] opensubtitles_username: not set" in output
+    assert "[ OK ] opensubtitles_password: set" in output
+    assert "[WARN] opensubtitles_token: not set" in output
+    assert API not in output
+    assert PHRASE not in output
+
+
+def test_auth_status_counts_environment_values_as_set(
+    tmp_path: Path, cli_store: MemoryStore
+) -> None:
+    code, output = _auth(
+        tmp_path, "--status", env={"VC_OPENSUBTITLES_API_KEY": "env-only-secret-value"}
+    )
+    assert code == 0
+    assert "opensubtitles_api_key: set" in output
+    assert "env-only-secret-value" not in output
+    assert "opensubtitles_username: not set" in output
+
+
+def test_auth_clear_deletes_all_four(tmp_path: Path, cli_store: MemoryStore) -> None:
+    cli_store.values.update({**FULL, TOKEN: "tok-value-1234"})
+    code, output = _auth(tmp_path, "--clear")
+    assert code == 0, output
+    assert cli_store.values == {}
+    assert "tok-value-1234" not in output
+
+
+def test_auth_status_and_clear_together_are_refused(tmp_path: Path, cli_store: MemoryStore) -> None:
+    cli_store.values.update(FULL)
+    code, output = _auth(tmp_path, "--status", "--clear")
+    assert code == 2
+    assert "[FAIL]" in output
+    assert cli_store.values == FULL
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--api-key", "x"], ["--password", "x"], ["--username", "x"], ["some-secret"]],
+)
+def test_auth_accepts_no_value_as_an_option_or_argument(
+    tmp_path: Path, cli_store: MemoryStore, args: list[str]
+) -> None:
+    code, _ = _auth(tmp_path, *args)
+    assert code == 2
+    assert cli_store.values == {}
+
+
+def test_auth_reports_a_store_error_without_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(env: object = None) -> MemoryStore:
+        raise CredentialError("no usable credential store")
+
+    monkeypatch.setattr(credentials, "open_store", broken)
+    code, output = _auth(tmp_path, "--status")
+    assert code == 2
+    assert "[FAIL]" in output
+    assert "no usable credential store" in output
+
+
+def test_auth_reports_a_failing_write_without_the_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Failing(MemoryStore):
+        def set(self, name: str, value: str) -> None:
+            raise CredentialError("keyring locked")
+
+    monkeypatch.setattr(credentials, "open_store", lambda env=None: Failing())
+    code, output = _auth(tmp_path, input_text=f"{API}\n{USER}\n{PHRASE}\n")
+    assert code == 2
+    assert "keyring locked" in output
+    assert PHRASE not in output
+
+
+def test_auth_names_the_file_store_when_it_is_the_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "credentials.json"
+    monkeypatch.setattr(credentials, "open_store", lambda env=None: FileStore(path))
+    code, output = _auth(tmp_path, "--status")
+    assert code == 0
+    assert str(path) in output
+
+
+def test_auth_with_a_missing_config_exits_2(tmp_path: Path, cli_store: MemoryStore) -> None:
+    result = CliRunner().invoke(app, ["auth", "--config", str(tmp_path / "missing.toml")])
+    assert result.exit_code == 2
+    assert "config" in result.output
