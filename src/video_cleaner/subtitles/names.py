@@ -36,8 +36,27 @@ _EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,5}")
 # File names that say nothing about the film, so the folder's name is used instead.
 _GENERIC_STEMS = frozenset({"movie", "video", "film", "main", "feature"})
 _SAME_TITLE_AS_FOLDER = 0.90
-# Roman numerals read as part of a title ("Rocky IV"); "i" is left out as an ordinary word.
-_ROMAN_NUMERALS = frozenset({"ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"})
+# Number words and roman numerals count as the digit they stand for, so "Part II", "Part Two"
+# and "Part 2" are one title. A lone "i" is an ordinary word unless a part word comes before it.
+_NUMBER_WORDS = {
+    **{
+        word: str(number)
+        for number, word in enumerate(
+            ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"), start=1
+        )
+    },
+    **{
+        numeral: str(number)
+        for number, numeral in enumerate(
+            ("ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"), start=2
+        )
+    },
+}
+_PART_WORDS = frozenset({"part", "volume", "chapter", "episode"})
+_WORD_ALIASES = {"pt": "part", "vol": "volume"}
+# A trailing "pt1"/"cd2"/"part 3" marker, and a "(1922)" year closing the name before it.
+_PART_WORD = re.compile(r"part", re.IGNORECASE)
+_YEAR_AT_END = re.compile(r"\((?:18|19|20)[0-9]{2}\)\s*\Z")
 # Titles that differ in a sequel number are different films however alike the rest is.
 _NUMBER_MISMATCH_CAP = 0.5
 _LATIN_LIMIT = 0x250  # end of Latin Extended-B: accents are stripped from these letters only
@@ -70,10 +89,21 @@ def parse_release_name(name: str) -> TitleYear:
         return _empty()
     raw_title = guess.get("title")
     title = raw_title if isinstance(raw_title, str) else ""
+    title = title.strip()
+    if title:
+        # guessit moves "Part II" and "Vol 2" out of the title; they say which film it is.
+        title = " ".join([title, *_numbered(guess.get("part"), "Part")])
+        title = " ".join([title, *_numbered(guess.get("volume"), "Volume")])
     raw_year = guess.get("year")
     year = raw_year if isinstance(raw_year, int) and _MIN_YEAR <= raw_year <= _MAX_YEAR else None
     is_episode = guess.get("season") is not None or guess.get("episode") is not None
-    return TitleYear(title=title.strip(), year=year, is_episode=is_episode)
+    return TitleYear(title=title, year=year, is_episode=is_episode)
+
+
+def _numbered(value: object, label: str) -> list[str]:
+    """ "Part 2" for a guessit part/volume value (a number, or a list of them)."""
+    numbers = value if isinstance(value, list) else [value]
+    return [f"{label} {number}" for number in numbers if isinstance(number, int)]
 
 
 def _parse_stem(stem: str) -> TitleYear:
@@ -94,16 +124,28 @@ def _without_extension(name: str) -> str:
     return name[: -len(suffix)] if _EXTENSION.fullmatch(suffix) else name
 
 
+def _without_split_marker(stem: str) -> str:
+    """Drop a trailing "pt1"/"cd1" marker that says the file is one piece of the movie.
+
+    A "part" marker only counts after the year ("Title (1922) - pt1"): on a bare name,
+    "Dune Part 2" is a sequel's title.
+    """
+    split = split_part_marker(stem)
+    if split is None:
+        return stem
+    base = split[0]
+    if _PART_WORD.search(stem, len(base)) and not _YEAR_AT_END.search(base):
+        return stem
+    return base
+
+
 def parse_library_name(path: Path) -> TitleYear:
     """Title and year of a library file: "Title (2010).mkv", with a " - pt1" marker stripped.
 
     The folder's name fills in what the file name lacks: its year when the titles agree, or the
     whole identity when the file is named something generic like "movie.mkv".
     """
-    stem = _without_extension(path.name)
-    split = split_part_marker(stem)
-    if split is not None:
-        stem = split[0]
+    stem = _without_split_marker(_without_extension(path.name[:MAX_NAME_CHARS]))
     parsed = _parse_stem(stem)
     if parsed.is_episode or parsed.year is not None:
         return parsed
@@ -124,6 +166,9 @@ def parse_library_name(path: Path) -> TitleYear:
 def normalise_title(title: str) -> str:
     """Casefold, strip Latin accents, "&" to "and", drop punctuation, collapse spaces.
 
+    Number words and roman numerals become digits ("Part Two", "Part II" -> "part 2"; "Pt" and
+    "Vol" are "part" and "volume").
+
     Only the first `MAX_NAME_CHARS` characters count. Accents come off Latin letters only, so
     kana and Cyrillic keep their marks (a voiced kana is not its unvoiced twin).
     """
@@ -142,13 +187,19 @@ def _normalise(title: str) -> str:
     text = unicodedata.normalize("NFC", "".join(kept))
     text = text.replace("'", "").replace("\u2019", "")
     spaced = "".join(char if char.isalnum() else " " for char in text)
-    return " ".join(spaced.split())
+    words: list[str] = []
+    for word in spaced.split():
+        word = _WORD_ALIASES.get(word, word)
+        if word in _NUMBER_WORDS:
+            word = _NUMBER_WORDS[word]
+        elif word == "i" and words and words[-1] in _PART_WORDS:
+            word = "1"
+        words.append(word)
+    return " ".join(words)
 
 
 def _number_tokens(normalised: str) -> frozenset[str]:
-    return frozenset(
-        token for token in normalised.split() if token.isdigit() or token in _ROMAN_NUMERALS
-    )
+    return frozenset(token for token in normalised.split() if token.isdigit())
 
 
 def title_similarity(a: str, b: str) -> float:

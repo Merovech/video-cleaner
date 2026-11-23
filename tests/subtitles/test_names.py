@@ -255,3 +255,115 @@ def test_similarity_stays_fast_for_hostile_long_titles() -> None:
 
 def test_the_name_length_cap_is_a_module_constant() -> None:
     assert names.MAX_NAME_CHARS == 256
+
+
+@pytest.mark.parametrize(
+    ("name", "title"),
+    [
+        ("The.Godfather.Part.II.en", "The Godfather Part 2"),
+        ("The Godfather Part II", "The Godfather Part 2"),
+        ("Dune.Part.Two.2024", "Dune Part 2"),
+        ("Dune.Part.2.2024", "Dune Part 2"),
+        ("Back.to.the.Future.Part.III.en", "Back to the Future Part 3"),
+        ("Kill.Bill.Vol.2.en", "Kill Bill Volume 2"),
+        ("Kill.Bill.Volume.2.2004", "Kill Bill Volume 2"),
+        ("Breaking.Dawn.Part.2.2012", "Breaking Dawn Part 2"),
+    ],
+)
+def test_release_name_keeps_the_part_or_volume_number_in_the_title(name: str, title: str) -> None:
+    assert parse_release_name(name).title == title
+
+
+def test_release_name_keeps_the_year_next_to_a_part_number() -> None:
+    parsed = parse_release_name("Dune.Part.Two.2024")
+
+    assert parsed.year == 2024
+    assert parsed.is_episode is False
+
+
+def test_a_disc_marker_or_an_edition_is_not_part_of_the_title() -> None:
+    assert parse_release_name("Alien.1979.CD1").title == "Alien"
+    assert parse_release_name("Alien.1979.Directors.Cut").title == "Alien"
+    assert parse_release_name("Movie.2010.Extended.Edition").title == "Movie"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("The Godfather Part II", "the godfather part 2"),
+        ("The Godfather Part 2", "the godfather part 2"),
+        ("Dune Part Two", "dune part 2"),
+        ("Dune Pt. 2", "dune part 2"),
+        ("Back to the Future Part III", "back to the future part 3"),
+        ("Godfather Part I", "godfather part 1"),
+        ("Kill Bill Vol. 2", "kill bill volume 2"),
+        ("Kill Bill Volume Two", "kill bill volume 2"),
+        ("Rocky IV", "rocky 4"),
+        ("Rocky 4", "rocky 4"),
+        ("Rocky", "rocky"),
+        ("Malcolm X", "malcolm 10"),
+    ],
+)
+def test_normalise_title_writes_word_and_roman_numbers_as_digits(raw: str, expected: str) -> None:
+    assert normalise_title(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("The Godfather Part II", "The Godfather"),
+        ("The Godfather Part 2", "The Godfather"),
+        ("Dune Part Two", "Dune"),
+        ("Back to the Future Part III", "Back to the Future"),
+        ("Kill Bill Vol. 2", "Kill Bill"),
+        ("Breaking Dawn Part 2", "Breaking Dawn"),
+        ("Mockingjay Part 2", "Mockingjay"),
+        ("Dune Part One", "Dune Part Two"),
+        ("Malcolm X", "Malcolm"),
+    ],
+)
+def test_titles_that_differ_in_a_part_number_are_never_similar(a: str, b: str) -> None:
+    assert title_similarity(a, b) <= 0.5
+    assert title_similarity(b, a) <= 0.5
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("The Godfather Part II", "The Godfather Part 2"),
+        ("Dune Part Two", "Dune Part 2"),
+        ("Dune Pt 2", "Dune Part Two"),
+        ("Kill Bill Vol. 2", "Kill Bill Volume Two"),
+        ("Rocky II", "Rocky 2"),
+        ("Godfather Part I", "Godfather Part 1"),
+    ],
+)
+def test_the_same_part_number_written_differently_is_the_same_title(a: str, b: str) -> None:
+    assert title_similarity(a, b) == 1.0
+
+
+def test_library_name_with_a_part_number_in_the_title_keeps_it() -> None:
+    assert parse_library_name(Path("Dune Part Two (2024).mkv")) == TitleYear("Dune Part Two", 2024)
+    assert parse_library_name(Path("Dune Part 2.mkv")).title == "Dune Part 2"
+
+
+def test_a_part_marker_is_stripped_only_where_it_marks_a_split_file() -> None:
+    assert parse_library_name(Path("Movie (2010) - pt1.mkv")).title == "Movie"
+    assert parse_library_name(Path("Movie (2010) - part 2.mkv")).title == "Movie"
+    assert parse_library_name(Path("Movie - cd1.mkv")).title == "Movie"
+    assert parse_library_name(Path("Movie.pt2.mkv")).title == "Movie"
+    # A bare "Part 2" on a name with no year is a sequel's title, not a split file.
+    assert parse_library_name(Path("Dune - Part 2.mkv")).title == "Dune Part 2"
+
+
+def test_a_name_made_of_separators_is_bounded_before_any_pattern_runs() -> None:
+    started = time.monotonic()
+    for hostile in (
+        "a" + " " * 100_000 + "x.mkv",
+        "a" + "-" * 100_000 + "x.mkv",
+        "." * 100_000 + "x",
+    ):
+        parse_library_name(Path(hostile))
+        parse_library_name(Path("Folder " + hostile[:200]) / hostile)
+
+    assert time.monotonic() - started < 10.0

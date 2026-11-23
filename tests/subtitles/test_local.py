@@ -24,7 +24,12 @@ from video_cleaner.subtitles.local import (
     index_local_folders,
     match_local,
 )
-from video_cleaner.subtitles.names import TitleYear, title_similarity
+from video_cleaner.subtitles.names import (
+    TitleYear,
+    parse_library_name,
+    parse_release_name,
+    title_similarity,
+)
 
 MB = 1024 * 1024
 
@@ -508,3 +513,65 @@ def test_a_hostile_long_title_is_matched_quickly() -> None:
 
     assert time.monotonic() - started < 5.0
     assert result is None
+
+
+def subtitle(name: str) -> LocalSubtitle:
+    """An indexed subtitle named like a downloaded release."""
+    return LocalSubtitle(Path("subs") / f"{name}.srt", parse_release_name(name))
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("The.Godfather.Part.II.en", "The Godfather (1972).mkv"),
+        ("The Godfather Part II", "The Godfather (1972).mkv"),
+        ("Dune.Part.Two.en", "Dune (2021).mkv"),
+        ("Dune.Part.Two.en", "Dune (1984).mkv"),
+        ("Back.to.the.Future.Part.III.en", "Back to the Future (1985).mkv"),
+        ("Kill.Bill.Vol.2.en", "Kill Bill (2003).mkv"),
+        ("Breaking.Dawn.Part.2.2012", "Breaking Dawn (2011).mkv"),
+        ("Mockingjay.Part.2.2015", "Mockingjay (2014).mkv"),
+        ("Dune.Part.Two.2024", "Dune (2023).mkv"),
+        ("Dune.Part.Two.2024", "Dune (2024).mkv"),
+        # And the other way round: the library file is the sequel.
+        ("Dune.en", "Dune Part Two (2024).mkv"),
+        ("Dune.2021", "Dune Part Two (2021).mkv"),
+        ("The.Godfather.1972.en", "The Godfather Part II (1974).mkv"),
+        ("The Godfather", "The Godfather Part II (1972).mkv"),
+        ("Kill.Bill.2003", "Kill Bill Vol. 2 (2004).mkv"),
+        ("Dune.Part.One.2021", "Dune Part Two (2021).mkv"),
+    ],
+)
+def test_a_sequel_and_its_original_never_match(release: str, library: str) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Dune.Part.Two.2024", "Dune Part Two (2024).mkv"),
+        ("Dune.Part.2.2024", "Dune Part Two (2024).mkv"),
+        ("Dune.Part.Two.en", "Dune Part Two (2024).mkv"),
+        ("The Godfather Part II", "The Godfather Part 2 (1974).mkv"),
+        ("The.Godfather.Part.II.1974.en", "The Godfather Part II (1974).mkv"),
+        ("Kill.Bill.Vol.2.2004.en", "Kill Bill Vol. 2 (2004).mkv"),
+        ("Kill.Bill.Volume.2.2004", "Kill Bill Vol 2 (2004).mkv"),
+        ("Rocky.II.1979", "Rocky 2 (1979).mkv"),
+        ("Back.to.the.Future.Part.III.1990", "Back to the Future Part III (1990).mkv"),
+    ],
+)
+def test_the_same_sequel_matches_however_its_number_is_written(release: str, library: str) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is not None
+    assert result.path == Path("subs") / f"{release}.srt"
+
+
+def test_a_sequel_subtitle_is_picked_over_the_original_for_the_sequel() -> None:
+    index = [subtitle("Dune.2021.en"), subtitle("Dune.Part.Two.2024.en")]
+
+    result = match_local(index, parse_library_name(Path("Dune Part Two (2024).mkv")))
+
+    assert result == LocalCandidate(index[1].path, 1.0)
