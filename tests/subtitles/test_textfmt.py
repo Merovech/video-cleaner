@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import time
+
 import pysubs2
 import pytest
 
 from video_cleaner.subtitles import textfmt
 from video_cleaner.subtitles.textfmt import (
     Cue,
+    NormalisedSubtitle,
     SubtitleRejected,
     cues_per_hour,
     decode_subtitle_bytes,
@@ -404,3 +407,159 @@ def test_to_srt_of_nothing_is_empty() -> None:
 
 def test_to_srt_cannot_be_split_by_blank_lines_in_text() -> None:
     assert to_srt([Cue(0, 1000, "a\n\n\nb")]) == "1\n00:00:00,000 --> 00:00:01,000\na\nb\n"
+
+
+# --- bounded cost on hostile input --------------------------------------------------------
+
+SRT_HEAD = b"1\n00:00:01,000 --> 00:00:02,000\n"
+HUGE = 20_000_000
+TIME_BOUND_S = 2.0
+
+
+def _timed_normalise(raw: bytes) -> tuple[float, NormalisedSubtitle | None]:
+    started = time.perf_counter()
+    try:
+        result: NormalisedSubtitle | None = normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
+    except SubtitleRejected:
+        result = None
+    return time.perf_counter() - started, result
+
+
+def test_a_cue_of_many_long_unclosed_tag_lines_is_rejected_quickly() -> None:
+    raw = SRT_HEAD + (b"<a" * 9500 + b"\n") * 50
+    started = time.perf_counter()
+    with pytest.raises(SubtitleRejected, match="markup"):
+        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
+    assert time.perf_counter() - started < TIME_BOUND_S
+
+
+def test_a_cue_of_many_short_tag_heavy_lines_is_rejected_quickly() -> None:
+    raw = SRT_HEAD + b"<a<a<a<a\n" * 50_000
+    started = time.perf_counter()
+    with pytest.raises(SubtitleRejected, match="markup"):
+        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
+    assert time.perf_counter() - started < TIME_BOUND_S
+
+
+def test_many_cues_each_with_an_unclosed_tag_run_are_rejected_quickly() -> None:
+    cue = b"00:00:01,000 --> 00:00:02,000\n" + b"<a" * 2000 + b"\n\n"
+    raw = b"".join(b"%d\n" % i + cue for i in range(1, 400))
+    started = time.perf_counter()
+    with pytest.raises(SubtitleRejected, match="markup"):
+        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
+    assert time.perf_counter() - started < TIME_BOUND_S
+
+
+def test_a_webvtt_cue_of_many_unclosed_tag_lines_is_rejected_quickly() -> None:
+    raw = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n" + (b"<a" * 9500 + b"\n") * 50
+    started = time.perf_counter()
+    with pytest.raises(SubtitleRejected, match="markup"):
+        normalise_subtitle(raw, max_bytes=HUGE, min_cues=1)
+    assert time.perf_counter() - started < TIME_BOUND_S
+
+
+def test_more_than_the_allowed_number_of_angle_brackets_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(textfmt, "MAX_ANGLE_BRACKETS", 3)
+    raw = srt_with(("00:00:01,000", "00:00:02,000", "<i>a</i> <b>b</b>"))
+    with pytest.raises(SubtitleRejected, match="markup"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        (b"{" * 19_000 + b"\n") * 50,
+        (rb"{\i1}" * 3000 + b"\n") * 60,
+        (rb"\N" * 9000 + b"\n") * 50,
+        (b"< " * 9500 + b"\n") * 50,
+        (b"</" * 9500 + b"\n") * 50,
+    ],
+    ids=["brace-runs", "override-runs", "break-runs", "open-space-runs", "close-slash-runs"],
+)
+def test_other_hostile_shapes_return_within_the_time_bound(body: bytes) -> None:
+    elapsed, _ = _timed_normalise(SRT_HEAD + body)
+    assert elapsed < TIME_BOUND_S
+
+
+def test_a_tag_rich_ordinary_subtitle_is_accepted_unchanged() -> None:
+    blocks = []
+    for i in range(1, 801):
+        start = f"00:{i // 60:02d}:{i % 60:02d},000"
+        end = f"00:{i // 60:02d}:{i % 60:02d},900"
+        text = f'<i>Line {i}</i> with <font color="#ffffff"><b>bold</b></font>\n<u>second</u> line'
+        blocks.append(f"{i}\n{start} --> {end}\n{text}\n")
+    result = normalise_subtitle("\n".join(blocks).encode(), max_bytes=BIG * 5, min_cues=800)
+    assert len(result.cues) == 800
+    assert result.cues[0].text == "Line 1 with bold\nsecond line"
+    assert result.cues[799].text == "Line 800 with bold\nsecond line"
+
+
+def test_an_ordinary_ass_subtitle_with_many_override_tags_is_accepted() -> None:
+    header = ASS.split(b"Dialogue:")[0]
+    lines = b"".join(
+        rb"Dialogue: 0,0:00:%02d.00,0:00:%02d.50,Default,,0,0,0,,{\an8\b1}A{\b0} {\i1}b{\i0}\Nc"
+        % (i % 60, i % 60)
+        + b"\n"
+        for i in range(500)
+    )
+    result = normalise_subtitle(header + lines, max_bytes=BIG, min_cues=500)
+    assert len(result.cues) == 500
+    assert result.cues[0].text == "A b\nc"
+
+
+# --- timestamps that the parser would silently misread ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "100:00:00,000",
+        "100:00:01,000",
+        "1000:00:01,000",
+        "1000000000000:00:01,000",
+        "0000100:00:01,000",
+    ],
+)
+def test_srt_hours_of_100_or_more_are_rejected(stamp: str) -> None:
+    raw = srt_with(("00:00:01,000", stamp, "x"))
+    with pytest.raises(SubtitleRejected, match="100 hours"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+def test_leading_zeros_in_the_hours_do_not_make_them_long() -> None:
+    raw = srt_with(("0001:00:00,000", "0001:00:01,000", "x"))
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+    assert result.cues[0].start_ms == 3_600_000
+
+
+def test_hours_of_99_59_59_are_still_accepted() -> None:
+    raw = srt_with(("99:59:58,000", "99:59:59,000", "edge"))
+    assert normalise_subtitle(raw, max_bytes=BIG, min_cues=1).cues[0].end_ms == 359_999_000
+
+
+@pytest.mark.parametrize("stamp", ["100:00.000", "1000:00.000", "123:45.678"])
+def test_webvtt_minutes_of_three_digits_are_rejected(stamp: str) -> None:
+    raw = f"WEBVTT\n\n00:01.000 --> {stamp}\nx\n".encode()
+    with pytest.raises(SubtitleRejected, match="malformed timestamp"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+def test_webvtt_hours_of_100_or_more_are_rejected() -> None:
+    raw = b"WEBVTT\n\n100:00:00.000 --> 100:00:01.000\nx\n"
+    with pytest.raises(SubtitleRejected, match="100 hours"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+def test_a_20000_digit_hours_field_is_a_rejection_not_a_value_error() -> None:
+    raw = SRT_HEAD.replace(b"00:00:02,000", b"1" * 20_000 + b":00:02,000") + b"x\n"
+    with pytest.raises(SubtitleRejected):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+def test_a_digit_run_longer_than_the_int_limit_is_handled_by_the_line_guard() -> None:
+    # Python refuses int() on more than 4300 digits; the check must not call int() on the run.
+    raw = SRT_HEAD.replace(b"00:00:02,000", b"1" * 5_000 + b":00:02,000") + b"x\n"
+    with pytest.raises(SubtitleRejected, match="100 hours"):
+        normalise_subtitle(raw, max_bytes=BIG, min_cues=1)

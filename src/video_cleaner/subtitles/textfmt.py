@@ -37,9 +37,18 @@ _BINARY_MAX_RATIO = 0.01
 _HTML_PAGE_RE = re.compile(r"<\s*(?:!doctype\s+html|html|head|body)\b", re.IGNORECASE)
 _HTML_SNIFF_CHARS = 4096
 
-# Hours with three or more digits: the parsers read only the last two, so a timestamp such as
-# 100:00:01 would silently turn into 00:00:01 and has to be caught first.
-_LONG_HOURS_RE = re.compile(r"(?<!\d)(\d{3,12}):(\d{1,2}):(\d{1,2})[.,](\d{1,3})(?!\d)")
+#: The SRT/WebVTT tag-stripping step of the parser rescans from every "<" to the next ">", so
+#: a cue full of unclosed "<" costs the number of "<" times the cue length. These two limits
+#: bound that work: how many "<" a file may have, and how many characters those scans may cover
+#: in total (about a tenth of a second of work). Ordinary subtitles use a small fraction.
+MAX_ANGLE_BRACKETS = 200_000
+MAX_MARKUP_SCAN_CHARS = 200_000_000
+
+# The parsers keep only the last two digits of an hours field (SRT, WebVTT hh:mm:ss.mmm) or of a
+# minutes field (WebVTT mm:ss.mmm), so 100:00:01 would silently turn into 00:00:01. These find
+# fields with three or more digits; the digits are judged as text, never converted to an int.
+_LONG_HOURS_RE = re.compile(r"(?<!\d)(\d{3,}):\d{1,2}:\d{1,2}[.,]\d")
+_LONG_MINUTES_RE = re.compile(r"(?<!\d)(\d{3,}):\d{2}[.,]\d{2}")
 
 _ASS_OVERRIDE_RE = re.compile(r"\{[^{}]*\}")
 _ASS_DRAWING_RE = re.compile(r"\{[^{}]*\\p\d")
@@ -114,7 +123,8 @@ def normalise_subtitle(raw: bytes, *, max_bytes: int, min_cues: int) -> Normalis
     if _HTML_PAGE_RE.search(text[:_HTML_SNIFF_CHARS]):
         raise SubtitleRejected("subtitle is an HTML page, not a subtitle")
     _reject_long_lines(text)
-    _reject_long_hours(text)
+    _reject_long_timestamp_fields(text)
+    _reject_costly_markup(text)
 
     source_format, events = _parse(text)
 
@@ -177,13 +187,31 @@ def _reject_long_lines(text: str) -> None:
         raise SubtitleRejected(f"subtitle has a line longer than {MAX_LINE_CHARS} characters")
 
 
-def _reject_long_hours(text: str) -> None:
+def _reject_long_timestamp_fields(text: str) -> None:
+    """Reject hours of 100 or more and minutes of 100 or more (leading zeros do not count)."""
     for match in _LONG_HOURS_RE.finditer(text):
-        hours, minutes, seconds, fraction = match.groups()
-        millis = int(fraction.ljust(3, "0"))
-        total = ((int(hours) * 60 + int(minutes)) * 60 + int(seconds)) * 1000 + millis
-        if total > MAX_TIMESTAMP_MS:
+        if len(match.group(1).lstrip("0")) >= 3:
             raise SubtitleRejected("subtitle has a timestamp beyond 100 hours")
+    for match in _LONG_MINUTES_RE.finditer(text):
+        if len(match.group(1).lstrip("0")) >= 3:
+            raise SubtitleRejected("subtitle has a malformed timestamp (minutes field too long)")
+
+
+def _reject_costly_markup(text: str) -> None:
+    """Bound the parser's tag-stripping work: see `MAX_ANGLE_BRACKETS`."""
+    if text.count("<") > MAX_ANGLE_BRACKETS:
+        raise SubtitleRejected("subtitle has too much markup")
+    scanned = 0
+    close = -1  # position of the ">" that ends the scan of every "<" before it
+    opening = text.find("<")
+    while opening != -1:
+        if close < opening:
+            found = text.find(">", opening)
+            close = found if found != -1 else len(text)
+        scanned += close - opening
+        if scanned > MAX_MARKUP_SCAN_CHARS:
+            raise SubtitleRejected("subtitle has too much markup")
+        opening = text.find("<", opening + 1)
 
 
 def _parse(text: str) -> tuple[str, list[pysubs2.SSAEvent]]:
