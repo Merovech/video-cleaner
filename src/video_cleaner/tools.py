@@ -59,6 +59,15 @@ class ToolFailed(Exception):
         super().__init__(f"command exited with code {returncode}: {cmd_text}{where}")
 
 
+class ToolTimedOut(Exception):
+    """A tool ran longer than the *timeout_s* given to `run_tool`; it has been stopped."""
+
+    def __init__(self, label: str, timeout_s: float) -> None:
+        self.label = label
+        self.timeout_s = timeout_s
+        super().__init__(f"{label}: stopped after {timeout_s:g}s without finishing")
+
+
 class ToolOutputError(Exception):
     """Output handling for a tool run broke.
 
@@ -332,13 +341,19 @@ def heartbeat(
         beat.join(timeout=join_timeout_s)
 
 
-def _wait_interruptibly(proc: subprocess.Popen[str]) -> int:
-    """`proc.wait()` in slices of `_WAIT_SLICE_S`, so a KeyboardInterrupt is never stuck."""
+def _wait_interruptibly(proc: subprocess.Popen[str], label: str, timeout_s: float | None) -> int:
+    """`proc.wait()` in slices of `_WAIT_SLICE_S`, so a KeyboardInterrupt is never stuck.
+
+    Raises `ToolTimedOut` once *timeout_s* seconds have passed (never, if it is None); the
+    caller stops the process.
+    """
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     while True:
         try:
             return proc.wait(timeout=_WAIT_SLICE_S)
         except subprocess.TimeoutExpired:
-            continue
+            if timeout_s is not None and deadline is not None and time.monotonic() >= deadline:
+                raise ToolTimedOut(label, timeout_s) from None
 
 
 def _stop_process(proc: subprocess.Popen[str]) -> None:
@@ -407,8 +422,10 @@ def run_tool(
     parser: Callable[[Iterable[str]], Iterator[Progress]] | None = None,
     stderr_log: Path | None = None,
     cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
     check: bool = True,
     join_timeout_s: float = _DEFAULT_JOIN_TIMEOUT_S,
+    timeout_s: float | None = None,
 ) -> ToolResult:
     """Run *cmd* (an argument list, never a shell) and return its result.
 
@@ -418,11 +435,17 @@ def run_tool(
     every *heartbeat_s* seconds. The child is terminated, then killed, if this call is
     interrupted or fails.
 
-    Raises `ToolFailed` on a non-zero exit when *check* is true, `ToolNotFound` if the
-    executable does not exist, and `ToolOutputError` if the parser, the reporter or a reader
-    thread failed, or a reader had not finished *join_timeout_s* after the process exited
-    (typically a grandchild holding the pipe). Output errors are raised after the process has
-    exited and the readers are done; the pipes are always drained meanwhile.
+    *env* is the child's whole environment; None (the default) inherits this process's. It is
+    copied, and this process's environment is never changed. With *timeout_s* the child is
+    stopped (terminated, then killed) once it has run that long and `ToolTimedOut` is raised;
+    None waits for as long as the tool takes.
+
+    Raises `ToolFailed` on a non-zero exit when *check* is true, `ToolTimedOut` when *timeout_s*
+    passes, `ToolNotFound` if the executable does not exist, and `ToolOutputError` if the
+    parser, the reporter or a reader thread failed, or a reader had not finished
+    *join_timeout_s* after the process exited (typically a grandchild holding the pipe). Output
+    errors are raised after the process has exited and the readers are done; the pipes are always
+    drained meanwhile.
     """
     cmd_text = redact(subprocess.list2cmdline([str(part) for part in cmd]))
     _log.debug("run [%s]: %s", label, cmd_text)
@@ -437,6 +460,7 @@ def run_tool(
             encoding="utf-8",
             errors="replace",
             cwd=cwd,
+            env=None if env is None else dict(env),
             shell=False,
             creationflags=power.creation_flags(),  # below normal: the PC stays usable
         )
@@ -459,7 +483,7 @@ def run_tool(
         with heartbeat(
             reporter, label, heartbeat_s, started=started, join_timeout_s=join_timeout_s
         ):
-            returncode = _wait_interruptibly(proc)
+            returncode = _wait_interruptibly(proc, label, timeout_s)
     except BaseException:
         _stop_process(proc)
         raise

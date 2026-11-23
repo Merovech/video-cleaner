@@ -24,6 +24,7 @@ from video_cleaner.tools import (
     ToolOutputError,
     ToolResult,
     Tools,
+    ToolTimedOut,
     locate_tools,
     mkvmerge_parser,
     run_tool,
@@ -311,6 +312,52 @@ def test_run_tool_passes_cwd(tmp_path: Path) -> None:
         _py("import os; print(os.getcwd())"), label="cwd", reporter=FakeReporter(), cwd=tmp_path
     )
     assert Path(result.stdout.strip()).resolve() == tmp_path.resolve()
+
+
+def test_run_tool_child_sees_the_given_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VC_TEST_ENV_MARKER", raising=False)
+    env = {**os.environ, "VC_TEST_ENV_MARKER": "from-the-caller"}
+    code = "import os; print(os.environ.get('VC_TEST_ENV_MARKER', 'unset'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter(), env=env)
+    assert result.stdout.strip() == "from-the-caller"
+    # Giving the child an environment never changes this process's.
+    assert "VC_TEST_ENV_MARKER" not in os.environ
+
+
+def test_run_tool_without_env_inherits_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VC_TEST_ENV_MARKER", "inherited")
+    code = "import os; print(os.environ.get('VC_TEST_ENV_MARKER', 'unset'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter())
+    assert result.stdout.strip() == "inherited"
+
+
+def test_run_tool_env_replaces_rather_than_extends(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VC_TEST_ENV_MARKER", "inherited")
+    env = {k: v for k, v in os.environ.items() if k != "VC_TEST_ENV_MARKER"}
+    code = "import os; print(os.environ.get('VC_TEST_ENV_MARKER', 'unset'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter(), env=env)
+    assert result.stdout.strip() == "unset"
+
+
+def test_run_tool_timeout_stops_the_child_and_raises() -> None:
+    started = time.monotonic()
+    with pytest.raises(ToolTimedOut) as excinfo:
+        run_tool(
+            _py("import time; time.sleep(60)"),
+            label="slow",
+            reporter=FakeReporter(),
+            timeout_s=0.5,
+        )
+    assert time.monotonic() - started < 30
+    assert excinfo.value.timeout_s == 0.5
+    assert excinfo.value.label == "slow"
+    assert "0.5" in str(excinfo.value)
+
+
+def test_run_tool_within_the_timeout_returns_normally() -> None:
+    result = run_tool(_py("print('done')"), label="quick", reporter=FakeReporter(), timeout_s=60.0)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "done"
 
 
 def test_run_tool_logs_redacted_command_exit_code_and_duration() -> None:

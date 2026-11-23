@@ -1,0 +1,14 @@
+[12:00:00] INFO     extracting speech segments from reference  ffsubsync.py:734
+                    'silent.mkv'...                                            
+
+100%|█████████▉| 60.032/60.064 [00:00<00:00, 1364.16it/s]
+           INFO     total of speech segments: 0.0    speech_transformers.py:763
+           INFO     ...done                                    ffsubsync.py:736
+           INFO     extracting speech segments from subtitles  ffsubsync.py:192
+                    file(s) ['in.srt']...                                      
+           INFO     computing alignments...                    ffsubsync.py:234
+           INFO     ...done                                    ffsubsync.py:250
+           INFO     score: 324.167                             ffsubsync.py:255
+           INFO     offset seconds: 4.780                      ffsubsync.py:256
+           INFO     framerate scale factor: 1.043              ffsubsync.py:257
+           INFO     writing output to out4.srt                 ffsubsync.py:350
