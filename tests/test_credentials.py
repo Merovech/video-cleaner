@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import keyring
@@ -27,6 +28,7 @@ from video_cleaner.credentials import (
     KeyringStore,
     OpenSubtitlesCredentials,
     credentials_file_path,
+    current_identity,
     load_credentials,
     open_store,
     restrict_to_owner,
@@ -36,6 +38,7 @@ from video_cleaner.logging_setup import redact
 API = "k3y-abcdef-123456"
 USER = "someuser"
 PHRASE = "hunter2-hunter2"
+SID = "*S-1-5-21-111-222-333-1001"
 
 
 class MemoryStore:
@@ -174,14 +177,14 @@ def test_restrict_to_owner_runs_icacls_without_a_shell_on_windows(tmp_path: Path
         return 0, ""
 
     target = tmp_path / "credentials.json"
-    restrict_to_owner(target, windows=True, user="ari", system_root="C:/Win", run=run)
+    restrict_to_owner(target, windows=True, identity=SID, system_root="C:/Win", run=run)
     assert calls == [
         [
             str(Path("C:/Win") / "System32" / "icacls.exe"),
             str(target),
             "/inheritance:r",
             "/grant:r",
-            "ari:F",
+            f"{SID}:F",
         ]
     ]
 
@@ -191,7 +194,7 @@ def test_restrict_to_owner_reports_an_icacls_failure(tmp_path: Path) -> None:
         return 5, "Access is denied.\n"
 
     with pytest.raises(CredentialError, match="Access is denied"):
-        restrict_to_owner(tmp_path / "x", windows=True, user="ari", system_root="C:/Win", run=run)
+        restrict_to_owner(tmp_path / "x", windows=True, identity=SID, system_root="C:/Win", run=run)
 
 
 def test_restrict_to_owner_reports_a_missing_icacls(tmp_path: Path) -> None:
@@ -199,7 +202,82 @@ def test_restrict_to_owner_reports_a_missing_icacls(tmp_path: Path) -> None:
         raise FileNotFoundError("icacls")
 
     with pytest.raises(CredentialError, match="icacls"):
-        restrict_to_owner(tmp_path / "x", windows=True, user="ari", system_root="C:/Win", run=run)
+        restrict_to_owner(tmp_path / "x", windows=True, identity=SID, system_root="C:/Win", run=run)
+
+
+WHOAMI_CSV = '"shiva\\ariro","S-1-5-21-111-222-333-1001"\r\n'
+
+
+def test_current_identity_is_the_sid_of_the_process_token() -> None:
+    calls: list[list[str]] = []
+
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        calls.append(list(cmd))
+        return 0, WHOAMI_CSV
+
+    identity = current_identity(system_root="C:/Win", run=run, env={})
+    assert identity == SID
+    assert calls == [
+        [str(Path("C:/Win") / "System32" / "whoami.exe"), "/user", "/fo", "csv", "/nh"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [(1, ""), (0, ""), (0, "garbage"), (0, '"a\\b","not-a-sid"\r\n'), (0, '"only-one-field"\r\n')],
+)
+def test_current_identity_falls_back_to_the_domain_qualified_name(result: tuple[int, str]) -> None:
+    env = {"USERDOMAIN": "SHIVA", "USERNAME": "ariro"}
+    identity = current_identity(system_root="C:/Win", run=lambda cmd: result, env=env)
+    assert identity == "SHIVA\\ariro"
+
+
+def test_current_identity_falls_back_when_whoami_cannot_run() -> None:
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        raise FileNotFoundError("whoami")
+
+    env = {"USERDOMAIN": "SHIVA", "USERNAME": "ariro"}
+    assert current_identity(system_root="C:/Win", run=run, env=env) == "SHIVA\\ariro"
+
+
+@pytest.mark.parametrize("env", [{}, {"USERNAME": "ariro"}, {"USERDOMAIN": "SHIVA"}])
+def test_current_identity_without_any_identity_is_an_error(env: dict[str, str]) -> None:
+    with pytest.raises(CredentialError, match="identity"):
+        current_identity(system_root="C:/Win", run=lambda cmd: (1, ""), env=env)
+
+
+def test_restrict_to_owner_grants_the_process_identity_not_the_login_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("USERNAME", "someone-else")
+    monkeypatch.setenv("USERDOMAIN", "ELSEWHERE")
+    calls: list[list[str]] = []
+
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        calls.append(list(cmd))
+        return (0, WHOAMI_CSV) if Path(cmd[0]).stem == "whoami" else (0, "")
+
+    restrict_to_owner(tmp_path / "c.json", windows=True, system_root="C:/Win", run=run)
+    icacls = next(c for c in calls if Path(c[0]).stem == "icacls")
+    assert icacls[-1] == SID + ":F"
+    assert "someone-else" not in " ".join(icacls)
+
+
+def test_restrict_to_owner_stops_when_no_identity_can_be_found(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def run(cmd: Sequence[str]) -> tuple[int, str]:
+        calls.append(list(cmd))
+        return 1, ""
+
+    with pytest.raises(CredentialError, match="identity"):
+        restrict_to_owner(tmp_path / "c.json", windows=True, system_root="C:/Win", run=run, env={})
+    assert all(Path(c[0]).stem != "icacls" for c in calls)  # nothing was granted
+
+
+@pytest.mark.skipif(os.name != "nt", reason="whoami and the token are Windows only")
+def test_the_real_identity_is_a_sid() -> None:
+    assert re.fullmatch(r"\*S-1-\d+(-\d+)+", current_identity())
 
 
 def test_restrict_to_owner_uses_chmod_on_posix(tmp_path: Path) -> None:
@@ -243,6 +321,75 @@ def test_keyring_store_round_trip_uses_the_service_name() -> None:
     store.delete(API_KEY)
     assert store.get(API_KEY) is None
     store.delete(API_KEY)  # already gone: not an error
+
+
+class PyWinError(Exception):
+    """Stands in for `pywintypes.error`, which the Windows backend lets through unwrapped."""
+
+
+class WinBackend(FakeBackend):
+    def get_password(self, service: str, username: str) -> str | None:
+        raise PyWinError(f"(1312, 'CredRead', {PHRASE})")
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        raise PyWinError(f"(1312, 'CredWrite', {password})")
+
+    def delete_password(self, service: str, username: str) -> None:
+        raise PyWinError(f"(1312, 'CredDelete', {PHRASE})")
+
+
+def test_keyring_store_wraps_any_backend_error_with_the_type_name_only() -> None:
+    store = KeyringStore(WinBackend())
+    calls: list[Callable[[], object]] = [
+        lambda: store.get(API_KEY),
+        lambda: store.set(API_KEY, PHRASE),
+        lambda: store.delete(API_KEY),
+    ]
+    for call in calls:
+        with pytest.raises(CredentialError) as info:
+            call()
+        assert "PyWinError" in str(info.value)
+        assert PHRASE not in str(info.value)
+        assert info.value.__cause__ is None
+        assert info.value.__suppress_context__
+
+
+def test_file_store_wraps_a_failing_folder_creation(tmp_path: Path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file where a folder is needed", encoding="utf-8")
+    with pytest.raises(CredentialError) as info:
+        FileStore(blocker / "sub" / "credentials.json").set(API_KEY, PHRASE)
+    assert PHRASE not in str(info.value)
+    assert info.value.__cause__ is None
+
+
+def test_file_store_wraps_a_failing_replace_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_replace(src: object, dst: object) -> None:
+        raise PermissionError(f"locked while writing {PHRASE}")
+
+    monkeypatch.setattr(os, "replace", broken_replace)
+    with pytest.raises(CredentialError) as info:
+        FileStore(tmp_path / "credentials.json").set(API_KEY, PHRASE)
+    assert "PermissionError" in str(info.value)
+    assert PHRASE not in str(info.value)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_file_store_wraps_a_failing_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tempfile
+
+    def broken_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        raise OSError(f"disk full {PHRASE}")
+
+    monkeypatch.setattr(tempfile, "mkstemp", broken_mkstemp)
+    with pytest.raises(CredentialError) as info:
+        FileStore(tmp_path / "credentials.json").set(API_KEY, PHRASE)
+    assert "OSError" in str(info.value)
+    assert PHRASE not in str(info.value)
 
 
 def test_keyring_store_wraps_backend_errors_without_the_secret() -> None:
@@ -604,3 +751,62 @@ def test_auth_with_a_missing_config_exits_2(tmp_path: Path, cli_store: MemorySto
     result = CliRunner().invoke(app, ["auth", "--config", str(tmp_path / "missing.toml")])
     assert result.exit_code == 2
     assert "config" in result.output
+
+
+def _fail_with(error: Exception) -> type[MemoryStore]:
+    class Failing(MemoryStore):
+        def get(self, name: str) -> str | None:
+            raise error
+
+        def set(self, name: str, value: str) -> None:
+            raise error
+
+        def delete(self, name: str) -> None:
+            raise error
+
+    return Failing
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(f"disk full while writing {PHRASE} {API}"),
+        PyWinError(f"(1312, 'CredWrite', {PHRASE})"),
+        RuntimeError(f"{USER} {PHRASE}"),
+    ],
+    ids=["OSError", "PyWinError", "RuntimeError"],
+)
+@pytest.mark.parametrize("args", [(), ("--status",), ("--clear",)])
+def test_auth_turns_any_store_error_into_a_fail_line_without_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, args: tuple[str, ...]
+) -> None:
+    store = _fail_with(error)()
+    monkeypatch.setattr(credentials, "open_store", lambda env=None: store)
+    typed = os.linesep.join([API, USER, PHRASE]) + os.linesep
+    code, output = _auth(tmp_path, *args, input_text=typed)
+    assert code == 2
+    assert "[FAIL]" in output
+    assert "Traceback" not in output
+    assert type(error).__name__ in output
+    for secret in (API, USER, PHRASE):
+        assert secret not in output
+
+
+def test_auth_with_a_real_failing_file_store_names_no_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    store = FileStore(blocker / "credentials.json")
+    monkeypatch.setattr(credentials, "open_store", lambda env=None: store)
+    typed = os.linesep.join([API, USER, PHRASE]) + os.linesep
+    result = CliRunner().invoke(
+        app, ["auth", "--config", str(_config(tmp_path))], input=typed, catch_exceptions=False
+    )
+    assert result.exit_code == 2
+    assert "[FAIL]" in result.output
+    assert PHRASE not in result.output
+
+
+def test_the_app_never_shows_local_variables_in_a_traceback() -> None:
+    assert app.pretty_exceptions_show_locals is False

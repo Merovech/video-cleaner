@@ -313,6 +313,10 @@ class _Doctor:
         except creds.CredentialError as exc:
             yield Check(name, False, f"credential store unusable: {exc}", required=False)
             return
+        except Exception as exc:  # a backend's own error type; its text could hold a value
+            detail = f"credential store unusable: {type(exc).__name__}"
+            yield Check(name, False, detail, required=False)
+            return
         if missing:
             detail = (
                 f"not set: {', '.join(missing)}; run `video-cleaner auth` (subtitles need them)"

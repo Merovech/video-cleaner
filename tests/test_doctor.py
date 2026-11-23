@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 import time
@@ -126,6 +127,13 @@ def _run(tmp_path: Path, **kwargs: object) -> dict[str, Check]:
     }
     params.update(kwargs)
     return _by_name(run_doctor(settings, **params))  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_appdata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whatever a test runs through the real environment sees an empty LOCALAPPDATA of its own,
+    never the user's config, credentials file or logs."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "isolated-localappdata"))
 
 
 def test_doctor_all_ok(tmp_path: Path) -> None:
@@ -620,3 +628,60 @@ def test_doctor_keeps_the_informational_keyring_check(tmp_path: Path) -> None:
     check = _run(tmp_path, credential_store=_Store())["keyring"]
     assert check.ok is True
     assert not check.required
+
+
+def test_doctor_credential_store_with_any_other_error_is_a_warning(tmp_path: Path) -> None:
+    class PyWinError(Exception):  # what the Windows keyring backend lets through
+        pass
+
+    class Broken(_Store):
+        def get(self, name: str) -> str | None:
+            raise PyWinError(f"(1312, 'CredRead', secret-detail-{name})")
+
+    checks = _run(tmp_path, credential_store=Broken())
+    check = checks["credentials"]
+    assert check.ok is False
+    assert check.required is False
+    assert "PyWinError" in check.detail
+    assert "secret-detail" not in check.detail
+    assert "credentials file permissions" in checks  # later checks still ran
+
+
+def test_doctor_fails_when_the_subtitle_cache_is_inside_the_library(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings = dataclasses.replace(settings, subtitle_cache_dir=settings.library_root / "subs")
+    check = _run(tmp_path, settings=settings)["library overlap"]
+    assert check.ok is False
+    assert check.required is True
+    assert "subtitle cache" in check.detail
+
+
+def test_doctor_fails_when_the_library_is_inside_the_subtitle_cache(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings = dataclasses.replace(settings, subtitle_cache_dir=tmp_path)
+    check = _run(tmp_path, settings=settings)["library overlap"]
+    assert check.ok is False
+    assert "subtitle cache" in check.detail
+
+
+def test_cli_writing_command_refuses_a_subtitle_cache_in_the_library(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + f"subtitle_cache_dir = '{tmp_path / 'library' / 'subs'}'\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(app, ["status", "--config", str(config)])
+    assert result.exit_code == 2
+    assert "subtitle cache" in result.output
+    assert "library" in result.output
+
+
+def test_cli_subtitle_cache_in_the_library_from_the_environment(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["status", "--config", str(_config(tmp_path))],
+        env={"VC_SUBTITLE_CACHE_DIR": str(tmp_path / "library" / "subs")},
+    )
+    assert result.exit_code == 2
+    assert "subtitle cache" in result.output

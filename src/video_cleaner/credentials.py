@@ -11,9 +11,11 @@ an error text that happens to contain one is masked.
 from __future__ import annotations
 
 import contextlib
-import getpass
+import csv
+import io
 import json
 import os
+import re
 import subprocess  # nosec B404
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -76,13 +78,13 @@ class KeyringStore:
     def get(self, name: str) -> str | None:
         try:
             return self._backend.get_password(SERVICE, name)
-        except keyring.errors.KeyringError as exc:
+        except Exception as exc:  # the Windows backend raises its own error type
             raise CredentialError(f"keyring read of {name} failed: {type(exc).__name__}") from None
 
     def set(self, name: str, value: str) -> None:
         try:
             self._backend.set_password(SERVICE, name, value)
-        except keyring.errors.KeyringError as exc:
+        except Exception as exc:
             raise CredentialError(f"keyring write of {name} failed: {type(exc).__name__}") from None
 
     def delete(self, name: str) -> None:
@@ -90,7 +92,7 @@ class KeyringStore:
             self._backend.delete_password(SERVICE, name)
         except keyring.errors.PasswordDeleteError:
             pass  # nothing stored under that name
-        except keyring.errors.KeyringError as exc:
+        except Exception as exc:
             raise CredentialError(
                 f"keyring delete of {name} failed: {type(exc).__name__}"
             ) from None
@@ -99,7 +101,7 @@ class KeyringStore:
 Runner = Callable[[Sequence[str]], tuple[int, str]]
 
 
-def _run_icacls(cmd: Sequence[str]) -> tuple[int, str]:
+def _run_tool(cmd: Sequence[str]) -> tuple[int, str]:
     # Fixed argument list, shell=False.
     proc = subprocess.run(  # noqa: S603  # nosec B603
         [str(part) for part in cmd],
@@ -114,20 +116,59 @@ def _run_icacls(cmd: Sequence[str]) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
+_SID = re.compile(r"S-1-\d+(?:-\d+)+")
+
+
+def current_identity(
+    *,
+    system_root: str | None = None,
+    run: Runner | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """The identity icacls should grant: ``*<SID>`` of the user the process runs as.
+
+    The SID comes from ``whoami /user`` (from ``System32``, no shell), which reports the
+    process token, so a same-named account cannot be mistaken for the real one. Only when that
+    fails does it fall back to ``DOMAIN\\NAME`` from ``USERDOMAIN`` and ``USERNAME``; with
+    neither it raises `CredentialError`.
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    root = system_root or environ.get("SYSTEMROOT") or DEFAULT_SYSTEM_ROOT
+    whoami = str(Path(root) / "System32" / "whoami.exe")
+    try:
+        code, output = (run or _run_tool)([whoami, "/user", "/fo", "csv", "/nh"])
+    except (OSError, subprocess.SubprocessError):
+        code, output = -1, ""
+    if code == 0:
+        row = next(csv.reader(io.StringIO(output)), [])
+        if len(row) >= 2 and _SID.fullmatch(row[1].strip()):
+            return "*" + row[1].strip()
+    domain, name = environ.get("USERDOMAIN", ""), environ.get("USERNAME", "")
+    if domain and name and ":" not in domain + name:
+        return f"{domain}\\{name}"
+    raise CredentialError(
+        "cannot determine the current user's identity (whoami failed and USERDOMAIN / "
+        "USERNAME are not set), so the credentials file cannot be restricted"
+    )
+
+
 def restrict_to_owner(
     path: Path,
     *,
     windows: bool | None = None,
-    user: str | None = None,
+    identity: str | None = None,
     system_root: str | None = None,
     run: Runner | None = None,
     chmod: Callable[[Path, int], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> None:
     """Make *path* readable and writable by its owner only.
 
-    POSIX: ``chmod 600``. Windows: ``icacls <path> /inheritance:r /grant:r <user>:F`` (the
-    folder's inherited rights are removed, the user keeps full control), run from
-    ``System32`` by full path and without a shell. The keyword arguments exist for tests.
+    POSIX: ``chmod 600``. Windows: ``icacls <path> /inheritance:r /grant:r <identity>:F`` (the
+    folder's inherited rights are removed, the identity keeps full control), run from
+    ``System32`` by full path and without a shell. The identity is the one the running process
+    holds (`current_identity`), never a name taken from the environment alone. The keyword
+    arguments exist for tests.
     """
     on_windows = os.name == "nt" if windows is None else windows
     if not on_windows:
@@ -135,11 +176,10 @@ def restrict_to_owner(
         return
     root = system_root or os.environ.get("SYSTEMROOT") or DEFAULT_SYSTEM_ROOT
     icacls = str(Path(root) / "System32" / "icacls.exe")
-    grant = f"{user or getpass.getuser()}:F"
+    who = identity or current_identity(system_root=root, run=run, env=env)
+    grant = f"{who}:F"
     try:
-        code, output = (run or _run_icacls)(
-            [icacls, str(path), "/inheritance:r", "/grant:r", grant]
-        )
+        code, output = (run or _run_tool)([icacls, str(path), "/inheritance:r", "/grant:r", grant])
     except (OSError, subprocess.SubprocessError) as exc:
         raise CredentialError(f"cannot run icacls to restrict {path}: {exc}") from None
     if code != 0:
@@ -180,6 +220,12 @@ class FileStore:
         return data
 
     def _write(self, data: Mapping[str, str]) -> None:
+        try:
+            self._write_file(data)
+        except OSError as exc:  # its text may name the file's content or a path of the user's
+            raise CredentialError(f"cannot write {self.path}: {type(exc).__name__}") from None
+
+    def _write_file(self, data: Mapping[str, str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(
             prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent

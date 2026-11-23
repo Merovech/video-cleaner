@@ -62,6 +62,7 @@ def _outputs(settings: Settings, extra: Sequence[tuple[str, Path]]) -> list[tupl
         ("completed folder", settings.completed_dir),
         ("state database", settings.state_db),
         ("log folder", settings.log_dir),
+        ("subtitle cache", settings.subtitle_cache_dir),
         *extra,
     ]
 
@@ -74,10 +75,11 @@ def library_overlaps(
 ) -> list[tuple[str, str]]:
     """Every ``(label, problem)`` where an output overlaps a library root, in either direction.
 
-    The outputs are the scratch and completed folders, the state database, the log folder and
-    the labelled *extra* paths; the roots are ``settings.library_root`` and *roots* (a survey
-    ``--root``). An output under a root would write to the library; a root inside an output
-    could be written to (the completed folder mirrors library paths) or swept. Empty when safe.
+    The outputs are the scratch and completed folders, the state database, the log folder, the
+    subtitle cache and the labelled *extra* paths; the roots are ``settings.library_root`` and
+    *roots* (a survey ``--root``). An output under a root would write to the library; a root
+    inside an output could be written to (the completed folder mirrors library paths) or
+    swept. Empty when safe.
     """
     found: list[tuple[str, str]] = []
     bases = list(dict.fromkeys((settings.library_root, *roots)))

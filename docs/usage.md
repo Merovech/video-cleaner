@@ -39,7 +39,7 @@ activated virtual environment). `--help` works on every command.
 | `calibrate --approve --vmaf-target X --crf-max Y` | Approves a VMAF target (`guard_mean_floor` to 100) and a CRF ceiling (`crf_min` to 51). A run uses these instead of the config's `vmaf_target` and `crf_max`. Refused until a `calibrate --samples` sweep has finished. |
 | `run [--until HH:MM] [--max-hours N] [--path X]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. |
 | `status` | Shows the number of files per status, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
-| `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. Takes `--config`. |
+| `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. A store that cannot be read or written gives a `[FAIL]` line naming the kind of error (never a value) and exit code 2. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. Takes `--config`. |
 | `report [--output FILE]` | Writes the results so far to `report.csv` beside the state database (or `FILE`) and prints a summary, including for every manifest entry whether its original(s) are still unchanged (run it before overwriting originals). |
 
 **Current state (Phase 1):** every command works. `run` searches a CRF per file (3 sample
@@ -80,8 +80,8 @@ encode, probe or VMAF error, an unusable scratch folder); 130 interrupted with C
 `doctor` checks: Python 3.11 or 3.12; ffmpeg found and built with `libx265` and `libvmaf`
 (`hevc_nvenc` is informational); ffprobe and mkvmerge found; an NVIDIA GPU visible
 (informational); free space on the scratch drive at least `scratch_cap_bytes`; `library_root`
-readable; the state database, log folder, `completed_dir` and `scratch_dir` neither inside the
-library nor containing it ("library overlap"); `completed_dir` and `scratch_dir` writable (a
+readable; the state database, log folder, subtitle cache, `completed_dir` and `scratch_dir` neither
+inside the library nor containing it ("library overlap"); `completed_dir` and `scratch_dir` writable (a
 missing one is reported as "does not exist (will be created)"; `doctor` creates nothing); the
 config file not readable by other users (informational); `keyring` importable (informational);
 the OpenSubtitles credentials set (a warning, not a failure, when they are missing); and, when the
@@ -189,7 +189,7 @@ and has the default shown.
 | `heartbeat_s` | `15.0` | The console is never silent longer than this. |
 | `plain_progress_s` | `30.0` | Progress line interval when output is not a terminal. |
 | `log_file_level` | `DEBUG` | Level of the run log file (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
-| `subtitle_cache_dir` | `%LOCALAPPDATA%\video-cleaner\subtitles` | Local folder for downloaded and prepared subtitles. Keep it outside `library_root`. |
+| `subtitle_cache_dir` | `%LOCALAPPDATA%\video-cleaner\subtitles` | Local folder for downloaded and prepared subtitles. Refused (like every other output) when it is inside `library_root` or contains it. |
 | `local_subtitle_dirs` | `[]` | Folders searched for subtitles you already have: a TOML array of absolute paths (`['D:\subs', 'E:\more']`), or in `VC_LOCAL_SUBTITLE_DIRS` several paths separated by `;` on Windows. |
 | `forced_full_cues_per_hour` | `250.0` | Cues per hour of video above which a subtitle counts as a full one rather than forced-only. A placeholder, calibrated against the real library. |
 | `align_max_offset_s` | `120.0` | Largest shift in seconds the alignment may apply to a subtitle. |

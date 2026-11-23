@@ -39,6 +39,8 @@ app = typer.Typer(
     help="Re-encode a video library to HEVC with x265, safely and non-destructively.",
     no_args_is_help=True,
     add_completion=False,
+    # A traceback must never print local variables: `auth` holds the values being stored.
+    pretty_exceptions_show_locals=False,
 )
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
@@ -656,5 +658,9 @@ def auth(
             _auth_clear(store)
         else:
             _auth_prompt(store)
+    except (typer.Exit, typer.Abort):
+        raise
     except _credentials.CredentialError as exc:
         _fail(f"credentials: {exc}")
+    except Exception as exc:  # the store's own error type; its text could hold a value
+        _fail(f"credentials: {type(exc).__name__}")
