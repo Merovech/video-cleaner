@@ -18,24 +18,61 @@ LOGGER_NAME = "video_cleaner"
 MASK = "***"
 _HANDLER_TAG = "_video_cleaner_handler"
 
+MIN_SECRET_LENGTH = 4
+
 # Each pattern keeps the label and replaces only the value. A key may carry a prefix
 # (access_token, x_api_key) and a closing quote before the separator (dict/JSON style
-# ``{"password": "x"}``). Values are quoted strings (spaces allowed, masked through the
-# closing quote) or a bare run up to whitespace, a quote or a delimiter.
-_VALUE = r"(?:\"[^\"\n]*\"?|'[^'\n]*'?|[^\s\"'&,;]+)"
-_SEP = r"[\"']?\s*[:=]\s*"
-_GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"(?i)(api[-_]?key{_SEP}){_VALUE}"),
-    re.compile(rf"(?i)(password{_SEP}){_VALUE}"),
-    re.compile(rf"(?i)(token{_SEP}){_VALUE}"),
-    re.compile(r"(?i)(\bbearer\s+)[^\s\"',;]+"),
+# ``{"password": "x"}``, or the same inside a JSON string: ``{\"password\": \"x\"}``).
+# Values are quoted strings (spaces allowed, masked through the closing quote; a backslash
+# escapes a quote inside a plain-quoted value) or a bare run up to whitespace, a quote or a
+# delimiter. A value may start with an auth scheme (``token: Bearer abc``), which is masked
+# along with the credential.
+_SCHEME = r"(?:(?:bearer|basic|digest)\s+)?"
+_VALUE = (
+    r"(?:\\\"(?:(?!\\\").)*(?:\\\")?"  # escaped quotes: \"value\"
+    r"|\"(?:[^\"\\\n]|\\.)*\"?"  # "value", with \" allowed inside
+    r"|'[^'\n]*'?"
+    r"|[^\s\"'&,;]+)"
 )
+_SEP = r"\\?[\"']?\s*[:=]\s*"
+_LABELLED_VALUE = rf"{_SCHEME}{_VALUE}"
+_GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"(?i)(api[-_]?key{_SEP}){_LABELLED_VALUE}"),
+    re.compile(rf"(?i)(password{_SEP}){_LABELLED_VALUE}"),
+    re.compile(rf"(?i)(token{_SEP}){_LABELLED_VALUE}"),
+    re.compile(r"(?i)(\bbearer\s+)[^\s\"',;]+"),
+    # Basic credentials are base64: require a digit or one of + / = so prose ("basic setup")
+    # is left alone. Digest credentials are key=value pairs, masked to the end of the line.
+    re.compile(r"(?i)(\bbasic\s+)(?=[A-Za-z0-9+/_-]*[0-9+/=])[A-Za-z0-9+/=_-]{6,}"),
+    re.compile(r"(?i)(\bdigest\s+)(?=\w+\s*=)[^\n]+"),
+)
+
+# Process-wide secrets (values the run knows are credentials), masked by every `redact` call
+# and every `RedactingFilter` in addition to the ones passed explicitly.
+_registered: set[str] = set()
+
+
+def register_secrets(secrets: Iterable[str]) -> None:
+    """Add *secrets* to the process-wide set that `redact` always masks.
+
+    Values shorter than `MIN_SECRET_LENGTH` characters are ignored: masking a one- or
+    two-letter value would garble ordinary text.
+    """
+    _registered.update(s for s in secrets if len(s) >= MIN_SECRET_LENGTH)
+
+
+def _reset_registered_secrets() -> None:
+    """Forget every registered secret (for tests, so one test cannot leak into the next)."""
+    _registered.clear()
 
 
 def redact(text: str, secrets: Iterable[str] = ()) -> str:
-    """Mask the explicit *secrets* and generic Api-Key / password / token / Bearer values."""
+    """Mask the explicit and registered *secrets* and generic credential values.
+
+    The generic ones are Api-Key / password / token labels, Bearer / Basic / Digest credentials.
+    """
     # Longest first so a secret that contains another is masked whole.
-    for secret in sorted({s for s in secrets if s}, key=len, reverse=True):
+    for secret in sorted({s for s in (*secrets, *_registered) if s}, key=len, reverse=True):
         text = text.replace(secret, MASK)
     for pattern in _GENERIC_PATTERNS:
         text = pattern.sub(rf"\g<1>{MASK}", text)

@@ -215,6 +215,46 @@ def test_forced_and_sdh_flags() -> None:
     ]
 
 
+def _subtitle_with_title(title: str) -> Any:
+    data = load_fixture("hevc_subrip_sdh_disposition_mkv")
+    data["streams"][2]["tags"] = {"language": "eng", "title": title}
+    data["streams"][2]["disposition"] = {}
+    return parse_ffprobe(data, Path("x.mkv"), SIZE, MTIME).subtitles[0]
+
+
+@pytest.mark.parametrize(
+    ("title", "forced"),
+    [
+        ("Non-forced", False),
+        ("non forced", False),
+        ("not forced", False),
+        ("Unforced", False),
+        ("English (Full)", False),
+        ("English [Forced]", True),
+        ("Forced", True),
+        ("english forced subs", True),
+    ],
+)
+def test_forced_is_matched_by_word_in_the_title(title: str, forced: bool) -> None:
+    assert _subtitle_with_title(title).forced is forced
+
+
+@pytest.mark.parametrize(
+    ("title", "sdh"),
+    [
+        ("Sdhx", False),
+        ("English", False),
+        ("English SDH", True),
+        ("English CC", True),
+        ("English (Closed Captions)", True),
+        ("Hearing Impaired", True),
+        ("Hearing-impaired", True),
+    ],
+)
+def test_sdh_is_matched_by_word_in_the_title(title: str, sdh: bool) -> None:
+    assert _subtitle_with_title(title).sdh is sdh
+
+
 def test_pgs_is_image_subtitle() -> None:
     pgs = parse_fixture("h264_pgs_forced_sdh_mkv")
     assert pgs.subtitles

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 import pytest
 
 from video_cleaner import power
-from video_cleaner.logging_setup import LOGGER_NAME
+from video_cleaner.logging_setup import LOGGER_NAME, _reset_registered_secrets
 
 
 @pytest.fixture(autouse=True)
@@ -29,3 +29,11 @@ def _close_tool_log_handlers() -> Iterator[None]:
     for handler in list(logger.handlers):
         logger.removeHandler(handler)
         handler.close()
+
+
+@pytest.fixture(autouse=True)
+def _no_registered_secrets() -> Iterator[None]:
+    """Secrets registered by one test (a process-wide set) never reach the next."""
+    _reset_registered_secrets()
+    yield
+    _reset_registered_secrets()
