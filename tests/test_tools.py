@@ -360,6 +360,58 @@ def test_run_tool_within_the_timeout_returns_normally() -> None:
     assert result.stdout.strip() == "done"
 
 
+_GRANDCHILD_PARENT = r"""
+import pathlib, subprocess, sys, time
+beat = sys.argv[1]
+code = (
+    "import pathlib, sys, time\n"
+    "p = pathlib.Path(sys.argv[1])\n"
+    "while True:\n"
+    "    with p.open('a') as f:\n"
+    "        f.write('x')\n"
+    "    time.sleep(0.05)\n"
+)
+subprocess.Popen([sys.executable, "-c", code, beat])
+time.sleep(120)
+"""
+
+
+def _vc_threads() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name.startswith("vc-") and t.is_alive()}
+
+
+def test_run_tool_timeout_kills_the_whole_process_tree(tmp_path: Path) -> None:
+    beat = tmp_path / "grandchild-beat.txt"
+    before = _vc_threads()
+    with pytest.raises(ToolTimedOut):
+        run_tool(
+            _py(_GRANDCHILD_PARENT, str(beat)),
+            label="tree",
+            reporter=FakeReporter(),
+            timeout_s=3.0,
+            join_timeout_s=2.0,
+        )
+    # The grandchild had started (it was writing) and holds this process's pipes.
+    assert beat.exists()
+    assert beat.stat().st_size > 0
+    # It is gone shortly after: the file stops growing.
+    deadline = time.monotonic() + 10.0
+    size = -1
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        now = beat.stat().st_size
+        if now == size:
+            break
+        size = now
+    else:
+        pytest.fail("the grandchild kept running after the timeout")
+    # No reader or reaper thread of this call is left behind.
+    deadline = time.monotonic() + 10.0
+    while _vc_threads() - before and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _vc_threads() - before
+
+
 def test_run_tool_logs_redacted_command_exit_code_and_duration() -> None:
     records: list[logging.LogRecord] = []
 
@@ -427,7 +479,9 @@ def test_run_tool_kills_process_on_keyboard_interrupt(monkeypatch: pytest.Monkey
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            started.append(self)
+            # Stopping the process tree on Windows runs taskkill, which is not the tool.
+            if "taskkill" not in str(args[0][0]).lower():
+                started.append(self)
 
         def wait(self, timeout: float | None = None) -> int:
             if InterruptingPopen._first:
@@ -462,7 +516,9 @@ def test_run_tool_sees_ctrl_c_while_waiting_for_a_long_child(
 
     def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
         proc = real_popen(*args, **kwargs)
-        started.append(proc)
+        # Stopping the process tree on Windows runs taskkill, which is not the tool.
+        if "taskkill" not in str(args[0][0]).lower():
+            started.append(proc)
         return proc
 
     monkeypatch.setattr(subprocess, "Popen", recording_popen)

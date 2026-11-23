@@ -11,7 +11,9 @@ import contextlib
 import logging
 import os
 import re
+import signal
 import subprocess  # nosec B404
+import sys
 import threading
 import time
 from collections import deque
@@ -356,15 +358,59 @@ def _wait_interruptibly(proc: subprocess.Popen[str], label: str, timeout_s: floa
                 raise ToolTimedOut(label, timeout_s) from None
 
 
+def _taskkill_path() -> Path:
+    root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or r"C:\Windows"
+    return Path(root) / "System32" / "taskkill.exe"
+
+
+def _kill_tree_windows(proc: subprocess.Popen[str]) -> None:  # pragma: no cover - Windows only
+    """Force-kill *proc* and everything it started (`taskkill /T`, which follows parent links).
+
+    Falls back to killing just *proc* when taskkill cannot be run. Console processes cannot be
+    asked to close, so there is no gentler first step on Windows (`terminate` is a kill too).
+    """
+    try:
+        subprocess.run(  # noqa: S603  # nosec B603
+            [str(_taskkill_path()), "/PID", str(proc.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            timeout=_TERMINATE_GRACE_S * 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _log.warning("taskkill failed for process %d; killing only that process", proc.pid)
+    if proc.poll() is None:
+        proc.kill()
+
+
+def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:  # pragma: no cover - POSIX only
+    """Send *sig* to the whole process group of *proc* (it leads its own, see `run_tool`)."""
+    # The group may be gone already, or not ours to signal.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, sig)  # type: ignore[attr-defined,unused-ignore]
+
+
 def _stop_process(proc: subprocess.Popen[str]) -> None:
+    """Stop *proc* and the processes it started: terminate, then kill after a grace period.
+
+    Every child leads its own process group (POSIX session) or is killed with its tree
+    (Windows), so a tool that runs helpers (ffsubsync runs ffmpeg) leaves none behind to hold
+    the output pipes open.
+    """
     if proc.poll() is not None:
         return
-    proc.terminate()
-    try:
-        proc.wait(timeout=_TERMINATE_GRACE_S)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    if sys.platform == "win32":  # pragma: no cover - the other branch runs on POSIX
+        _kill_tree_windows(proc)
         proc.wait()
+        return
+    _signal_group(proc, signal.SIGTERM)  # pragma: no cover - POSIX only
+    with contextlib.suppress(subprocess.TimeoutExpired):  # pragma: no cover - POSIX only
+        proc.wait(timeout=_TERMINATE_GRACE_S)
+    # Also when the leader has gone: helpers that ignored the terminate must not outlive it.
+    _signal_group(proc, signal.SIGKILL)  # pragma: no cover - POSIX only
+    proc.wait()  # pragma: no cover - POSIX only
 
 
 def _close_pipes_when_readers_finish(
@@ -463,6 +509,9 @@ def run_tool(
             env=None if env is None else dict(env),
             shell=False,
             creationflags=power.creation_flags(),  # below normal: the PC stays usable
+            # Its own process group (POSIX) so the whole tree can be stopped; on Windows the
+            # tree is found from the parent links instead (see `_stop_process`).
+            start_new_session=sys.platform != "win32",
         )
     except FileNotFoundError as exc:
         raise ToolNotFound(str(cmd[0]), "executable does not exist") from exc

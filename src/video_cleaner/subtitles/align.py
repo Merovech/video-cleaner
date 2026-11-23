@@ -27,6 +27,7 @@ from pathlib import Path
 from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
+from video_cleaner.logging_setup import redact
 from video_cleaner.progress import Reporter
 from video_cleaner.subtitles.textfmt import SubtitleRejected, normalise_subtitle
 from video_cleaner.tools import (
@@ -46,6 +47,20 @@ ALIGN_TIMEOUT_S = 3600.0
 # ffsubsync's log is mostly one line per skipped cue; the numbers are near its start.
 _LOG_READ_CAP_BYTES = 8 * 1024 * 1024
 _SCALE_SLACK = 1e-9
+#: ffsubsync works on a 100 Hz grid and only looks for offsets inside the window it is given
+#: (`--max-offset-seconds`, our limit). When the true offset lies outside, the best candidate
+#: inside is at or next to the edge, so an offset within this margin (five samples) of the
+#: limit is a clamped search, not a result.
+CLAMP_EPSILON_S = 0.05
+#: Less speech than this in the video's audio (the "total of speech segments" ffsubsync logs,
+#: counted in 10 ms frames) cannot anchor an alignment: a silent or music-only track gives
+#: arbitrary numbers that look like a match. A real film has minutes of dialogue.
+MIN_REFERENCE_SPEECH_S = 5.0
+_SPEECH_FRAMES_PER_S = 100.0
+# The excerpt of ffsubsync's output that goes to the log when a run fails.
+_EXCERPT_LINES = 10
+_CONSOLE_COLUMNS = "1000"
+_EXCERPT_LINE_CHARS = 300
 _WORK_PREFIX = ".align-"
 _STAGED_INPUT = "input.srt"
 _STAGED_OUTPUT = "aligned.srt"
@@ -70,6 +85,7 @@ def _report_pattern(label: str) -> re.Pattern[str]:
 _SCORE_RE = _report_pattern("score")
 _OFFSET_RE = _report_pattern("offset seconds")
 _SCALE_RE = _report_pattern("framerate scale factor")
+_SPEECH_RE = _report_pattern("total of speech segments")
 
 
 @dataclass(frozen=True)
@@ -112,14 +128,42 @@ def parse_ffsubsync_log(text: str) -> tuple[float | None, float | None, float | 
     )
 
 
+def parse_reference_speech_s(text: str) -> float | None:
+    """Seconds of speech ffsubsync found in the video's audio, or None if it did not say.
+
+    It logs ``total of speech segments: 3022.0``, the number of 10 ms frames with speech.
+    """
+    frames = _last_number(_SPEECH_RE, text.replace("\r\n", "\n").replace("\r", "\n"))
+    return None if frames is None else frames / _SPEECH_FRAMES_PER_S
+
+
+def accept_reference_speech(speech_s: float | None) -> tuple[bool, str]:
+    """Whether the video's audio held enough speech (`MIN_REFERENCE_SPEECH_S`) to align to.
+
+    An unknown total is rejected: ffsubsync always logs it for a video, so its absence means
+    the log is not what this code understands.
+    """
+    if speech_s is None or not math.isfinite(speech_s):
+        return False, "ffsubsync did not report how much speech it found"
+    if speech_s < MIN_REFERENCE_SPEECH_S:
+        return False, (
+            f"only {speech_s:.1f} s of speech found in the audio "
+            f"(at least {MIN_REFERENCE_SPEECH_S:g} s needed)"
+        )
+    return True, f"{speech_s:.1f} s of speech"
+
+
 def accept_alignment(
     offset_s: float | None, scale: float | None, score: float | None, settings: Settings
 ) -> tuple[bool, str]:
     """Whether an alignment is believable, with a reason carrying the numbers.
 
-    Rejected: a missing or non-finite number, an offset of more than ``align_max_offset_s``
-    seconds either way, a framerate scale further than ``align_scale_tolerance`` from 1, and,
-    when ``align_min_score`` is above zero, a score below it.
+    Rejected: a missing or non-finite number; an offset beyond ``align_max_offset_s`` seconds
+    either way, or within `CLAMP_EPSILON_S` of it (the search was cut off there); a framerate
+    scale further than ``align_scale_tolerance`` from 1; a score of zero or less, whatever
+    ``align_min_score`` says (ffsubsync scores agreement minus disagreement, so zero is no
+    evidence and a negative score is an anti-correlated, plainly wrong match); and, when
+    ``align_min_score`` is above zero, a score below it.
     """
     missing = [
         name
@@ -132,12 +176,22 @@ def accept_alignment(
         return False, (
             f"offset {offset_s:+.3f} s is beyond the {settings.align_max_offset_s:g} s limit"
         )
+    if abs(offset_s) >= settings.align_max_offset_s - CLAMP_EPSILON_S:
+        return False, (
+            f"offset {offset_s:+.3f} s is at the {settings.align_max_offset_s:g} s search limit, "
+            "so the real offset is probably beyond it"
+        )
+    # ffsubsync tries only fixed ratios (24/23.976, 25/23.976, 25/24 and their inverses, at
+    # most about 0.043 from 1) and one inferred from the two lengths, so only the inferred one
+    # can exceed a tolerance of 0.05; it is the one that points at a different cut of the film.
     # The small slack keeps a scale exactly at the tolerance (1.05 - 1.0 is not exactly 0.05).
     if abs(scale - 1.0) > settings.align_scale_tolerance + _SCALE_SLACK:
         return False, (
             f"framerate scale {scale:.3f} differs from 1 by more than "
             f"{settings.align_scale_tolerance:g}"
         )
+    if score <= 0:
+        return False, f"score {score:.3f} is not a positive match"
     if settings.align_min_score > 0 and score < settings.align_min_score:
         return False, f"score {score:.3f} is below the minimum {settings.align_min_score:g}"
     return True, f"offset {offset_s:+.3f} s, framerate scale {scale:.3f}, score {score:.3f}"
@@ -147,7 +201,8 @@ def _child_env(tools: Tools) -> dict[str, str]:
     """A copy of this environment with the ffmpeg (and ffprobe) folders first on PATH.
 
     ffsubsync finds ffmpeg only through PATH. Python's stdio is set to UTF-8 so the log, which
-    names the video, is decoded the way `run_tool` reads it.
+    names the video, is decoded the way `run_tool` reads it, and the console is pinned to plain,
+    wide output.
     """
     env = dict(os.environ)
     key = next((name for name in env if name.upper() == "PATH"), "PATH")
@@ -155,6 +210,13 @@ def _child_env(tools: Tools) -> dict[str, str]:
     existing = env.get(key, "")
     env[key] = os.pathsep.join([*folders, existing] if existing else folders)
     env["PYTHONIOENCODING"] = "utf-8"
+    # ffsubsync logs through rich, which follows these variables: colour codes or a narrow
+    # console that wraps a line would make the numbers unreadable.
+    for name in ("FORCE_COLOR", "CLICOLOR_FORCE"):
+        env.pop(name, None)
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    env["COLUMNS"] = _CONSOLE_COLUMNS
     return env
 
 
@@ -192,6 +254,18 @@ def _read_log(path: Path, fallback: str) -> str:
             return handle.read(_LOG_READ_CAP_BYTES).decode("utf-8", errors="replace")
     except OSError:
         return fallback
+
+
+def _log_excerpt(label: str, text: str) -> None:
+    """Log the last lines of ffsubsync's output (redacted, each capped) at WARNING.
+
+    The work folder and the log in it are removed when the run ends, so this is the only place
+    the cause (a traceback, a missing module) is kept.
+    """
+    lines = [line.rstrip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+    kept = [redact(line)[:_EXCERPT_LINE_CHARS] for line in lines[-_EXCERPT_LINES:]]
+    if kept:
+        _log.warning("%s: the end of ffsubsync's output:\n%s", label, "\n".join(kept))
 
 
 def _failure_reason(text: str, what: str) -> str:
@@ -247,15 +321,20 @@ def _run(
             check=True,
         )
     except ToolFailed as exc:
-        _log.warning("%s: %s", label, exc)
         text = _read_log(log_path, "")
+        _log.warning("%s: ffsubsync exited with code %d", label, exc.returncode)
+        _log_excerpt(label, text)
         return None, text, _failure_reason(text, f"ffsubsync exited with code {exc.returncode}")
     except ToolTimedOut as exc:
+        text = _read_log(log_path, "")
         _log.warning("%s: %s", label, exc)
-        return None, _read_log(log_path, ""), f"ffsubsync timed out after {exc.timeout_s:g} s"
+        _log_excerpt(label, text)
+        return None, text, f"ffsubsync timed out after {exc.timeout_s:g} s"
     except ToolOutputError as exc:
+        text = _read_log(log_path, "")
         _log.warning("%s: %s", label, exc)
-        return None, _read_log(log_path, ""), "ffsubsync output could not be read"
+        _log_excerpt(label, text)
+        return None, text, "ffsubsync output could not be read"
     return result, _read_log(log_path, result.stderr_tail), ""
 
 
@@ -289,16 +368,24 @@ def align_subtitle(
         result, text, why = _run(tools, media, work, media.name, settings, reporter, timeout_s)
         if result is None:
             return AlignResult(ok=False, reason=why)
+        label = f"align subtitle to {media.name}"
         if result.returncode != 0:
+            _log.warning("%s: ffsubsync exited with code %d", label, result.returncode)
+            _log_excerpt(label, text)
             return AlignResult(
                 ok=False,
                 reason=_failure_reason(text, f"ffsubsync exited with code {result.returncode}"),
             )
         if _TRACEBACK_MARK in text:
+            _log.warning("%s: ffsubsync reported an error", label)
+            _log_excerpt(label, text)
             return AlignResult(
                 ok=False, reason=_failure_reason(text, "ffsubsync reported an error")
             )
         offset_s, scale, score = parse_ffsubsync_log(text)
+        enough_speech, speech_reason = accept_reference_speech(parse_reference_speech_s(text))
+        if not enough_speech:
+            return AlignResult(False, speech_reason, offset_s, scale, score)
         accepted, reason = accept_alignment(offset_s, scale, score, settings)
         if not accepted:
             return AlignResult(False, reason, offset_s, scale, score)

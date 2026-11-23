@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import logging
 import math
 import os
 import subprocess
@@ -17,10 +19,14 @@ from media import RecordingReporter
 from video_cleaner.config import Settings
 from video_cleaner.subtitles import align
 from video_cleaner.subtitles.align import (
+    CLAMP_EPSILON_S,
+    MIN_REFERENCE_SPEECH_S,
     AlignResult,
     accept_alignment,
+    accept_reference_speech,
     align_subtitle,
     parse_ffsubsync_log,
+    parse_reference_speech_s,
 )
 from video_cleaner.tools import (
     ToolFailed,
@@ -29,7 +35,8 @@ from video_cleaner.tools import (
     ToolResult,
     Tools,
     ToolTimedOut,
-    locate_tools,
+    locate_tool,
+    run_tool,
 )
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "ffsubsync"
@@ -59,6 +66,7 @@ def srt(cue_count: int) -> str:
 
 
 GOOD_LOG = (
+    "           INFO     total of speech segments: 3022.0 speech_transformers.py:763\n"
     "           INFO     computing alignments...                    ffsubsync.py:234\n"
     "           INFO     score: 5256.000                            ffsubsync.py:255\n"
     "           INFO     offset seconds: -3.000                     ffsubsync.py:256\n"
@@ -165,6 +173,72 @@ def test_a_partial_report_gives_the_numbers_it_has() -> None:
     assert parse_ffsubsync_log("INFO offset seconds: 2.000\n") == (2.0, None, None)
 
 
+# --- the reference speech total ----------------------------------------------------------------
+
+
+def test_the_speech_total_of_a_recorded_run_is_in_seconds() -> None:
+    # ffsubsync prints the count of 10 ms frames it found speech in.
+    assert parse_reference_speech_s(fixture_text("success")) == pytest.approx(30.22)
+
+
+def test_a_recorded_run_over_a_silent_track_found_no_speech() -> None:
+    assert parse_reference_speech_s(fixture_text("silent_audio")) == 0.0
+
+
+def test_a_recorded_run_that_died_early_has_no_speech_total() -> None:
+    assert parse_reference_speech_s(fixture_text("no_audio_stream")) is None
+
+
+def test_the_speech_total_is_parsed_from_windows_line_endings_and_other_layouts() -> None:
+    crlf = fixture_text("success").replace("\n", "\r\n")
+    assert parse_reference_speech_s(crlf) == pytest.approx(30.22)
+    assert parse_reference_speech_s("INFO:ffsubsync:total of speech segments: 500\n") == 5.0
+    assert parse_reference_speech_s("total of speech segments: 250.0\n") == 2.5
+
+
+def test_the_last_speech_total_wins() -> None:
+    text = "INFO total of speech segments: 1.0\nINFO total of speech segments: 700.0\n"
+    assert parse_reference_speech_s(text) == 7.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "INFO total of speech segments: nan\n",
+        "INFO total of speech segments: inf\n",
+        "                    total of speech segments: 99999.0\n",
+    ],
+)
+def test_an_unreadable_or_echoed_speech_total_is_none(text: str) -> None:
+    assert parse_reference_speech_s(text) is None
+
+
+def test_enough_speech_is_accepted() -> None:
+    assert accept_reference_speech(MIN_REFERENCE_SPEECH_S)[0]
+    assert accept_reference_speech(1800.0)[0]
+
+
+@pytest.mark.parametrize("seconds", [0.0, 0.5, MIN_REFERENCE_SPEECH_S - 0.01])
+def test_too_little_speech_is_rejected_with_the_number_and_the_floor(seconds: float) -> None:
+    accepted, reason = accept_reference_speech(seconds)
+    assert not accepted
+    assert "speech" in reason
+    assert f"{seconds:.1f}" in reason
+    assert f"{MIN_REFERENCE_SPEECH_S:g}" in reason
+
+
+@pytest.mark.parametrize("seconds", [None, math.nan, math.inf])
+def test_an_unknown_speech_total_is_rejected(seconds: float | None) -> None:
+    accepted, reason = accept_reference_speech(seconds)
+    assert not accepted
+    assert "did not report" in reason
+
+
+def test_the_floor_is_a_few_seconds() -> None:
+    assert 2.0 <= MIN_REFERENCE_SPEECH_S <= 30.0
+
+
 # --- accept_alignment ---------------------------------------------------------------------------
 
 
@@ -182,10 +256,48 @@ def test_accepts_a_negative_offset_within_the_limit() -> None:
     assert accept_alignment(-119.9, 1.0, 5.0, settings_with())[0]
 
 
-def test_accepts_exactly_the_limits() -> None:
-    settings = settings_with(align_max_offset_s=10.0, align_scale_tolerance=0.05)
-    assert accept_alignment(10.0, 1.05, 1.0, settings)[0]
-    assert accept_alignment(-10.0, 0.95, 1.0, settings)[0]
+def test_accepts_a_scale_exactly_at_the_tolerance() -> None:
+    settings = settings_with(align_scale_tolerance=0.05)
+    assert accept_alignment(1.0, 1.05, 1.0, settings)[0]
+    assert accept_alignment(1.0, 0.95, 1.0, settings)[0]
+
+
+def test_accepts_an_offset_just_inside_the_search_window() -> None:
+    settings = settings_with(align_max_offset_s=10.0)
+    assert accept_alignment(10.0 - 2 * CLAMP_EPSILON_S, 1.0, 1.0, settings)[0]
+    assert accept_alignment(-10.0 + 2 * CLAMP_EPSILON_S, 1.0, 1.0, settings)[0]
+
+
+@pytest.mark.parametrize("offset", [10.0, -10.0, 10.0 - CLAMP_EPSILON_S / 2, -9.99])
+def test_rejects_an_offset_at_the_edge_of_the_search_window_as_clamped(offset: float) -> None:
+    # ffsubsync only looks inside the window, so a best match at its edge means the real
+    # offset is probably further out.
+    accepted, reason = accept_alignment(offset, 1.0, 100.0, settings_with(align_max_offset_s=10.0))
+    assert not accepted
+    assert "search limit" in reason
+    assert f"{offset:+.3f}" in reason
+
+
+def test_the_clamp_margin_is_a_few_samples_of_ffsubsyncs_hundred_hertz_grid() -> None:
+    assert 0.01 <= CLAMP_EPSILON_S <= 0.1
+
+
+@pytest.mark.parametrize("score", [-0.001, -5.0, -324.167])
+def test_rejects_an_anti_correlated_score_even_when_the_minimum_is_off(score: float) -> None:
+    accepted, reason = accept_alignment(1.0, 1.0, score, settings_with(align_min_score=0.0))
+    assert not accepted
+    assert f"{score:.3f}" in reason
+    assert "match" in reason
+
+
+def test_rejects_a_score_of_zero_which_is_no_evidence_of_a_match() -> None:
+    accepted, reason = accept_alignment(1.0, 1.0, 0.0, settings_with(align_min_score=0.0))
+    assert not accepted
+    assert "0.000" in reason
+
+
+def test_a_small_positive_score_passes_when_the_minimum_is_off() -> None:
+    assert accept_alignment(1.0, 1.0, 0.001, settings_with(align_min_score=0.0))[0]
 
 
 def test_rejects_an_offset_beyond_the_limit_and_names_both_numbers() -> None:
@@ -669,6 +781,197 @@ def test_a_failed_run_does_not_touch_an_existing_output(
     assert case.out.read_text(encoding="utf-8") == "earlier result"
 
 
+def test_the_recorded_successful_run_is_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = Case(tmp_path)
+    patch_run(monkeypatch, FakeFfsubsync(log=fixture_text("success")))
+    result = case.run()
+    assert result.ok
+    assert result.output == case.out
+
+
+def test_the_recorded_run_over_a_silent_track_is_rejected_for_lack_of_speech(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = Case(tmp_path)
+    patch_run(monkeypatch, FakeFfsubsync(log=fixture_text("silent_audio")))
+    result = case.run()
+    assert not result.ok
+    assert "speech" in result.reason
+    # ffsubsync's own numbers are kept for the record, but nothing is written.
+    assert result.score == pytest.approx(324.167)
+    assert result.output is None
+    assert not case.out.exists()
+
+
+def test_a_log_without_a_speech_total_is_rejected_as_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = Case(tmp_path)
+    log = "".join(line for line in GOOD_LOG.splitlines(keepends=True) if "total of" not in line)
+    patch_run(monkeypatch, FakeFfsubsync(log=log))
+    result = case.run()
+    assert not result.ok
+    assert "did not report" in result.reason
+    assert not case.out.exists()
+
+
+def test_a_negative_score_in_the_log_is_rejected_with_the_default_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = Case(tmp_path)
+    patch_run(monkeypatch, FakeFfsubsync(log=GOOD_LOG.replace("5256.000", "-12.000")))
+    result = case.run()
+    assert not result.ok
+    assert result.score == -12.0
+    assert not case.out.exists()
+
+
+def test_an_offset_pinned_at_the_search_limit_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = Case(tmp_path)
+    log = GOOD_LOG.replace("-3.000", "-120.000")
+    patch_run(monkeypatch, FakeFfsubsync(log=log))
+    result = case.run()
+    assert not result.ok
+    assert "search limit" in result.reason
+
+
+# --- the child's environment and the log excerpt -----------------------------------------------
+
+
+def test_the_child_console_is_pinned_whatever_the_caller_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in (
+        ("FORCE_COLOR", "1"),
+        ("CLICOLOR_FORCE", "1"),
+        ("COLUMNS", "20"),
+        ("TERM", "xterm-256color"),
+    ):
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    case = Case(tmp_path)
+    fake = patch_run(monkeypatch, FakeFfsubsync())
+    case.run()
+    env = fake.env_seen
+    assert env is not None
+    assert "FORCE_COLOR" not in env
+    assert "CLICOLOR_FORCE" not in env
+    assert env["NO_COLOR"] == "1"
+    assert env["TERM"] == "dumb"
+    assert int(env["COLUMNS"]) >= 1000
+
+
+_RICH_LOGGER = (
+    "import logging, sys\n"
+    "from rich.console import Console\n"
+    "from rich.logging import RichHandler\n"
+    "logging.basicConfig(level=logging.INFO, format='%(message)s', datefmt='[%X]',\n"
+    "    handlers=[RichHandler(console=Console(file=sys.stderr))])\n"
+    "log = logging.getLogger('x')\n"
+    "log.info('score: %.3f', 5256.0)\n"
+    "log.info('offset seconds: %.3f', -3.0)\n"
+    "log.info('framerate scale factor: %.3f', 1.0)\n"
+    "log.info('total of speech segments: %s', 3022.0)\n"
+)
+
+
+def test_a_hostile_caller_environment_cannot_garble_the_log_ffsubsync_prints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The logging setup ffsubsync uses (rich on stderr), run with and without our pinned child
+    # environment while the caller's environment asks for colour and a narrow console.
+    for name, value in (("FORCE_COLOR", "1"), ("CLICOLOR_FORCE", "1"), ("COLUMNS", "12")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    command = [sys.executable, "-c", _RICH_LOGGER]
+    hostile = run_tool(command, label="rich", reporter=RecordingReporter())
+    assert parse_ffsubsync_log(hostile.stderr_tail) != (-3.0, 1.0, 5256.0)  # the premise
+    pinned = run_tool(
+        command,
+        label="rich",
+        reporter=RecordingReporter(),
+        env=align._child_env(make_tools(tmp_path)),
+    )
+    assert parse_ffsubsync_log(pinned.stderr_tail) == (-3.0, 1.0, 5256.0)
+    assert parse_reference_speech_s(pinned.stderr_tail) == pytest.approx(30.22)
+    assert "\x1b" not in pinned.stderr_tail
+
+
+def failure_log(lines: int = 30) -> str:
+    return "".join(f"           INFO     log line number {n}\n" for n in range(1, lines + 1))
+
+
+def warnings_of(caplog: pytest.LogCaptureFixture) -> str:
+    return " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+def test_a_failed_run_logs_the_end_of_ffsubsyncs_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    case = Case(tmp_path)
+    patch_run(monkeypatch, FakeFfsubsync(raises=failed(1), log=failure_log()))
+    with caplog.at_level(logging.WARNING, logger="video_cleaner.subtitles.align"):
+        result = case.run()
+    assert not result.ok
+    warnings = warnings_of(caplog)
+    assert "log line number 30" in warnings
+    assert "log line number 21" in warnings
+    assert "log line number 20" not in warnings
+    assert "stderr in" not in warnings  # the work folder, and the log in it, is gone by then
+
+
+@pytest.mark.parametrize("what", ["traceback", "timeout", "exit"])
+def test_every_kind_of_failure_logs_the_excerpt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    what: str,
+) -> None:
+    case = Case(tmp_path)
+    log = failure_log(5) + (fixture_text("failed_to_sync") if what == "traceback" else "")
+    fake = FakeFfsubsync(
+        log=log,
+        raises=ToolTimedOut("align", 5.0) if what == "timeout" else None,
+        returncode=3 if what == "exit" else 0,
+    )
+    patch_run(monkeypatch, fake)
+    with caplog.at_level(logging.WARNING, logger="video_cleaner.subtitles.align"):
+        assert not case.run().ok
+    warnings = warnings_of(caplog)
+    assert "log line number 5" in warnings or "FileNotFoundError" in warnings
+
+
+def test_the_logged_excerpt_is_redacted_and_each_line_is_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    case = Case(tmp_path)
+    log = (
+        "           INFO     started with --api-key=SUPERSECRET123 now\n"
+        f"           INFO     {'x' * 5000}\n"
+    )
+    patch_run(monkeypatch, FakeFfsubsync(raises=failed(1), log=log))
+    with caplog.at_level(logging.WARNING, logger="video_cleaner.subtitles.align"):
+        case.run()
+    warnings = warnings_of(caplog)
+    assert "SUPERSECRET123" not in warnings
+    assert "x" * 301 not in warnings
+    assert "x" * 200 in warnings
+
+
+def test_a_successful_run_logs_no_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    case = Case(tmp_path)
+    patch_run(monkeypatch, FakeFfsubsync())
+    with caplog.at_level(logging.WARNING, logger="video_cleaner.subtitles.align"):
+        assert case.run().ok
+    assert warnings_of(caplog) == ""
+
+
 # --- failures never raise -----------------------------------------------------------------------
 
 
@@ -890,9 +1193,47 @@ def _timestamp(seconds: int) -> str:
     return f"00:{seconds // 60:02d}:{seconds % 60:02d},000"
 
 
+def real_tools() -> Tools:
+    """ffmpeg and ffprobe plus the ffsubsync modules, or skip the test when one is missing."""
+    for module in ("ffsubsync", "webrtcvad"):
+        if importlib.util.find_spec(module) is None:
+            pytest.skip(f"the {module} module is not installed")
+    try:
+        ffmpeg = locate_tool("ffmpeg", os.environ)
+        ffprobe = locate_tool("ffprobe", os.environ)
+    except ToolNotFound as exc:
+        pytest.skip(f"ffmpeg and ffprobe are required: {exc}")
+    # mkvmerge is not used here.
+    return Tools(ffmpeg=ffmpeg, ffprobe=ffprobe, mkvmerge=Path("mkvmerge"))
+
+
+def test_the_integration_test_skips_when_ffmpeg_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(name: str, env: Any) -> Path:
+        raise ToolNotFound(name, "not installed")
+
+    monkeypatch.setattr(sys.modules[__name__], "locate_tool", missing)
+    with pytest.raises(pytest.skip.Exception, match="ffmpeg"):
+        real_tools()
+
+
+def test_the_integration_test_skips_when_ffsubsync_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name, *args: None if name == "ffsubsync" else real_find_spec(name, *args),
+    )
+    with pytest.raises(pytest.skip.Exception, match="ffsubsync"):
+        real_tools()
+
+
 @pytest.mark.integration
 def test_the_real_ffsubsync_runs_the_command_on_generated_media(tmp_path: Path) -> None:
-    tools = locate_tools()
+    tools = real_tools()
     media_dir = tmp_path / "library" / "film [2020] üé"
     media_dir.mkdir(parents=True)
     media = media_dir / "-clip [1] ü.mkv"
