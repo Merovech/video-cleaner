@@ -595,3 +595,50 @@ def test_locate_tool_is_public(tmp_path: Path) -> None:
 
     exe = _touch(tmp_path / "bin" / "ffmpeg.exe")
     assert locate_tool("ffmpeg", _fake_env(tmp_path, PATH=str(tmp_path / "bin"))) == exe
+
+
+def test_run_tool_redacts_the_kept_stderr_log_and_tail(tmp_path: Path) -> None:
+    log = tmp_path / "stderr.log"
+    code = "import sys; sys.stderr.write('start\\nApi-Key: k3y12345\\nend\\n')"
+    result = run_tool(_py(code), label="leaky", reporter=FakeReporter(), stderr_log=log)
+    kept = log.read_text(encoding="utf-8")
+    assert "k3y12345" not in kept
+    assert "Api-Key: ***" in kept
+    assert "start" in kept
+    assert "end" in kept
+    assert "k3y12345" not in result.stderr_tail
+
+
+def test_run_tool_redacts_a_registered_secret_in_stderr_and_the_command_log(
+    tmp_path: Path,
+) -> None:
+    from video_cleaner import logging_setup
+
+    logging_setup._reset_registered_secrets()
+    logging_setup.register_secrets(["hunter22"])
+    messages: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage())
+
+    handler = Capture(level=logging.DEBUG)
+    logger = logging.getLogger("video_cleaner.tools")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    log = tmp_path / "stderr.log"
+    try:
+        run_tool(
+            _py("import sys; sys.stderr.write('saw hunter22\\n')", "hunter22"),
+            label="reg",
+            reporter=FakeReporter(),
+            stderr_log=log,
+        )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging_setup._reset_registered_secrets()
+    assert messages
+    assert not any("hunter22" in m for m in messages)
+    assert "hunter22" not in log.read_text(encoding="utf-8")

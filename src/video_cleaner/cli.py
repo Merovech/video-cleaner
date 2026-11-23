@@ -12,6 +12,7 @@ from typing import Annotated, NoReturn
 import typer
 
 from video_cleaner import calibrate as _calibrate
+from video_cleaner import credentials as _credentials
 from video_cleaner import doctor as doctor_mod
 from video_cleaner import logarchive, planning, power
 from video_cleaner import runner as _runner
@@ -21,7 +22,7 @@ from video_cleaner.consolefmt import Level, encodable, print_tagged
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
 from video_cleaner.instancelock import AlreadyRunning
-from video_cleaner.logging_setup import setup_logging
+from video_cleaner.logging_setup import register_secrets, setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
 from video_cleaner.progress import (
@@ -38,6 +39,8 @@ app = typer.Typer(
     help="Re-encode a video library to HEVC with x265, safely and non-destructively.",
     no_args_is_help=True,
     add_completion=False,
+    # A traceback must never print local variables: `auth` holds the values being stored.
+    pretty_exceptions_show_locals=False,
 )
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
@@ -587,3 +590,81 @@ def report(
     except (planning.PlanError, StateError) as exc:
         _fail(str(exc))
     _print_results(results, csv_path)
+
+
+def _auth_status(store: _credentials.CredentialStore) -> None:
+    """One tagged line per credential name: whether it is set, never its value."""
+    for name in _credentials.ALL_NAMES:
+        source = _credentials.source_of(store, os.environ, name)
+        if source is None:
+            print_tagged(Level.WARN, f"{name}: not set")
+        else:
+            print_tagged(
+                Level.OK, f"{name}: set" + (" (environment)" if source == "environment" else "")
+            )
+
+
+def _auth_clear(store: _credentials.CredentialStore) -> None:
+    for name in _credentials.ALL_NAMES:
+        store.delete(name)
+        print_tagged(Level.OK, f"cleared {name}")
+
+
+def _auth_prompt(store: _credentials.CredentialStore) -> None:
+    """Ask for the three login values (hidden), then store them; nothing is stored unless all
+    three were given."""
+    labels = {
+        _credentials.API_KEY: "OpenSubtitles API key",
+        _credentials.USERNAME: "OpenSubtitles username",
+        _credentials.PASSWORD: "OpenSubtitles password",
+    }
+    values: dict[str, str] = {}
+    for name, label in labels.items():
+        typed = str(typer.prompt(label, hide_input=True))
+        # A password is kept exactly as typed (spaces can be part of it); the other two are
+        # identifiers, where stray spaces are a paste accident.
+        values[name] = typed if name == _credentials.PASSWORD else typed.strip()
+    blank = [name for name, value in values.items() if not value.strip()]
+    if blank:
+        _fail(f"{', '.join(blank)}: a value is required; nothing was stored")
+    register_secrets([*values.values(), values[_credentials.PASSWORD].strip()])
+    # A token cached for the previous login is no longer valid. It goes first, so a write that
+    # fails part-way never leaves a new key beside the old login's token.
+    store.delete(_credentials.TOKEN)
+    for name, value in values.items():
+        store.set(name, value)
+        print_tagged(Level.OK, f"stored {name}")
+
+
+@app.command()
+def auth(
+    status: Annotated[
+        bool, typer.Option("--status", help="Show which credentials are set (never the values).")
+    ] = False,
+    clear: Annotated[
+        bool, typer.Option("--clear", help="Delete every stored OpenSubtitles credential.")
+    ] = False,
+    config: ConfigOption = None,
+) -> None:
+    """Store the OpenSubtitles API key, username and password (prompted, never as arguments)."""
+    if status and clear:
+        _fail("--status and --clear cannot be used together")
+    _load(config)  # a bad config is reported the same way as for every other command
+    try:
+        store = _credentials.open_store()
+        if isinstance(store, _credentials.FileStore):
+            print_tagged(Level.INFO, f"credential store: owner-only file {store.path}")
+        else:
+            print_tagged(Level.INFO, "credential store: system keyring")
+        if status:
+            _auth_status(store)
+        elif clear:
+            _auth_clear(store)
+        else:
+            _auth_prompt(store)
+    except (typer.Exit, typer.Abort):
+        raise
+    except _credentials.CredentialError as exc:
+        _fail(f"credentials: {exc}")
+    except Exception as exc:  # the store's own error type; its text could hold a value
+        _fail(f"credentials: {type(exc).__name__}")

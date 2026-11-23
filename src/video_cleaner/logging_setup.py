@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -18,24 +19,75 @@ LOGGER_NAME = "video_cleaner"
 MASK = "***"
 _HANDLER_TAG = "_video_cleaner_handler"
 
+MIN_SECRET_LENGTH = 4
+
 # Each pattern keeps the label and replaces only the value. A key may carry a prefix
 # (access_token, x_api_key) and a closing quote before the separator (dict/JSON style
-# ``{"password": "x"}``). Values are quoted strings (spaces allowed, masked through the
-# closing quote) or a bare run up to whitespace, a quote or a delimiter.
-_VALUE = r"(?:\"[^\"\n]*\"?|'[^'\n]*'?|[^\s\"'&,;]+)"
-_SEP = r"[\"']?\s*[:=]\s*"
-_GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"(?i)(api[-_]?key{_SEP}){_VALUE}"),
-    re.compile(rf"(?i)(password{_SEP}){_VALUE}"),
-    re.compile(rf"(?i)(token{_SEP}){_VALUE}"),
-    re.compile(r"(?i)(\bbearer\s+)[^\s\"',;]+"),
+# ``{"password": "x"}``, or the same inside a JSON string: ``{\"password\": \"x\"}``).
+# Values are quoted strings (spaces allowed, masked through the closing quote; a backslash
+# escapes a quote inside a plain-quoted value) or a bare run up to whitespace, a quote or a
+# delimiter. A value may start with an auth scheme (``token: Bearer abc``), which is masked
+# along with the credential.
+_SCHEME = r"(?:(?:bearer|basic|digest)\s+)?"
+_VALUE = (
+    r"(?:\\\"(?:(?!\\\").)*(?:\\\")?"  # escaped quotes: \"value\"
+    r"|\"(?:[^\"\\\n]|\\.)*\"?"  # "value", with \" allowed inside
+    r"|'[^'\n]*'?"
+    r"|[^\s\"'&,;]+)"
 )
+_SEP = r"\\?[\"']?\s*[:=]\s*"
+_LABELLED_VALUE = rf"{_SCHEME}{_VALUE}"
+_GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"(?i)(api[-_]?key{_SEP}){_LABELLED_VALUE}"),
+    re.compile(rf"(?i)(password{_SEP}){_LABELLED_VALUE}"),
+    re.compile(rf"(?i)(token{_SEP}){_LABELLED_VALUE}"),
+    re.compile(r"(?i)(\bbearer\s+)[^\s\"',;]+"),
+    # Basic credentials are base64. After an Authorization / Proxy-Authorization header any
+    # base64 token is masked (base64 of "user:pass" can have no digit, '+', '/' or '=').
+    re.compile(
+        r"(?i)((?:proxy-)?authorization\s*[:=]\s*basic\s+)[A-Za-z0-9+/=_-]{4,}",
+    ),
+    # Elsewhere a bare "basic <token>" is masked only when the token looks encoded (a digit,
+    # '+' or '=') so prose such as "basic setup/teardown" is left alone.
+    re.compile(r"(?i)(\bbasic\s+)(?=[A-Za-z0-9+/_-]*[0-9+=])[A-Za-z0-9+/=_-]{6,}"),
+    re.compile(r"(?i)(\bdigest\s+)(?=\w+\s*=)[^\n]+"),
+)
+
+# Process-wide secrets (values the run knows are credentials), masked by every `redact` call
+# and every `RedactingFilter` in addition to the ones passed explicitly. An immutable snapshot,
+# replaced under a lock on every write, so a thread that redacts (the tool's stderr drain) never
+# iterates a set another thread is changing.
+_registered: frozenset[str] = frozenset()
+_registered_lock = threading.Lock()
+
+
+def register_secrets(secrets: Iterable[str]) -> None:
+    """Add *secrets* to the process-wide set that `redact` always masks.
+
+    Values shorter than `MIN_SECRET_LENGTH` characters are ignored: masking a one- or
+    two-letter value would garble ordinary text.
+    """
+    global _registered
+    new = {s for s in secrets if len(s) >= MIN_SECRET_LENGTH}
+    with _registered_lock:
+        _registered = _registered | new
+
+
+def _reset_registered_secrets() -> None:
+    """Forget every registered secret (for tests, so one test cannot leak into the next)."""
+    global _registered
+    with _registered_lock:
+        _registered = frozenset()
 
 
 def redact(text: str, secrets: Iterable[str] = ()) -> str:
-    """Mask the explicit *secrets* and generic Api-Key / password / token / Bearer values."""
+    """Mask the explicit and registered *secrets* and generic credential values.
+
+    The generic ones are Api-Key / password / token labels, Bearer / Basic / Digest credentials.
+    """
     # Longest first so a secret that contains another is masked whole.
-    for secret in sorted({s for s in secrets if s}, key=len, reverse=True):
+    registered = _registered  # one snapshot for the whole call
+    for secret in sorted({s for s in (*secrets, *registered) if s}, key=len, reverse=True):
         text = text.replace(secret, MASK)
     for pattern in _GENERIC_PATTERNS:
         text = pattern.sub(rf"\g<1>{MASK}", text)

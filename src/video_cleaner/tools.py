@@ -239,7 +239,11 @@ class _StdoutCapture(_Capture):
 
 
 class _StderrCapture(_Capture):
-    """Drains stderr: keeps the last ~4 KB and streams every line to *log_path* if given."""
+    """Drains stderr: keeps the last ~4 KB and streams every line to *log_path* if given.
+
+    Every line is redacted before it is kept or written, so a credential a tool echoes never
+    reaches the kept log or the returned tail.
+    """
 
     stream_name = "stderr"
 
@@ -262,7 +266,8 @@ class _StderrCapture(_Capture):
     def _read(self) -> None:
         sink = self._open_log()
         try:
-            for line in self._stream:
+            for raw in self._stream:
+                line = redact(raw)
                 with self._lock:
                     self._tail.append(line)
                     self._size += len(line)

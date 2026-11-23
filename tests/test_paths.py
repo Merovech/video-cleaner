@@ -95,6 +95,7 @@ def _guard_settings(tmp_path: Path, **changes: Any) -> Settings:
         completed_dir=tmp_path / "completed",
         state_db=tmp_path / "appdata" / "state.db",
         log_dir=tmp_path / "appdata" / "logs",
+        subtitle_cache_dir=tmp_path / "appdata" / "subtitles",
     )
     return dataclasses.replace(base, **changes)
 
@@ -112,6 +113,7 @@ def test_outputs_outside_library_accepts_separate_folders(tmp_path: Path) -> Non
         ("completed_dir", "completed folder"),
         ("state_db", "state database"),
         ("log_dir", "log folder"),
+        ("subtitle_cache_dir", "subtitle cache"),
     ],
 )
 def test_every_output_under_the_library_is_refused(tmp_path: Path, field: str, label: str) -> None:
@@ -121,7 +123,7 @@ def test_every_output_under_the_library_is_refused(tmp_path: Path, field: str, l
     assert [lab for lab, _ in library_overlaps(settings)] == [label]
 
 
-@pytest.mark.parametrize("field", ["scratch_dir", "completed_dir", "log_dir"])
+@pytest.mark.parametrize("field", ["scratch_dir", "completed_dir", "log_dir", "subtitle_cache_dir"])
 def test_library_inside_an_output_folder_is_refused(tmp_path: Path, field: str) -> None:
     settings = _guard_settings(
         tmp_path, library_root=getattr(_guard_settings(tmp_path), field) / "library"

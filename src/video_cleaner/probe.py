@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,11 @@ INTERLACED_FIELD_ORDERS = frozenset({"tt", "bb", "tb", "bt"})
 IMAGE_SUBTITLE_CODECS = frozenset({"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"})
 UNKNOWN_FIELD_ORDER = "unknown"
 UNDETERMINED_LANGUAGE = "und"
+
+# Titles are matched by word: "Non-forced", "not forced" and "Unforced" are not forced, and
+# "Sdhx" is not SDH.
+_FORCED_TITLE = re.compile(r"(?<!\bnon[-_\s])(?<!\bnot[-_\s])(?<![a-z])forced\b", re.IGNORECASE)
+_SDH_TITLE = re.compile(r"\b(?:sdh|cc|hearing[- ]impaired|closed captions?)\b", re.IGNORECASE)
 
 _FFPROBE_ARGS = (
     "-v",
@@ -182,12 +188,11 @@ def _video_stream(stream: Mapping[str, Any]) -> VideoStream:
 def _is_sdh(stream: Mapping[str, Any]) -> bool:
     if _flag(stream, "hearing_impaired"):
         return True
-    title = _tag(stream, "title").lower()
-    return "sdh" in title or "hearing impaired" in title
+    return _SDH_TITLE.search(_tag(stream, "title")) is not None
 
 
 def _is_forced(stream: Mapping[str, Any]) -> bool:
-    return _flag(stream, "forced") or "forced" in _tag(stream, "title").lower()
+    return _flag(stream, "forced") or _FORCED_TITLE.search(_tag(stream, "title")) is not None
 
 
 def _subtitle_stream(stream: Mapping[str, Any]) -> SubtitleStream:

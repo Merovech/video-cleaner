@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 import time
@@ -9,7 +10,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from video_cleaner import doctor
+from video_cleaner import credentials, doctor
 from video_cleaner.cli import app
 from video_cleaner.config import Settings, default_config_path, load_settings
 from video_cleaner.doctor import Check, run_doctor
@@ -126,6 +127,13 @@ def _run(tmp_path: Path, **kwargs: object) -> dict[str, Check]:
     }
     params.update(kwargs)
     return _by_name(run_doctor(settings, **params))  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_appdata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whatever a test runs through the real environment sees an empty LOCALAPPDATA of its own,
+    never the user's config, credentials file or logs."""
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "isolated-localappdata"))
 
 
 def test_doctor_all_ok(tmp_path: Path) -> None:
@@ -481,3 +489,202 @@ def test_a_crashing_check_becomes_a_failed_check(tmp_path: Path) -> None:
     assert checks["scratch space"].ok is False
     assert "boom" in checks["scratch space"].detail
     assert "keyring" in checks  # later checks still ran
+
+
+# --- credentials ----------------------------------------------------------------------
+
+
+class _Store:
+    def __init__(self, values: dict[str, str] | None = None) -> None:
+        self.values = values or {}
+
+    def get(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    def set(self, name: str, value: str) -> None:
+        self.values[name] = value
+
+    def delete(self, name: str) -> None:
+        self.values.pop(name, None)
+
+
+_CREDS = {
+    "opensubtitles_api_key": "key-value-123",
+    "opensubtitles_username": "someuser",
+    "opensubtitles_password": "pass-value-123",
+}
+
+
+def test_doctor_credentials_set_is_ok_and_never_shows_values(tmp_path: Path) -> None:
+    check = _run(tmp_path, credential_store=_Store(dict(_CREDS)))["credentials"]
+    assert check.ok is True
+    assert not check.required
+    for value in _CREDS.values():
+        assert value not in check.detail
+
+
+def test_doctor_missing_credentials_are_a_warning_not_a_failure(tmp_path: Path) -> None:
+    store = _Store({"opensubtitles_username": "someuser"})
+    check = _run(tmp_path, credential_store=store)["credentials"]
+    assert check.ok is False
+    assert check.required is False
+    assert "opensubtitles_api_key" in check.detail
+    assert "opensubtitles_password" in check.detail
+    assert "opensubtitles_username" not in check.detail
+    assert "auth" in check.detail
+
+
+def test_doctor_credentials_from_the_environment_count(tmp_path: Path) -> None:
+    env = {
+        **_env(tmp_path),
+        "VC_OPENSUBTITLES_API_KEY": "k",
+        "VC_OPENSUBTITLES_USERNAME": "u",
+        "VC_OPENSUBTITLES_PASSWORD": "p",
+    }
+    assert _run(tmp_path, env=env, credential_store=_Store())["credentials"].ok is True
+
+
+def test_doctor_unusable_credential_store_is_a_warning(tmp_path: Path) -> None:
+    # No injected store: the keyring is unusable in tests and there is no LOCALAPPDATA.
+    check = _run(tmp_path)["credentials"]
+    assert check.ok is False
+    assert check.required is False
+    assert "LOCALAPPDATA" in check.detail
+
+
+def test_doctor_credential_store_that_raises_is_a_warning(tmp_path: Path) -> None:
+    class Broken(_Store):
+        def get(self, name: str) -> str | None:
+            raise credentials.CredentialError("keyring locked")
+
+    check = _run(tmp_path, credential_store=Broken())["credentials"]
+    assert check.ok is False
+    assert check.required is False
+    assert "keyring locked" in check.detail
+
+
+def _credentials_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    appdata = tmp_path / "appdata"
+    path = appdata / "video-cleaner" / "credentials.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}", encoding="utf-8")
+    return {**_env(tmp_path), "LOCALAPPDATA": str(appdata)}, path
+
+
+def test_doctor_without_a_credentials_file_has_nothing_to_warn_about(tmp_path: Path) -> None:
+    check = _run(tmp_path, credential_store=_Store())["credentials file permissions"]
+    assert check.ok is True
+    assert not check.required
+
+
+def test_doctor_warns_on_a_loose_windows_credentials_file(tmp_path: Path) -> None:
+    env, path = _credentials_env(tmp_path)
+    runner = FakeRunner(icacls=ICACLS_LOOSE)
+    check = _run(tmp_path, env=env, runner=runner, credential_store=_Store())[
+        "credentials file permissions"
+    ]
+    assert check.ok is False
+    assert check.required is False
+    assert str(path) in check.detail
+    assert [c[1] for c in runner.calls if Path(c[0]).stem == "icacls"] == [str(path)]
+
+
+def test_doctor_accepts_a_tight_windows_credentials_file(tmp_path: Path) -> None:
+    env, _ = _credentials_env(tmp_path)
+    check = _run(tmp_path, env=env, credential_store=_Store())["credentials file permissions"]
+    assert check.ok is True
+
+
+def test_doctor_warns_on_a_loose_posix_credentials_file(tmp_path: Path) -> None:
+    env, _ = _credentials_env(tmp_path)
+    name = "credentials file permissions"
+    loose = _run(
+        tmp_path, env=env, windows=False, file_mode=lambda p: 0o644, credential_store=_Store()
+    )[name]
+    assert loose.ok is False and not loose.required
+    assert "chmod 600" in loose.detail
+    tight = _run(
+        tmp_path, env=env, windows=False, file_mode=lambda p: 0o600, credential_store=_Store()
+    )[name]
+    assert tight.ok is True
+
+
+def test_doctor_credentials_file_icacls_failure_is_a_warning(tmp_path: Path) -> None:
+    env, _ = _credentials_env(tmp_path)
+
+    def runner(cmd: Sequence[str]) -> tuple[int, str]:
+        if Path(cmd[0]).stem == "icacls":
+            return 5, "Access is denied.\n"
+        return FakeRunner()(cmd)
+
+    check = _run(tmp_path, env=env, runner=runner, credential_store=_Store())[
+        "credentials file permissions"
+    ]
+    assert check.ok is False and not check.required
+    assert "Access is denied" in check.detail
+
+
+def test_doctor_keeps_the_informational_keyring_check(tmp_path: Path) -> None:
+    check = _run(tmp_path, credential_store=_Store())["keyring"]
+    assert check.ok is True
+    assert not check.required
+
+
+def test_doctor_credential_store_with_any_other_error_is_a_warning(tmp_path: Path) -> None:
+    class PyWinError(Exception):  # what the Windows keyring backend lets through
+        pass
+
+    class Broken(_Store):
+        def get(self, name: str) -> str | None:
+            raise PyWinError(f"(1312, 'CredRead', secret-detail-{name})")
+
+    checks = _run(tmp_path, credential_store=Broken())
+    check = checks["credentials"]
+    assert check.ok is False
+    assert check.required is False
+    assert "PyWinError" in check.detail
+    assert "secret-detail" not in check.detail
+    assert "credentials file permissions" in checks  # later checks still ran
+
+
+def test_doctor_fails_when_the_subtitle_cache_is_inside_the_library(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings = dataclasses.replace(settings, subtitle_cache_dir=settings.library_root / "subs")
+    check = _run(tmp_path, settings=settings)["library overlap"]
+    assert check.ok is False
+    assert check.required is True
+    assert "subtitle cache" in check.detail
+
+
+def test_doctor_fails_when_the_library_is_inside_the_subtitle_cache(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    settings = dataclasses.replace(settings, subtitle_cache_dir=tmp_path)
+    check = _run(tmp_path, settings=settings)["library overlap"]
+    assert check.ok is False
+    assert "subtitle cache" in check.detail
+
+
+def test_cli_writing_command_refuses_a_subtitle_cache_in_the_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("VC_SUBTITLE_CACHE_DIR")  # the conftest default would beat the file
+    config = _config(tmp_path)
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + f"subtitle_cache_dir = '{tmp_path / 'library' / 'subs'}'\n",
+        encoding="utf-8",
+    )
+    result = CliRunner().invoke(app, ["status", "--config", str(config)])
+    assert result.exit_code == 2
+    assert "subtitle cache" in result.output
+    assert "library" in result.output
+
+
+def test_cli_subtitle_cache_in_the_library_from_the_environment(tmp_path: Path) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["status", "--config", str(_config(tmp_path))],
+        env={"VC_SUBTITLE_CACHE_DIR": str(tmp_path / "library" / "subs")},
+    )
+    assert result.exit_code == 2
+    assert "subtitle cache" in result.output

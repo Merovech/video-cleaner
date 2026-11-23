@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from video_cleaner.consolefmt import ConsoleLogHandler
-from video_cleaner.logging_setup import LOGGER_NAME, redact, setup_logging
+from video_cleaner.logging_setup import (
+    LOGGER_NAME,
+    RedactingFilter,
+    redact,
+    register_secrets,
+    setup_logging,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -212,3 +218,141 @@ def test_console_lines_carry_a_level_tag_the_file_lines_do_not(
     err = capsys.readouterr().err.splitlines()
     assert err == ["[VERB] d-marker", "[INFO] i-marker", "[WARN] w-marker", "[FAIL] e-marker"]
     assert "[INFO]" not in path.read_text(encoding="utf-8")  # the file keeps its own format
+
+
+def test_redact_masks_a_bearer_value_that_follows_a_masked_label() -> None:
+    out = redact("token: Bearer abc123")
+    assert "abc123" not in out
+    assert "Bearer abc123" not in out
+
+
+@pytest.mark.parametrize(
+    ("text", "leaked"),
+    [
+        ("Authorization: Basic dXNlcjpwdw==", "dXNlcjpwdw"),
+        ("authorization: basic dXNlcjpwdw==", "dXNlcjpwdw"),
+        ('Authorization: Digest username="bob", realm="x", response="deadbeef"', "deadbeef"),
+        ("password: Basic dXNlcjpwdw==", "dXNlcjpwdw"),
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),  # no digit, +, / or =
+        ("Proxy-Authorization: Basic YTpi", "YTpi"),
+        ("proxy-authorization:basic YTpi", "YTpi"),
+    ],
+)
+def test_redact_masks_basic_and_digest_credentials(text: str, leaked: str) -> None:
+    out = redact(text)
+    assert leaked not in out
+    assert "***" in out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "basic configuration loaded; digest of the file computed",
+        "basic setup/teardown done",
+        "digest of the file",
+    ],
+)
+def test_redact_leaves_the_word_basic_in_prose_alone(text: str) -> None:
+    assert redact(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "leaked"),
+    [
+        ('{\\"password\\": \\"s3cr3t\\"}', "s3cr3t"),
+        ('{\\"password\\": \\"two words\\", \\"x\\": 1}', "two words"),
+        ('{"password": "pa\\"ss word"}', "ss word"),
+    ],
+)
+def test_redact_handles_escaped_quotes_inside_json_strings(text: str, leaked: str) -> None:
+    out = redact(text)
+    assert leaked not in out
+    assert "***" in out
+
+
+def test_redact_escaped_json_keeps_the_text_after_the_value() -> None:
+    out = redact('{\\"password\\": \\"s3cr3t\\", \\"user\\": \\"bob\\"}')
+    assert "bob" in out
+
+
+@pytest.fixture
+def clean_registry() -> Iterator[None]:
+    from video_cleaner import logging_setup
+
+    logging_setup._reset_registered_secrets()
+    yield
+    logging_setup._reset_registered_secrets()
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registered_secret_is_masked_by_redact() -> None:
+    register_secrets(["hunter22"])
+    out = redact("connect with hunter22 now")
+    assert "hunter22" not in out
+    assert out == "connect with *** now"
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_the_registry_is_an_immutable_snapshot_swapped_under_a_lock() -> None:
+    from video_cleaner import logging_setup
+
+    before = logging_setup._registered
+    assert isinstance(before, frozenset)
+    register_secrets(["hunter22"])
+    assert before == frozenset()  # a reader holding the old snapshot is unaffected
+    assert logging_setup._registered == frozenset({"hunter22"})
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registering_while_another_thread_redacts_never_raises() -> None:
+    import threading
+
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        try:
+            while not stop.is_set():
+                redact("text with secret-0 and secret-5 in it")
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        for i in range(3000):
+            register_secrets([f"secret-{i}"])
+    finally:
+        stop.set()
+        thread.join()
+    assert errors == []
+    assert redact("secret-2999") == "***"
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registered_secret_is_masked_by_the_filter() -> None:
+    register_secrets(["hunter22"])
+    record = logging.LogRecord(
+        "video_cleaner.x", logging.INFO, __file__, 1, "got %s", ("hunter22",), None
+    )
+    assert RedactingFilter().filter(record)
+    assert "hunter22" not in record.getMessage()
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registered_secret_is_masked_in_the_log_file(tmp_path: Path) -> None:
+    register_secrets(["hunter22"])
+    path = setup_logging(tmp_path, verbosity=0)
+    logging.getLogger(f"{LOGGER_NAME}.reg").info("value hunter22 here")
+    for handler in logging.getLogger(LOGGER_NAME).handlers:
+        handler.flush()
+    assert "hunter22" not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registering_accumulates_and_ignores_values_under_four_characters() -> None:
+    register_secrets(["a", "abc", ""])
+    assert redact("a abc") == "a abc"
+    register_secrets(["abcd"])
+    register_secrets(["wxyz"])
+    assert redact("abcd wxyz") == "*** ***"

@@ -50,6 +50,9 @@ class Settings:
     completed_dir: Path
     state_db: Path
     log_dir: Path
+    # `load_settings` derives the real default (under LOCALAPPDATA); this relative value only
+    # serves code that builds `Settings` directly and passes no cache folder.
+    subtitle_cache_dir: Path = Path("subtitles")
     scratch_cap_bytes: int = 2 * 10**12
     min_file_size: int = 0
     bitrate_floor_kbps: int = 2500  # placeholder the user sets; calibration does not change it
@@ -63,6 +66,14 @@ class Settings:
     heartbeat_s: float = 15.0
     plain_progress_s: float = 30.0
     log_file_level: str = "DEBUG"
+    local_subtitle_dirs: tuple[Path, ...] = ()
+    forced_full_cues_per_hour: float = 250.0  # placeholder, calibrated against the real library
+    align_max_offset_s: float = 120.0
+    align_scale_tolerance: float = 0.05
+    align_min_score: float = 0.0  # 0 disables the score check
+    subtitle_max_bytes: int = 2_000_000
+    subtitle_min_cues: int = 20
+    subtitle_candidates_per_file: int = 3
 
 
 def _to_int(name: str, value: object) -> int:
@@ -133,12 +144,30 @@ def _to_path(name: str, value: object) -> Path:
     return Path(value)
 
 
+def _to_path_tuple(name: str, value: object) -> tuple[Path, ...]:
+    """A TOML array of absolute path strings (an environment value is split first)."""
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError(f"{name}: expected an array of path strings, got {value!r}")
+    return tuple(_to_path(f"{name}[{index}]", item) for index, item in enumerate(value))
+
+
 _CONVERTERS: dict[str, Callable[[str, object], Any]] = {
     "int": _to_int,
     "float": _to_float,
     "str": _to_str,
     "Path": _to_path,
+    "tuple[Path, ...]": _to_path_tuple,
 }
+_LIST_TYPE = "tuple[Path, ...]"
+
+
+def _list_fields() -> frozenset[str]:
+    return frozenset(f.name for f in fields(Settings) if str(f.type) == _LIST_TYPE)
+
+
+def _split_env_list(value: str) -> list[str]:
+    """An environment value holding several paths: split on ``os.pathsep``, empty parts dropped."""
+    return [part for part in value.split(os.pathsep) if part.strip()]
 
 
 def _field_converters() -> dict[str, Callable[[str, object], Any]]:
@@ -177,6 +206,18 @@ def _validate(values: Mapping[str, Any]) -> None:
     _require(
         values["log_file_level"] in LOG_FILE_LEVELS,
         f"log_file_level {values['log_file_level']!r} must be one of {', '.join(LOG_FILE_LEVELS)}",
+    )
+    _require(values["forced_full_cues_per_hour"] > 0, "forced_full_cues_per_hour must be positive")
+    _require(values["align_max_offset_s"] > 0, "align_max_offset_s must be positive")
+    _require(
+        0 <= values["align_scale_tolerance"] < 1, "align_scale_tolerance must be within [0, 1)"
+    )
+    _require(values["align_min_score"] >= 0, "align_min_score must not be negative (0 disables)")
+    _require(values["subtitle_max_bytes"] > 0, "subtitle_max_bytes must be positive")
+    _require(values["subtitle_min_cues"] >= 0, "subtitle_min_cues must not be negative")
+    _require(
+        values["subtitle_candidates_per_file"] >= 1,
+        "subtitle_candidates_per_file must be at least 1",
     )
     _require(
         values["preset"] in X265_PRESETS,
@@ -243,10 +284,15 @@ def load_settings(
         for key, value in table.items():
             raw[key] = (f"{file_path}", value)
 
+    list_fields = _list_fields()
     for name in converters:
         env_name = env_var(name)
         if env_name in environ:
-            raw[name] = (f"environment variable {env_name}", environ[env_name])
+            text = environ[env_name]
+            raw[name] = (
+                f"environment variable {env_name}",
+                _split_env_list(text) if name in list_fields else text,
+            )
 
     defaults = {f.name: f.default for f in fields(Settings) if f.default is not MISSING}
     values: dict[str, Any] = dict(defaults)
@@ -258,9 +304,13 @@ def load_settings(
 
     local_appdata = environ.get("LOCALAPPDATA")
     app_local = Path(local_appdata) / APP_DIR_NAME if local_appdata else None
-    derived = {"state_db": ("state.db", app_local), "log_dir": ("logs", app_local)}
+    derived = {
+        "state_db": ("state.db", app_local),
+        "log_dir": ("logs", app_local),
+        "subtitle_cache_dir": ("subtitles", app_local),
+    }
     for name, (leaf, base) in derived.items():
-        if name not in values:
+        if name not in raw:
             if base is None:
                 raise ConfigError(
                     f"{name} is not set and LOCALAPPDATA is unavailable to derive a default; "

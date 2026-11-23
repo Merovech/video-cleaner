@@ -7,21 +7,21 @@ from typer.testing import CliRunner
 import video_cleaner
 from video_cleaner.cli import app
 
-PHASE1_COMMANDS = ("doctor", "survey", "plan", "calibrate", "run", "status", "report")
+COMMANDS = ("doctor", "survey", "plan", "calibrate", "run", "status", "report", "auth")
 
 
-def test_help_lists_phase1_commands() -> None:
+def test_help_lists_every_command() -> None:
     out = CliRunner().invoke(app, ["--help"]).stdout
-    for cmd in PHASE1_COMMANDS:
+    for cmd in COMMANDS:
         assert cmd in out
 
 
 def test_every_command_is_registered() -> None:
     names = {c.name or (c.callback.__name__ if c.callback else "") for c in app.registered_commands}
-    assert names == set(PHASE1_COMMANDS)
+    assert names == set(COMMANDS)
 
 
-@pytest.mark.parametrize("cmd", PHASE1_COMMANDS)
+@pytest.mark.parametrize("cmd", COMMANDS)
 def test_no_command_is_a_stub(cmd: str, tmp_path: Path) -> None:
     # A missing explicit config stops every command at the config check, before any real work.
     result = CliRunner().invoke(app, [cmd, "--config", str(tmp_path / "missing.toml")])
