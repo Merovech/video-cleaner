@@ -41,9 +41,14 @@ _GENERIC_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"(?i)(password{_SEP}){_LABELLED_VALUE}"),
     re.compile(rf"(?i)(token{_SEP}){_LABELLED_VALUE}"),
     re.compile(r"(?i)(\bbearer\s+)[^\s\"',;]+"),
-    # Basic credentials are base64: require a digit or one of + / = so prose ("basic setup")
-    # is left alone. Digest credentials are key=value pairs, masked to the end of the line.
-    re.compile(r"(?i)(\bbasic\s+)(?=[A-Za-z0-9+/_-]*[0-9+/=])[A-Za-z0-9+/=_-]{6,}"),
+    # Basic credentials are base64. After an Authorization / Proxy-Authorization header any
+    # base64 token is masked (base64 of "user:pass" can have no digit, '+', '/' or '=').
+    re.compile(
+        r"(?i)((?:proxy-)?authorization\s*[:=]\s*basic\s+)[A-Za-z0-9+/=_-]{4,}",
+    ),
+    # Elsewhere a bare "basic <token>" is masked only when the token looks encoded (a digit,
+    # '+' or '=') so prose such as "basic setup/teardown" is left alone.
+    re.compile(r"(?i)(\bbasic\s+)(?=[A-Za-z0-9+/_-]*[0-9+=])[A-Za-z0-9+/=_-]{6,}"),
     re.compile(r"(?i)(\bdigest\s+)(?=\w+\s*=)[^\n]+"),
 )
 

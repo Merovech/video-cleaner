@@ -233,6 +233,9 @@ def test_redact_masks_a_bearer_value_that_follows_a_masked_label() -> None:
         ("authorization: basic dXNlcjpwdw==", "dXNlcjpwdw"),
         ('Authorization: Digest username="bob", realm="x", response="deadbeef"', "deadbeef"),
         ("password: Basic dXNlcjpwdw==", "dXNlcjpwdw"),
+        ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),  # no digit, +, / or =
+        ("Proxy-Authorization: Basic YTpi", "YTpi"),
+        ("proxy-authorization:basic YTpi", "YTpi"),
     ],
 )
 def test_redact_masks_basic_and_digest_credentials(text: str, leaked: str) -> None:
@@ -241,8 +244,15 @@ def test_redact_masks_basic_and_digest_credentials(text: str, leaked: str) -> No
     assert "***" in out
 
 
-def test_redact_leaves_the_word_basic_in_prose_alone() -> None:
-    text = "basic configuration loaded; digest of the file computed"
+@pytest.mark.parametrize(
+    "text",
+    [
+        "basic configuration loaded; digest of the file computed",
+        "basic setup/teardown done",
+        "digest of the file",
+    ],
+)
+def test_redact_leaves_the_word_basic_in_prose_alone(text: str) -> None:
     assert redact(text) == text
 
 
