@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -229,10 +230,16 @@ def _subtitle_with_title(title: str) -> Any:
         ("non forced", False),
         ("not forced", False),
         ("Unforced", False),
+        ("Non  forced", False),
+        ("Non - Forced", False),
+        ("No forced", False),
+        ("non_forced", False),
         ("English (Full)", False),
         ("English [Forced]", True),
         ("Forced", True),
         ("english forced subs", True),
+        ("forced_subs", True),
+        ("eng_forced", True),
     ],
 )
 def test_forced_is_matched_by_word_in_the_title(title: str, forced: bool) -> None:
@@ -244,8 +251,14 @@ def test_forced_is_matched_by_word_in_the_title(title: str, forced: bool) -> Non
     [
         ("Sdhx", False),
         ("English", False),
+        ("Non-SDH", False),
+        ("non sdh", False),
+        ("Not SDH", False),
+        ("No SDH", False),
         ("English SDH", True),
+        ("English_SDH", True),
         ("English CC", True),
+        ("English_CC", True),
         ("English (Closed Captions)", True),
         ("Hearing Impaired", True),
         ("Hearing-impaired", True),
@@ -253,6 +266,17 @@ def test_forced_is_matched_by_word_in_the_title(title: str, forced: bool) -> Non
 )
 def test_sdh_is_matched_by_word_in_the_title(title: str, sdh: bool) -> None:
     assert _subtitle_with_title(title).sdh is sdh
+
+
+@pytest.mark.parametrize(
+    ("filler", "forced"), [("a", False), ("_", True), (" ", True), ("-", True), ("non ", False)]
+)
+def test_a_huge_title_is_matched_in_linear_time(filler: str, forced: bool) -> None:
+    started = time.monotonic()
+    stream = _subtitle_with_title(filler * 1_000_000 + "forced")
+    assert time.monotonic() - started < 5.0
+    assert stream.forced is forced
+    assert stream.sdh is False
 
 
 def test_pgs_is_image_subtitle() -> None:

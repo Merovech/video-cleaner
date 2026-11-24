@@ -1,0 +1,9 @@
+{
+  "link": "https://dl.opensubtitles.com/en/download/FAKE-LINK-0000/subfile/FAKE-LINK-NAME.srt",
+  "file_name": "FAKE-FILE-NAME-DO-NOT-USE.srt",
+  "requests": 3,
+  "remaining": 97,
+  "message": "Your quota will be renewed in 23 hours and 59 minutes (2030-01-02 00:00:00 UTC)",
+  "reset_time": "23 hours and 59 minutes",
+  "reset_time_utc": "2030-01-02T00:00:00.000Z"
+}

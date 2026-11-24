@@ -24,6 +24,7 @@ from video_cleaner.tools import (
     ToolOutputError,
     ToolResult,
     Tools,
+    ToolTimedOut,
     locate_tools,
     mkvmerge_parser,
     run_tool,
@@ -313,6 +314,104 @@ def test_run_tool_passes_cwd(tmp_path: Path) -> None:
     assert Path(result.stdout.strip()).resolve() == tmp_path.resolve()
 
 
+def test_run_tool_child_sees_the_given_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VC_TEST_ENV_MARKER", raising=False)
+    env = {**os.environ, "VC_TEST_ENV_MARKER": "from-the-caller"}
+    code = "import os; print(os.environ.get('VC_TEST_ENV_MARKER', 'unset'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter(), env=env)
+    assert result.stdout.strip() == "from-the-caller"
+    # Giving the child an environment never changes this process's.
+    assert "VC_TEST_ENV_MARKER" not in os.environ
+
+
+def test_run_tool_without_env_inherits_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VC_TEST_ENV_MARKER", "inherited")
+    code = "import os; print(os.environ.get('VC_TEST_ENV_MARKER', 'unset'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter())
+    assert result.stdout.strip() == "inherited"
+
+
+def test_run_tool_env_replaces_rather_than_extends(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VC_TEST_ENV_MARKER", "inherited")
+    env = {k: v for k, v in os.environ.items() if k != "VC_TEST_ENV_MARKER"}
+    code = "import os; print(os.environ.get('VC_TEST_ENV_MARKER', 'unset'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter(), env=env)
+    assert result.stdout.strip() == "unset"
+
+
+def test_run_tool_timeout_stops_the_child_and_raises() -> None:
+    started = time.monotonic()
+    with pytest.raises(ToolTimedOut) as excinfo:
+        run_tool(
+            _py("import time; time.sleep(60)"),
+            label="slow",
+            reporter=FakeReporter(),
+            timeout_s=0.5,
+        )
+    assert time.monotonic() - started < 30
+    assert excinfo.value.timeout_s == 0.5
+    assert excinfo.value.label == "slow"
+    assert "0.5" in str(excinfo.value)
+
+
+def test_run_tool_within_the_timeout_returns_normally() -> None:
+    result = run_tool(_py("print('done')"), label="quick", reporter=FakeReporter(), timeout_s=60.0)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "done"
+
+
+_GRANDCHILD_PARENT = r"""
+import pathlib, subprocess, sys, time
+beat = sys.argv[1]
+code = (
+    "import pathlib, sys, time\n"
+    "p = pathlib.Path(sys.argv[1])\n"
+    "while True:\n"
+    "    with p.open('a') as f:\n"
+    "        f.write('x')\n"
+    "    time.sleep(0.05)\n"
+)
+subprocess.Popen([sys.executable, "-c", code, beat])
+time.sleep(120)
+"""
+
+
+def _vc_threads() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name.startswith("vc-") and t.is_alive()}
+
+
+def test_run_tool_timeout_kills_the_whole_process_tree(tmp_path: Path) -> None:
+    beat = tmp_path / "grandchild-beat.txt"
+    before = _vc_threads()
+    with pytest.raises(ToolTimedOut):
+        run_tool(
+            _py(_GRANDCHILD_PARENT, str(beat)),
+            label="tree",
+            reporter=FakeReporter(),
+            timeout_s=3.0,
+            join_timeout_s=2.0,
+        )
+    # The grandchild had started (it was writing) and holds this process's pipes.
+    assert beat.exists()
+    assert beat.stat().st_size > 0
+    # It is gone shortly after: the file stops growing.
+    deadline = time.monotonic() + 10.0
+    size = -1
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        now = beat.stat().st_size
+        if now == size:
+            break
+        size = now
+    else:
+        pytest.fail("the grandchild kept running after the timeout")
+    # No reader or reaper thread of this call is left behind.
+    deadline = time.monotonic() + 10.0
+    while _vc_threads() - before and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert not _vc_threads() - before
+
+
 def test_run_tool_logs_redacted_command_exit_code_and_duration() -> None:
     records: list[logging.LogRecord] = []
 
@@ -380,7 +479,9 @@ def test_run_tool_kills_process_on_keyboard_interrupt(monkeypatch: pytest.Monkey
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
-            started.append(self)
+            # Stopping the process tree on Windows runs taskkill, which is not the tool.
+            if "taskkill" not in str(args[0][0]).lower():
+                started.append(self)
 
         def wait(self, timeout: float | None = None) -> int:
             if InterruptingPopen._first:
@@ -415,7 +516,9 @@ def test_run_tool_sees_ctrl_c_while_waiting_for_a_long_child(
 
     def recording_popen(*args: Any, **kwargs: Any) -> subprocess.Popen[str]:
         proc = real_popen(*args, **kwargs)
-        started.append(proc)
+        # Stopping the process tree on Windows runs taskkill, which is not the tool.
+        if "taskkill" not in str(args[0][0]).lower():
+            started.append(proc)
         return proc
 
     monkeypatch.setattr(subprocess, "Popen", recording_popen)
@@ -444,6 +547,46 @@ def test_run_tool_stops_heartbeat_thread_after_return() -> None:
         t for t in threading.enumerate() if t.name not in before and t.name.startswith("vc-")
     ]
     assert leftover == []
+
+
+# --- heartbeat ------------------------------------------------------------------------------
+
+
+def test_heartbeat_beats_while_the_block_runs_and_stops_after() -> None:
+    reporter = FakeReporter()
+    before = {t.name for t in threading.enumerate()}
+    with tools.heartbeat(reporter, "waiting", 0.05):
+        time.sleep(0.4)
+    assert len(reporter.heartbeats) >= 2
+    assert {label for label, _ in reporter.heartbeats} == {"waiting"}
+    elapsed = [e for _, e in reporter.heartbeats]
+    assert elapsed == sorted(elapsed)
+    count = len(reporter.heartbeats)
+    time.sleep(0.2)
+    assert len(reporter.heartbeats) == count  # nothing after the block
+    assert [t for t in threading.enumerate() if t.name not in before] == []
+
+
+def test_heartbeat_stops_when_the_block_raises() -> None:
+    reporter = FakeReporter()
+    with pytest.raises(RuntimeError, match="boom"), tools.heartbeat(reporter, "x", 0.05):
+        raise RuntimeError("boom")
+    count = len(reporter.heartbeats)
+    time.sleep(0.2)
+    assert len(reporter.heartbeats) == count
+
+
+def test_heartbeat_survives_a_failing_reporter(caplog: pytest.LogCaptureFixture) -> None:
+    class Failing(FakeReporter):
+        def heartbeat(self, label: str, elapsed_s: float) -> None:
+            raise RuntimeError("reporter down")
+
+    with (
+        caplog.at_level(logging.ERROR, logger="video_cleaner.tools"),
+        tools.heartbeat(Failing(), "x", 0.05),
+    ):
+        time.sleep(0.2)
+    assert any("heartbeat failed" in r.getMessage() for r in caplog.records)
 
 
 # --- locate_tools ---------------------------------------------------------------------------

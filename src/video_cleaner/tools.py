@@ -7,10 +7,13 @@ while it runs and guarantees the process is gone when it returns or raises.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
+import signal
 import subprocess  # nosec B404
+import sys
 import threading
 import time
 from collections import deque
@@ -56,6 +59,15 @@ class ToolFailed(Exception):
         self.log_path = log_path
         where = f"; stderr in {log_path}" if log_path is not None else ""
         super().__init__(f"command exited with code {returncode}: {cmd_text}{where}")
+
+
+class ToolTimedOut(Exception):
+    """A tool ran longer than the *timeout_s* given to `run_tool`; it has been stopped."""
+
+    def __init__(self, label: str, timeout_s: float) -> None:
+        self.label = label
+        self.timeout_s = timeout_s
+        super().__init__(f"{label}: stopped after {timeout_s:g}s without finishing")
 
 
 class ToolOutputError(Exception):
@@ -301,24 +313,104 @@ def _heartbeat_loop(
             _log.exception("heartbeat failed")
 
 
-def _wait_interruptibly(proc: subprocess.Popen[str]) -> int:
-    """`proc.wait()` in slices of `_WAIT_SLICE_S`, so a KeyboardInterrupt is never stuck."""
+@contextlib.contextmanager
+def heartbeat(
+    reporter: Reporter,
+    label: str,
+    interval_s: float,
+    *,
+    started: float | None = None,
+    join_timeout_s: float = _DEFAULT_JOIN_TIMEOUT_S,
+) -> Iterator[None]:
+    """Call ``reporter.heartbeat(label, elapsed)`` every *interval_s* while the block runs.
+
+    *started* is the `time.monotonic` reading the elapsed time counts from (the block's start
+    by default). The beating thread is stopped when the block ends or raises, so nothing beats
+    afterwards. A reporter that raises is logged and the beat goes on.
+    """
+    stop = threading.Event()
+    beat = threading.Thread(
+        target=_heartbeat_loop,
+        args=(stop, reporter, label, interval_s, time.monotonic() if started is None else started),
+        name="vc-heartbeat",
+        daemon=True,
+    )
+    beat.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        beat.join(timeout=join_timeout_s)
+
+
+def _wait_interruptibly(proc: subprocess.Popen[str], label: str, timeout_s: float | None) -> int:
+    """`proc.wait()` in slices of `_WAIT_SLICE_S`, so a KeyboardInterrupt is never stuck.
+
+    Raises `ToolTimedOut` once *timeout_s* seconds have passed (never, if it is None); the
+    caller stops the process.
+    """
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     while True:
         try:
             return proc.wait(timeout=_WAIT_SLICE_S)
         except subprocess.TimeoutExpired:
-            continue
+            if timeout_s is not None and deadline is not None and time.monotonic() >= deadline:
+                raise ToolTimedOut(label, timeout_s) from None
+
+
+def _taskkill_path() -> Path:
+    root = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR") or r"C:\Windows"
+    return Path(root) / "System32" / "taskkill.exe"
+
+
+def _kill_tree_windows(proc: subprocess.Popen[str]) -> None:  # pragma: no cover - Windows only
+    """Force-kill *proc* and everything it started (`taskkill /T`, which follows parent links).
+
+    Falls back to killing just *proc* when taskkill cannot be run. Console processes cannot be
+    asked to close, so there is no gentler first step on Windows (`terminate` is a kill too).
+    """
+    try:
+        subprocess.run(  # noqa: S603  # nosec B603
+            [str(_taskkill_path()), "/PID", str(proc.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            timeout=_TERMINATE_GRACE_S * 2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _log.warning("taskkill failed for process %d; killing only that process", proc.pid)
+    if proc.poll() is None:
+        proc.kill()
+
+
+def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:  # pragma: no cover - POSIX only
+    """Send *sig* to the whole process group of *proc* (it leads its own, see `run_tool`)."""
+    # The group may be gone already, or not ours to signal.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, sig)  # type: ignore[attr-defined,unused-ignore]
 
 
 def _stop_process(proc: subprocess.Popen[str]) -> None:
+    """Stop *proc* and the processes it started: terminate, then kill after a grace period.
+
+    Every child leads its own process group (POSIX session) or is killed with its tree
+    (Windows), so a tool that runs helpers (ffsubsync runs ffmpeg) leaves none behind to hold
+    the output pipes open.
+    """
     if proc.poll() is not None:
         return
-    proc.terminate()
-    try:
-        proc.wait(timeout=_TERMINATE_GRACE_S)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    if sys.platform == "win32":  # pragma: no cover - the other branch runs on POSIX
+        _kill_tree_windows(proc)
         proc.wait()
+        return
+    _signal_group(proc, signal.SIGTERM)  # pragma: no cover - POSIX only
+    with contextlib.suppress(subprocess.TimeoutExpired):  # pragma: no cover - POSIX only
+        proc.wait(timeout=_TERMINATE_GRACE_S)
+    # Also when the leader has gone: helpers that ignored the terminate must not outlive it.
+    _signal_group(proc, signal.SIGKILL)  # pragma: no cover - POSIX only
+    proc.wait()  # pragma: no cover - POSIX only
 
 
 def _close_pipes_when_readers_finish(
@@ -376,8 +468,10 @@ def run_tool(
     parser: Callable[[Iterable[str]], Iterator[Progress]] | None = None,
     stderr_log: Path | None = None,
     cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
     check: bool = True,
     join_timeout_s: float = _DEFAULT_JOIN_TIMEOUT_S,
+    timeout_s: float | None = None,
 ) -> ToolResult:
     """Run *cmd* (an argument list, never a shell) and return its result.
 
@@ -387,11 +481,17 @@ def run_tool(
     every *heartbeat_s* seconds. The child is terminated, then killed, if this call is
     interrupted or fails.
 
-    Raises `ToolFailed` on a non-zero exit when *check* is true, `ToolNotFound` if the
-    executable does not exist, and `ToolOutputError` if the parser, the reporter or a reader
-    thread failed, or a reader had not finished *join_timeout_s* after the process exited
-    (typically a grandchild holding the pipe). Output errors are raised after the process has
-    exited and the readers are done; the pipes are always drained meanwhile.
+    *env* is the child's whole environment; None (the default) inherits this process's. It is
+    copied, and this process's environment is never changed. With *timeout_s* the child is
+    stopped (terminated, then killed) once it has run that long and `ToolTimedOut` is raised;
+    None waits for as long as the tool takes.
+
+    Raises `ToolFailed` on a non-zero exit when *check* is true, `ToolTimedOut` when *timeout_s*
+    passes, `ToolNotFound` if the executable does not exist, and `ToolOutputError` if the
+    parser, the reporter or a reader thread failed, or a reader had not finished
+    *join_timeout_s* after the process exited (typically a grandchild holding the pipe). Output
+    errors are raised after the process has exited and the readers are done; the pipes are always
+    drained meanwhile.
     """
     cmd_text = redact(subprocess.list2cmdline([str(part) for part in cmd]))
     _log.debug("run [%s]: %s", label, cmd_text)
@@ -406,8 +506,12 @@ def run_tool(
             encoding="utf-8",
             errors="replace",
             cwd=cwd,
+            env=None if env is None else dict(env),
             shell=False,
             creationflags=power.creation_flags(),  # below normal: the PC stays usable
+            # Its own process group (POSIX) so the whole tree can be stopped; on Windows the
+            # tree is found from the parent links instead (see `_stop_process`).
+            start_new_session=sys.platform != "win32",
         )
     except FileNotFoundError as exc:
         raise ToolNotFound(str(cmd[0]), "executable does not exist") from exc
@@ -417,30 +521,24 @@ def run_tool(
         raise RuntimeError("subprocess pipes were not created")
     out = _StdoutCapture(proc.stdout, parser, reporter)
     err = _StderrCapture(proc.stderr, stderr_log)
-    stop = threading.Event()
     readers = [
         threading.Thread(target=out.run, name="vc-stdout", daemon=True),
         threading.Thread(target=err.run, name="vc-stderr", daemon=True),
     ]
-    beat = threading.Thread(
-        target=_heartbeat_loop,
-        args=(stop, reporter, label, heartbeat_s, started),
-        name="vc-heartbeat",
-        daemon=True,
-    )
     stuck: list[str] = []
     try:
-        for thread in (*readers, beat):
+        for thread in readers:
             thread.start()
-        returncode = _wait_interruptibly(proc)
+        with heartbeat(
+            reporter, label, heartbeat_s, started=started, join_timeout_s=join_timeout_s
+        ):
+            returncode = _wait_interruptibly(proc, label, timeout_s)
     except BaseException:
         _stop_process(proc)
         raise
     finally:
-        stop.set()
         # One shared deadline, so two stuck readers cost one timeout, not two.
         deadline = time.monotonic() + join_timeout_s
-        beat.join(timeout=max(0.0, deadline - time.monotonic()))
         for thread, capture in zip(readers, (out, err), strict=True):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if thread.is_alive():

@@ -1,0 +1,25 @@
+[12:00:00] INFO     extracting speech segments from reference  ffsubsync.py:734
+                    'noaudio.mkv'...                                           
+
+  0%|          | 0/10.0 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\venv\Lib\site-packages\ffsubsync\ffsubsync.py", line 1200, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\venv\Lib\site-packages\ffsubsync\ffsubsync.py", line 1196, in main
+    return run(parser)["retval"]
+           ^^^^^^^^^^^
+  File "C:\venv\Lib\site-packages\ffsubsync\ffsubsync.py", line 809, in run
+    sync_was_successful = _run_impl(
+                          ^^^^^^^^^^
+  File "C:\venv\Lib\site-packages\ffsubsync\ffsubsync.py", line 735, in _run_impl
+    reference_pipe.fit(args.reference)
+  File "C:\venv\Lib\site-packages\ffsubsync\sklearn_shim.py", line 255, in fit
+    self._final_estimator.fit(Xt, y, **fit_params)
+  File "C:\venv\Lib\site-packages\ffsubsync\speech_transformers.py", line 635, in fit
+    self._fit_using_audio(fname)
+  File "C:\venv\Lib\site-packages\ffsubsync\speech_transformers.py", line 758, in _fit_using_audio
+    raise ValueError(
+ValueError: Unable to detect speech. Perhaps try specifying a different stream / track, or a different vad.

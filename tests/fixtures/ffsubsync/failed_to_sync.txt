@@ -1,0 +1,31 @@
+[12:00:00] INFO     extracting speech segments from reference  ffsubsync.py:734
+                    'clip.mkv'...                                              
+
+100%|█████████▉| 60.032/60.064 [00:00<00:00, 1412.13it/s]
+           INFO     total of speech segments: 3022.0 speech_transformers.py:763
+           INFO     ...done                                    ffsubsync.py:736
+           INFO     extracting speech segments from subtitles  ffsubsync.py:192
+                    file(s) ['in.srt']...                                      
+           INFO     computing alignments...                    ffsubsync.py:234
+           INFO     ...done                                    ffsubsync.py:250
+           INFO     score: 5256.000                            ffsubsync.py:255
+           INFO     offset seconds: -3.000                     ffsubsync.py:256
+           INFO     framerate scale factor: 1.000              ffsubsync.py:257
+           INFO     writing output to missing-dir\out3.srt     ffsubsync.py:350
+           ERROR    failed to sync in.srt                      ffsubsync.py:360
+                    Traceback (most recent call last):                         
+                      File                                                     
+                    "C:\venv\Lib\sit                 
+                    e-packages\ffsubsync\ffsubsync.py", line                   
+                    351, in try_sync                                           
+                        out_subs.write_file(srtout)                            
+                      File                                                     
+                    "C:\venv\Lib\sit                 
+                    e-packages\ffsubsync\generic_subtitles.py"                 
+                    , line 160, in write_file                                  
+                        with open(fname or                                     
+                    sys.stdout.fileno(), "wb") as f:                           
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                 
+                    ^^^^^^^                                                    
+                    FileNotFoundError: [Errno 2] No such file                  
+                    or directory: 'missing-dir\\out3.srt'                      
