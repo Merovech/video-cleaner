@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,9 +25,11 @@ from resolve_fakes import (
     result,
     srt_bytes,
 )
+from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.state import SubtitleRecord, SubtitleStatus
 from video_cleaner.subtitles.local import index_local_folders
 from video_cleaner.subtitles.resolve import (
+    CacheUnwritable,
     sidecar_candidates,
     sweep_align_workdirs,
 )
@@ -338,6 +341,43 @@ def test_a_library_inside_the_cache_folder_raises(tmp_path: Path) -> None:
         case.resolve()
 
 
+def test_a_cache_folder_that_contains_the_video_raises(tmp_path: Path) -> None:
+    case = make_case(
+        tmp_path, library_root=tmp_path / "elsewhere", subtitle_cache_dir=tmp_path / "library"
+    )
+    with pytest.raises(ValueError, match="video"):
+        case.resolve()
+
+
+def test_a_cache_folder_inside_the_video_path_raises(tmp_path: Path) -> None:
+    case = make_case(tmp_path, library_root=tmp_path / "elsewhere")
+    inside = replace(case.settings, subtitle_cache_dir=case.video / "cache")
+    case.ctx = replace(case.ctx, settings=inside)
+    with pytest.raises(ValueError, match="video"):
+        case.resolve()
+
+
+def test_a_failed_final_write_of_a_sidecar_stops_instead_of_going_online(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeClient(
+        hash_results=[result(1, hash_match=True)], downloads={1: srt_bytes(tag="os")}
+    )
+    case = make_case(tmp_path, client=client)
+    write_sidecar(case, ".srt", srt_bytes(tag="sidecar"))
+
+    def broken(path: Path, text: str, **kwargs: Any) -> None:
+        if re.search(r"-sidecar-[0-9a-f]{12}\.srt$", path.name):
+            raise OSError("disk full")
+        write_text_atomic(path, text, **kwargs)
+
+    monkeypatch.setattr("video_cleaner.subtitles.resolve.write_text_atomic", broken)
+    with pytest.raises(CacheUnwritable) as caught:
+        case.resolve()
+    assert client.calls == 0
+    assert caught.value.record.status is SubtitleStatus.WANTED
+
+
 def test_a_relative_cache_folder_raises(tmp_path: Path) -> None:
     case = make_case(tmp_path, subtitle_cache_dir=Path("relative-cache"))
     write_sidecar(case, ".srt", srt_bytes())
@@ -430,7 +470,7 @@ def test_the_sweep_skips_a_folder_it_cannot_remove(
             raise PermissionError("locked")
         real(path, *args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("video_cleaner.subtitles.resolve.shutil.rmtree", flaky)
+    monkeypatch.setattr("video_cleaner.subtitles.cache.shutil.rmtree", flaky)
     assert sweep_align_workdirs(cache) == 1
     assert (cache / ".align-a").exists()
     assert not (cache / ".align-b").exists()

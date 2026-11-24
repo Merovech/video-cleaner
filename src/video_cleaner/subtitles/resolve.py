@@ -25,11 +25,8 @@ exception.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import logging
 import math
-import os
-import shutil
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -39,15 +36,24 @@ from typing import Protocol, TypeVar
 from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.config import Settings
 from video_cleaner.logging_setup import redact
-from video_cleaner.paths import is_under
 from video_cleaner.probe import MediaInfo
 from video_cleaner.progress import Reporter
 from video_cleaner.state import FileRecord, SubtitleRecord, SubtitleStatus
-from video_cleaner.subtitles.align import WORK_PREFIX, AlignResult, align_subtitle
+from video_cleaner.subtitles.align import AlignResult, align_subtitle
+from video_cleaner.subtitles.cache import (
+    CacheNames,
+    cache_key,
+    cache_names,
+    cached_result_is_valid,
+    check_cache_dir,
+    discard,
+    probe_writable,
+    sidecar_candidates,
+    sweep_align_workdirs,
+)
 from video_cleaner.subtitles.language import looks_english
 from video_cleaner.subtitles.local import (
     LocalSubtitle,
-    is_link_like,
     match_local,
     title_year_confidence,
 )
@@ -63,13 +69,21 @@ from video_cleaner.subtitles.quota import quota_usable
 from video_cleaner.subtitles.textfmt import NormalisedSubtitle, SubtitleRejected, normalise_subtitle
 from video_cleaner.tools import Tools
 
+__all__ = [
+    "CacheUnwritable",
+    "OnlineFailure",
+    "QuotaStop",
+    "ResolveContext",
+    "ResolveStop",
+    "SubtitleClient",
+    "resolve_subtitle",
+    "sidecar_candidates",
+    "sweep_align_workdirs",
+]
+
 _log = logging.getLogger("video_cleaner.subtitles.resolve")
 _T = TypeVar("_T")
 
-SIDECAR_EXTENSIONS = (".srt", ".ass", ".vtt")
-_SIDECAR_LANGUAGES = ("", ".en", ".eng")
-MAX_SIDECARS = 3
-_MAX_ENTRIES_EXAMINED = 100_000
 #: The most ids kept in a record's `tried_ids` (the state database reads back a longer list as
 #: empty), keeping the latest.
 MAX_TRIED_IDS = 50
@@ -87,8 +101,6 @@ _PROVENANCE = {
     "local": "English (local file)",
     "opensubtitles": "English (OpenSubtitles)",
 }
-_STAGED_SUFFIX = ".dl.srt"
-_ALIGNED_SUFFIX = ".aligned.srt"
 NO_CREDENTIALS = "unavailable: no OpenSubtitles credentials"
 MULTI_PART = "multi-part film: subtitle lookup needs the parts combined (not supported yet)"
 
@@ -143,6 +155,11 @@ class QuotaStop(ResolveStop):
         self.reset_at = reset_at
 
 
+class CacheUnwritable(ResolveStop):
+    """The cache folder cannot be written (disk full, no permission). The job should stop
+    resolving subtitles: every further download would be spent for nothing."""
+
+
 class OnlineFailure(ResolveStop):
     """OpenSubtitles failed. *fatal* is a refused login: the job must stop using the client."""
 
@@ -164,112 +181,6 @@ def _bounded_ids(ids: Iterable[int]) -> list[int]:
     return sorted(last, key=lambda item: last[item])[-MAX_TRIED_IDS:]
 
 
-def _discard(*paths: Path) -> None:
-    """Remove the resolver's own intermediate files; a failure is not worth an error."""
-    for path in paths:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            _log.debug("could not remove %r", path.name)
-
-
-def _check_cache_dir(settings: Settings) -> Path:
-    """The cache folder, after checking it is absolute and apart from the library.
-
-    A violation is a configuration bug, so it raises `ValueError` before anything is written.
-    """
-    cache = settings.subtitle_cache_dir
-    if not cache.is_absolute():
-        raise ValueError(f"subtitle_cache_dir must be an absolute path, not {str(cache)!r}")
-    root = settings.library_root
-    if is_under(cache, root) or is_under(root, cache):
-        raise ValueError(
-            f"subtitle_cache_dir {str(cache)!r} overlaps the library {str(root)!r}; "
-            "nothing is ever written to the library"
-        )
-    return cache
-
-
-def sidecar_candidates(path: Path) -> list[Path]:
-    """Subtitle files that sit beside *path*, named like it: same folder, same stem (any case),
-    an optional ".en" or ".eng", and an extension from `SIDECAR_EXTENSIONS`.
-
-    Sorted by name, at most `MAX_SIDECARS`, regular files only (never a link). The folder is
-    only listed; one that cannot be listed gives an empty list.
-    """
-    stem = path.stem.lower()
-    wanted = {f"{stem}{lang}{ext}" for lang in _SIDECAR_LANGUAGES for ext in SIDECAR_EXTENSIONS}
-    found: list[str] = []
-    try:
-        with os.scandir(path.parent) as entries:
-            for entry in itertools.islice(entries, _MAX_ENTRIES_EXAMINED):
-                if entry.name.lower() not in wanted:
-                    continue
-                try:
-                    if is_link_like(entry) or not entry.is_file(follow_symlinks=False):
-                        continue
-                except OSError:
-                    continue
-                found.append(entry.name)
-    except OSError:
-        return []
-    return [path.parent / name for name in sorted(found)[:MAX_SIDECARS]]
-
-
-def sweep_align_workdirs(cache_dir: Path) -> int:
-    """Remove the work folders ffsubsync runs left in *cache_dir* (killed runs) and count them.
-
-    Only direct children that are real folders named with the align work prefix are removed;
-    files, links, junctions and everything else stay. A folder that cannot be removed is logged
-    and skipped.
-    """
-    folders: list[str] = []
-    try:
-        with os.scandir(cache_dir) as entries:
-            for entry in itertools.islice(entries, _MAX_ENTRIES_EXAMINED):
-                try:
-                    if (
-                        entry.name.startswith(WORK_PREFIX)
-                        and entry.is_dir(follow_symlinks=False)
-                        and not is_link_like(entry)
-                    ):
-                        folders.append(entry.path)
-                except OSError:
-                    continue
-    except OSError:
-        return 0
-    removed = 0
-    for folder in folders:
-        try:
-            shutil.rmtree(folder)
-        except OSError as exc:
-            _log.warning("could not remove an old align work folder: %s", type(exc).__name__)
-            continue
-        removed += 1
-    return removed
-
-
-def _cached_result_is_valid(sub: SubtitleRecord, cache_dir: Path, max_bytes: int) -> bool:
-    """Whether a FOUND record's cache file is still there, inside the cache, and unchanged."""
-    path = sub.cache_path
-    if path is None or not sub.sha256 or not path.is_absolute() or not is_under(path, cache_dir):
-        return False
-    try:
-        data = read_bytes_capped(path, max_bytes)
-    except OSError:
-        return False
-    return data is not None and hashlib.sha256(data).hexdigest() == sub.sha256
-
-
-@dataclass(frozen=True)
-class _Names:
-    """The cache files of one candidate; the name is a hash and a number, never text."""
-
-    final: Path
-    staged: Path
-    aligned: Path
-
-
 class _Resolution:
     """One run of `resolve_subtitle` for one file."""
 
@@ -288,8 +199,7 @@ class _Resolution:
         self.ctx = ctx
         self.settings = ctx.settings
         self.cache_dir = cache_dir
-        text = f"{sub.path}|{sub.size}|{sub.mtime}"
-        self.key = hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+        self.key = cache_key(sub)
         self.label = _safe(rec.path.name, 80)
         self.base = replace(
             sub,
@@ -305,6 +215,7 @@ class _Resolution:
         self.attempts = sub.attempts
         self.downloads = 0
         self.online_tried = 0
+        self._probed = False
         self.notes: dict[str, list[str]] = {"sidecar": [], "local": [], "online": []}
         self._target: TitleYear | None = None
 
@@ -346,16 +257,11 @@ class _Resolution:
     def _note(self, source: str, reason: str) -> None:
         self.notes[source].append(_safe(reason))
 
-    def _names(self, provider: str, ident: str) -> _Names:
-        stem = f"{self.key}-{provider}-{ident}"
-        return _Names(
-            self.cache_dir / f"{stem}.srt",
-            self.cache_dir / f"{stem}{_STAGED_SUFFIX}",
-            self.cache_dir / f"{stem}{_ALIGNED_SUFFIX}",
-        )
+    def _names(self, provider: str, ident: str) -> CacheNames:
+        return cache_names(self.cache_dir, self.key, provider, ident)
 
     def _found(
-        self, provider: str, names: _Names, data: bytes, hash_exact: bool, detail: str
+        self, provider: str, names: CacheNames, data: bytes, hash_exact: bool, detail: str
     ) -> SubtitleRecord:
         _log.info("%s: accepted the %s subtitle (%s)", self.label, provider, _safe(detail))
         return replace(
@@ -412,7 +318,7 @@ class _Resolution:
         return norm, ""
 
     def _vet(
-        self, norm: NormalisedSubtitle, names: _Names, hash_exact: bool
+        self, norm: NormalisedSubtitle, names: CacheNames, hash_exact: bool
     ) -> tuple[NormalisedSubtitle | None, str]:
         """Language, alignment and the checks on its result: (accepted cues, detail) or
         (None, why not). An `OSError` and `ToolNotFound` propagate."""
@@ -422,7 +328,7 @@ class _Resolution:
             final, detail = norm, "matched by hash; not aligned"
         else:
             if not names.staged.exists():
-                write_text_atomic(names.staged, norm.srt)
+                self._cache_write(names.staged, norm.srt, fsync=True)
             names.aligned.unlink(missing_ok=True)
             aligned = self.ctx.align(
                 self.ctx.tools,
@@ -451,7 +357,9 @@ class _Resolution:
         problem = self._length_problem(final)
         return (None, problem) if problem else (final, detail)
 
-    def _adopt_final(self, provider: str, names: _Names, hash_exact: bool) -> SubtitleRecord | None:
+    def _adopt_final(
+        self, provider: str, names: CacheNames, hash_exact: bool
+    ) -> SubtitleRecord | None:
         """The record for a finished cache file of this candidate, if it is still our own
         normalised output and still fits the video; None otherwise (it will be overwritten)."""
         try:
@@ -473,17 +381,17 @@ class _Resolution:
     def _accept(
         self,
         provider: str,
-        names: _Names,
+        names: CacheNames,
         final: NormalisedSubtitle,
         hash_exact: bool,
         detail: str,
     ) -> SubtitleRecord:
-        write_text_atomic(names.final, final.srt)
+        self._cache_write(names.final, final.srt)
         return self._found(provider, names, final.srt.encode("utf-8"), hash_exact, detail)
 
     def _file_candidate(self, path: Path, provider: str) -> SubtitleRecord | None:
         self.ctx.reporter.stage(f"subtitle: checking {provider} file {_safe(path.name, 60)}")
-        names: _Names | None = None
+        names: CacheNames | None = None
         try:
             raw = read_bytes_capped(path, self.settings.subtitle_max_bytes)
             if raw is None:
@@ -508,14 +416,36 @@ class _Resolution:
             return None
         finally:
             if names is not None:
-                _discard(names.staged, names.aligned)
+                discard(names.staged, names.aligned)
 
     def _reject_file(self, provider: str, reason: str) -> None:
         _log.info("%s: rejected the %s file: %s", self.label, provider, _safe(reason))
         self._note(provider, reason)
 
-    def _call(self, call: Callable[[], _T]) -> _T:
-        """Run a client call, turning its errors into the resolver's stops."""
+    def _cache_write(self, path: Path, text: str, *, fsync: bool = False) -> None:
+        """Write a cache file; a failure stops the resolution (`CacheUnwritable`)."""
+        try:
+            write_text_atomic(path, text, fsync=fsync)
+        except OSError as exc:
+            raise self._unwritable(exc) from None
+
+    def _unwritable(self, exc: OSError) -> CacheUnwritable:
+        reason = f"the subtitle cache folder {_safe(self.cache_dir, 150)} cannot be written"
+        _log.warning("%s: %s (%s)", self.label, reason, type(exc).__name__)
+        return CacheUnwritable(
+            self._record(SubtitleStatus.WANTED, f"{reason} ({type(exc).__name__})"),
+            f"{reason} ({type(exc).__name__})",
+        )
+
+    def _spend(self, file_id: int) -> None:
+        """Remember that *file_id* was downloaded (and so possibly counted) and is not wanted
+        again for this file."""
+        self.tried = _bounded_ids([*self.tried, file_id])
+        self.attempts += 1
+
+    def _call(self, call: Callable[[], _T], spent: int | None = None) -> _T:
+        """Run a client call, turning its errors into the resolver's stops. *spent* is the id
+        of a download: if it fails after the server may have counted it, the id is blamed."""
         try:
             return call()
         except QuotaExhausted as exc:
@@ -525,6 +455,8 @@ class _Resolution:
             reason = f"OpenSubtitles refused the login: {_safe(exc, 150)}"
             raise OnlineFailure(self._record(SubtitleStatus.WANTED, reason), reason, True) from None
         except ProviderError as exc:
+            if spent is not None:
+                self._spend(spent)
             reason = f"OpenSubtitles failed: {_safe(exc, 150)}"
             raise OnlineFailure(
                 self._record(SubtitleStatus.WANTED, reason), reason, False
@@ -557,6 +489,8 @@ class _Resolution:
         if item.foreign_parts_only:
             return "foreign parts only"
         if not (from_hash and item.hash_match):
+            if self.target.is_episode:
+                return "an episode is only trusted on a hash match"
             as_found = TitleYear(item.title, item.year, False, ())
             if title_year_confidence(as_found, self.target) is None:
                 return "title or year does not match the file"
@@ -596,8 +530,17 @@ class _Resolution:
             raise QuotaStop(
                 self._record(SubtitleStatus.WANTED, "OpenSubtitles quota used up"), quota.reset_at
             )
+        if not self._probed:
+            try:
+                probe_writable(self.cache_dir)
+            except OSError as exc:
+                raise self._unwritable(exc) from None
+            self._probed = True
         self.downloads += 1
-        return self._call(lambda: client.download(item, max_bytes=self.settings.subtitle_max_bytes))
+        return self._call(
+            lambda: client.download(item, max_bytes=self.settings.subtitle_max_bytes),
+            spent=item.file_id,
+        )
 
     def _online_candidate(
         self, client: SubtitleClient, item: SubtitleResult, hash_exact: bool
@@ -633,12 +576,11 @@ class _Resolution:
             return None
         if downloaded:
             try:
-                write_text_atomic(names.staged, norm.srt)
+                write_text_atomic(names.staged, norm.srt, fsync=True)
             except OSError as exc:
                 # The download is spent and cannot be resumed, so it must not be spent again.
-                _log.warning("%s: could not keep the download: %s", self.label, _safe(exc))
-                self._reject_online(item.file_id, names, "could not keep the download")
-                return None
+                self._spend(item.file_id)
+                raise self._unwritable(exc) from None
         try:
             final, detail = self._vet(norm, names, hash_exact)
             if final is None:
@@ -646,15 +588,14 @@ class _Resolution:
                 return None
             record = self._accept("opensubtitles", names, final, hash_exact, detail)
         finally:
-            _discard(names.aligned)
-        _discard(names.staged)
+            discard(names.aligned)
+        discard(names.staged)
         return record
 
-    def _reject_online(self, file_id: int, names: _Names, reason: str) -> None:
-        self.tried = _bounded_ids([*self.tried, file_id])
-        self.attempts += 1
+    def _reject_online(self, file_id: int, names: CacheNames, reason: str) -> None:
+        self._spend(file_id)
         self._note("online", reason)
-        _discard(names.staged, names.aligned)
+        discard(names.staged, names.aligned)
         _log.info("%s: rejected OpenSubtitles file %d: %s", self.label, file_id, _safe(reason))
 
     def _unavailable_reason(self) -> str:
@@ -689,9 +630,9 @@ def resolve_subtitle(
     """
     if sub.status not in (SubtitleStatus.WANTED, SubtitleStatus.FOUND):
         return sub
-    cache_dir = _check_cache_dir(ctx.settings)
+    cache_dir = check_cache_dir(ctx.settings, rec.path)
     if sub.status is SubtitleStatus.FOUND:
-        if _cached_result_is_valid(sub, cache_dir, ctx.settings.subtitle_max_bytes):
+        if cached_result_is_valid(sub, cache_dir, ctx.settings.subtitle_max_bytes):
             return sub
         _log.warning(
             "%s: the cached subtitle is gone or changed; resolving again", _safe(rec.path.name)

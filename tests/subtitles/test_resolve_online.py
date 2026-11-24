@@ -33,7 +33,12 @@ from video_cleaner.state import SubtitleRecord, SubtitleStatus
 from video_cleaner.subtitles.align import AlignResult
 from video_cleaner.subtitles.models import QuotaInfo
 from video_cleaner.subtitles.opensubtitles import AuthError, ProviderError, QuotaExhausted
-from video_cleaner.subtitles.resolve import OnlineFailure, QuotaStop, ResolveStop
+from video_cleaner.subtitles.resolve import (
+    CacheUnwritable,
+    OnlineFailure,
+    QuotaStop,
+    ResolveStop,
+)
 from video_cleaner.subtitles.textfmt import normalise_subtitle
 from video_cleaner.tools import ToolNotFound
 
@@ -525,8 +530,9 @@ def test_a_provider_error_after_a_rejected_candidate_keeps_the_rejected_id(
     stop = caught.value
     assert stop.fatal is False
     assert stop.record.status is SubtitleStatus.WANTED
-    assert stop.record.tried_ids == (1,)
-    assert stop.record.attempts == 1
+    # The failed id may have been counted by the server, so it is not asked for again.
+    assert stop.record.tried_ids == (1, 2)
+    assert stop.record.attempts == 2
 
 
 def test_a_provider_error_at_search_is_not_fatal(tmp_path: Path) -> None:
@@ -626,40 +632,152 @@ def test_the_intermediates_are_removed_after_a_rejection(tmp_path: Path) -> None
     assert case.cache_files() == []
 
 
-def test_a_failure_to_keep_the_download_rejects_that_candidate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _failing_writes(
+    monkeypatch: pytest.MonkeyPatch, ends_with: str, seen: list[tuple[str, bool]] | None = None
 ) -> None:
-
-    def broken(path: Path, text: str, **kwargs: object) -> None:
-        if path.name.endswith(".dl.srt"):
+    def broken(path: Path, text: str, **kwargs: Any) -> None:
+        if seen is not None:
+            seen.append((path.name, bool(kwargs.get("fsync", False))))
+        if path.name.endswith(ends_with):
             raise OSError("disk full")
-        write_text_atomic(path, text)
+        write_text_atomic(path, text, **kwargs)
 
     monkeypatch.setattr("video_cleaner.subtitles.resolve.write_text_atomic", broken)
-    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes()})
+
+
+def test_a_failure_to_keep_the_download_stops_before_another_download_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _failing_writes(monkeypatch, ".dl.srt")
+    client = FakeClient(
+        title_results=[result(1), result(2), result(3)],
+        downloads={n: srt_bytes(tag=str(n)) for n in (1, 2, 3)},
+    )
     case = online(tmp_path, client, movie_hash=None)
-    out = case.resolve()
-    assert out.status is SubtitleStatus.UNAVAILABLE
-    assert out.tried_ids == (1,)  # nothing to resume from, so it must not be spent again
+    with pytest.raises(CacheUnwritable) as caught:
+        case.resolve()
+    assert isinstance(caught.value, ResolveStop)
+    assert client.download_calls == [1]
+    # It was downloaded and cannot be resumed from, so it is not spent again; 2 and 3 were
+    # never asked for and are not blamed.
+    assert caught.value.record.tried_ids == (1,)
+    assert caught.value.record.status is SubtitleStatus.WANTED
     assert case.aligner.calls == []
+
+
+def test_the_kept_download_is_flushed_to_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str, bool]] = []
+    _failing_writes(monkeypatch, "never-matches", seen)
+    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes()})
+    online(tmp_path, client, movie_hash=None).resolve()
+    assert [fsync for name, fsync in seen if name.endswith(".dl.srt")] == [True]
 
 
 def test_a_failure_to_write_the_result_keeps_the_download_for_the_next_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _failing_writes(monkeypatch, "-opensubtitles-1.srt")
+    client = FakeClient(
+        title_results=[result(1), result(2)], downloads={1: srt_bytes(), 2: srt_bytes(tag="b")}
+    )
+    case = online(tmp_path, client, movie_hash=None)
+    with pytest.raises(CacheUnwritable) as caught:
+        case.resolve()
+    assert client.download_calls == [1]
+    assert caught.value.record.tried_ids == ()
+    assert case.cache_files() == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
 
-    def broken(path: Path, text: str, **kwargs: object) -> None:
-        if path.name.endswith("-opensubtitles-1.srt"):
-            raise OSError("disk full")
-        write_text_atomic(path, text)
 
-    monkeypatch.setattr("video_cleaner.subtitles.resolve.write_text_atomic", broken)
+def test_an_unwritable_cache_folder_is_found_before_any_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(folder: Path) -> None:
+        raise OSError("read-only")
+
+    monkeypatch.setattr("video_cleaner.subtitles.resolve.probe_writable", broken)
     client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes()})
     case = online(tmp_path, client, movie_hash=None)
-    out = case.resolve()
+    with pytest.raises(CacheUnwritable) as caught:
+        case.resolve()
+    assert client.download_calls == []
+    assert caught.value.record.status is SubtitleStatus.WANTED
+    assert caught.value.record.tried_ids == ()
+
+
+def test_a_cache_path_that_is_a_file_is_unwritable_before_any_download(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes()})
+    case = online(tmp_path, client, movie_hash=None)
+    case.cache_dir.write_text("in the way")
+    with pytest.raises(CacheUnwritable):
+        case.resolve()
+    assert client.download_calls == []
+
+
+def test_the_cache_folder_is_probed_once_per_call_and_only_when_a_download_is_due(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes: list[Path] = []
+    monkeypatch.setattr("video_cleaner.subtitles.resolve.probe_writable", probes.append)
+    client = FakeClient(
+        title_results=[result(1), result(2)],
+        downloads={1: srt_bytes(tag="a"), 2: srt_bytes(tag="b")},
+    )
+    online(tmp_path / "a", client, failing(), failing(), movie_hash=None).resolve()
+    assert len(probes) == 1
+    probes.clear()
+    online(tmp_path / "b", FakeClient(), movie_hash=None).resolve()
+    assert probes == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "OpenSubtitles download: the downloaded file is empty",
+        "download: the reply names a link outside opensubtitles.com",
+        "OpenSubtitles download failed: HTTP 503; not retried, the server may have counted it",
+    ],
+    ids=["empty", "foreign-link", "transient"],
+)
+def test_a_provider_error_at_download_is_never_asked_for_again(
+    tmp_path: Path, message: str
+) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: ProviderError(message)})
+    case = online(tmp_path, client, movie_hash=None)
+    with pytest.raises(OnlineFailure) as caught:
+        case.resolve()
+    stop = caught.value
+    assert stop.fatal is False
+    assert stop.record.tried_ids == (1,)
+    assert stop.record.attempts == 1
+    assert stop.record.status is SubtitleStatus.WANTED
+    again = case.resolve(stop.record)
+    assert client.download_calls == [1]
+    assert again.status is SubtitleStatus.UNAVAILABLE
+    assert again.tried_ids == (1,)
+
+
+def test_a_refused_login_or_a_spent_allowance_does_not_blame_the_id(tmp_path: Path) -> None:
+    auth = FakeClient(title_results=[result(1)], downloads={1: AuthError("refused")})
+    with pytest.raises(OnlineFailure) as refused:
+        online(tmp_path / "a", auth, movie_hash=None).resolve()
+    assert refused.value.record.tried_ids == ()
+    quota = FakeClient(title_results=[result(1)], downloads={1: QuotaExhausted("used up", None)})
+    with pytest.raises(QuotaStop) as spent:
+        online(tmp_path / "b", quota, movie_hash=None).resolve()
+    assert spent.value.record.tried_ids == ()
+
+
+def test_an_episode_accepts_only_a_hash_match(tmp_path: Path) -> None:
+    show = result(1, title="Some Show", year=None)
+    client = FakeClient(hash_results=[show], downloads={1: srt_bytes()})
+    out = online(tmp_path, client, name="Some Show S01E02.mkv").resolve()
+    assert client.download_calls == []
     assert out.status is SubtitleStatus.UNAVAILABLE
-    assert out.tried_ids == ()
-    assert case.cache_files() == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
+    exact = FakeClient(hash_results=[replace(show, hash_match=True)], downloads={1: srt_bytes()})
+    found = online(tmp_path / "b", exact, name="Some Show S01E02.mkv").resolve()
+    assert found.status is SubtitleStatus.FOUND
 
 
 def test_a_stored_record_is_unchanged_in_its_key_fields(tmp_path: Path) -> None:
