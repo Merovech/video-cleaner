@@ -18,6 +18,7 @@ the whole text or a whole multi-line cue body, which is safe for the same reason
 
 from __future__ import annotations
 
+import html
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -80,10 +81,19 @@ _MARKUP_TAG_RE = re.compile(r"</?[A-Za-z][^<>\n]{0,200}>|<\d{1,2}:\d{2}(?::\d{2}
 # parser itself accepts, a timestamp followed by an arrow anywhere in the line (digit runs are
 # bounded, so scanning a long line stays linear).
 _TIMING_LIKE_RE = re.compile(r"\d{1,6}(?::\d{1,6}){1,2}[,.]\d{1,6}\s*-+>")
-# Removing markup can leave new markup behind (`<<i>b>`), so it is removed again, up to this many
-# times; text that is still changing after that loses its angle and curly brackets instead.
-_MAX_MARKUP_PASSES = 4
-_BRACKETS = str.maketrans("", "", "<>{}")
+# An HTML character reference, closed by ";": a name (the longest HTML5 name has 32 characters) or
+# a number of at most eight digits (the highest code point has seven). The bounds keep the
+# decoder away from `int()` on a run of thousands of digits, which Python refuses; a longer
+# reference is not decoded. Names are looked up by `html.unescape`, which also maps an invalid
+# number (0, a surrogate, past U+10FFFF) to U+FFFD and drops a control character.
+_ENTITY_RE = re.compile(r"&(?:#[0-9]{1,8}|#[xX][0-9a-fA-F]{1,8}|[A-Za-z][A-Za-z0-9]{1,31});")
+_NBSP = "\u00a0"
+# Decoding, removing markup and dropping lines each can expose something the next pass has to
+# deal with (`&amp;lt;` is `&lt;` after one pass, `<` after two; `<<i>b>` is `<b>`), so cleaning
+# repeats until the text no longer changes, up to this many passes. Text that is still changing
+# after that (a crafted nesting) loses its ampersands and angle and curly brackets instead.
+_MAX_CLEAN_PASSES = 8
+_UNSTABLE_CHARS = str.maketrans("", "", "&<>{}")
 
 _UTF8_BOM = b"\xef\xbb\xbf"
 _UTF16_LE_BOM = b"\xff\xfe"
@@ -359,8 +369,10 @@ def _parse_ass(lines: Sequence[str]) -> list[_RawCue]:
 def _clean_text(text: str, *, ass: bool) -> str | None:
     """Plain text of one cue, or None when nothing is left (or it is an ASS vector drawing).
 
-    The result is a fixed point: cleaning it again (as SRT, which is how it is written) changes
-    nothing, and none of its lines reads as a cue timing line.
+    HTML character references are decoded first, so that "&lt;i&gt;" is a tag that is then
+    removed like any other and a decoded timing line is dropped like any other. The result is a
+    fixed point: cleaning it again (as SRT, which is how it is written) changes nothing, and none
+    of its lines reads as a cue timing line.
     """
     if ass:
         if _ASS_DRAWING_RE.search(text):
@@ -368,16 +380,24 @@ def _clean_text(text: str, *, ass: bool) -> str | None:
         text = _ASS_OVERRIDE_RE.sub("", text)
         text = _ASS_BREAK_RE.sub(lambda m: "\n" if m.group(0) == "\\N" else " ", text)
         text = _ASS_HARD_SPACE_RE.sub(" ", text)
-    text = _CONTROL_RE.sub("", text)
-    cleaned = "\n".join(_text_lines(_strip_markup(text)))
-    return cleaned or None
+    for _ in range(_MAX_CLEAN_PASSES):
+        cleaned = _clean_pass(text)
+        if cleaned == text:
+            return cleaned or None
+        text = cleaned
+    return _clean_pass(text.translate(_UNSTABLE_CHARS)) or None
 
 
-def _strip_markup(text: str) -> str:
-    """Remove override blocks and HTML/WebVTT tags until none are left."""
-    for _ in range(_MAX_MARKUP_PASSES):
-        stripped = _MARKUP_TAG_RE.sub("", _OVERRIDE_BLOCK_RE.sub("", text))
-        if stripped == text:
-            return text
-        text = stripped
-    return text.translate(_BRACKETS)
+def _decode_entities(text: str) -> str:
+    """Decode the HTML character references in *text*; a no-break space becomes a space."""
+    if "&" not in text:
+        return text
+    decoded = _ENTITY_RE.sub(lambda match: html.unescape(match.group()), text)
+    return decoded.replace(_NBSP, " ")
+
+
+def _clean_pass(text: str) -> str:
+    """One round of decoding, markup removal and line clean-up."""
+    text = _CONTROL_RE.sub("", _decode_entities(text))
+    text = _MARKUP_TAG_RE.sub("", _OVERRIDE_BLOCK_RE.sub("", text))
+    return "\n".join(_text_lines(text))

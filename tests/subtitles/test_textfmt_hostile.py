@@ -151,6 +151,18 @@ HOSTILE_TEXTS = [
     "<" * 6 + "i>" * 6 + "x",
     "{\\" * 6 + "a}" * 6 + "x",
     "I <3 you, 2 < 3 and {name}",
+    "&lt;i&gt;00:59:00,000 --&gt; 00:59:05,000",
+    "&amp;lt;i&amp;gt;00:59:00,000 --&amp;gt; 00:59:05,000",
+    "before\n&lt;b&gt;00:00:09,000 --&gt; 00:00:10,000&lt;/b&gt;\nafter",
+    "7\n&lt;i&gt;00:00:09,000 --&gt; 00:00:10,000&lt;/i&gt;\n8",
+    "&lt;&lt;i&gt;b&gt;",
+    "&amp;lt;&amp;lt;i&amp;gt;b&amp;gt;",
+    "&lbrace;\\an8&rbrace;x &amp;lbrace;\\an8&amp;rbrace;y",
+    "&lt;i&gt;x&lt;/i&gt;",
+    "&amp;amp;amp;lt;",
+    "&#0; &#x110000; &#xD800; &#60;i&#62;x",
+    "&#10;00:59:00,000 --&#62; 00:59:05,000",
+    "&#x3C;&#x3C;i&#x3E;b&#x3E;",
 ]
 
 

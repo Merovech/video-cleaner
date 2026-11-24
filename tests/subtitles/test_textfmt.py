@@ -15,6 +15,7 @@ from video_cleaner.subtitles.textfmt import (
 )
 
 BIG = 1_000_000
+NBSP = chr(0xA0)
 SRT_HEAD = b"1\n00:00:01,000 --> 00:00:02,000\n"
 
 SRT = (
@@ -126,7 +127,101 @@ def test_html_tags_are_stripped_from_srt_text() -> None:
     )
     result = normalise_subtitle(raw, max_bytes=BIG, min_cues=2)
     assert result.cues[0].text == "Hello world"
-    assert result.cues[1].text == "Bold &amp; plain"
+    assert result.cues[1].text == "Bold & plain"
+
+
+def _only_cue_text(text: str, *, min_cues: int = 1) -> str:
+    raw = srt_with(("00:00:01,000", "00:00:02,000", text), ("00:00:03,000", "00:00:04,000", "end"))
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=min_cues)
+    return result.cues[0].text
+
+
+@pytest.mark.parametrize(
+    ("encoded", "plain"),
+    [
+        ("Tom &amp; Jerry", "Tom & Jerry"),
+        ("a &lt; b &gt; c", "a < b > c"),
+        ("&quot;Hi&quot;", '"Hi"'),
+        ("it&#39;s", "it's"),
+        ("it&apos;s", "it's"),
+        ("a&nbsp;b", "a b"),
+        ("caf&#233; caf&#xE9; caf&eacute;", "café café café"),
+        ("&lt;i&gt;x&lt;/i&gt;", "x"),
+        ("&amp;lt;i&amp;gt;x", "x"),
+        ("5 &amp; 6 &ampersand 7", "5 & 6 &ampersand 7"),  # only ";"-closed references decode
+        ("AT&T and R&D", "AT&T and R&D"),
+    ],
+)
+def test_html_entities_in_cue_text_are_decoded(encoded: str, plain: str) -> None:
+    assert _only_cue_text(encoded) == plain
+
+
+def test_a_non_breaking_space_becomes_a_normal_space() -> None:
+    text = _only_cue_text("a&nbsp;b \u00a0c&nbsp;")
+
+    assert NBSP not in text
+    assert text == "a b  c"
+
+
+def test_entities_are_decoded_in_ass_text_after_its_overrides_are_removed() -> None:
+    raw = ASS.replace(b"First", b"Tom &amp; {\\i1}Jerry")
+    result = normalise_subtitle(raw, max_bytes=BIG, min_cues=2)
+
+    assert result.cues[0].text == "Tom & Jerry"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "&amp;lt;",
+        "&amp;amp;amp;",
+        "&#0;",
+        "&#x110000;",
+        "&#xD800;",
+        "&#1; &#x7f; &#x9f;",
+        "&#" + "9" * 5000 + ";",
+        "&#x" + "f" * 5000 + ";",
+        "&" * 5000,
+        "&amp;" * 3000,
+        "&" + "a" * 5000 + ";",
+    ],
+)
+def test_odd_entities_never_raise_and_read_back_unchanged(text: str) -> None:
+    raw = srt_with(
+        ("00:00:01,000", "00:00:02,000", "x" + text), ("00:00:03,000", "00:00:04,000", "y")
+    )
+
+    first = normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+    again = normalise_subtitle(first.srt.encode(), max_bytes=BIG, min_cues=1)
+
+    assert again.cues == first.cues
+    assert NBSP not in first.srt
+
+
+def test_a_double_encoded_ampersand_decodes_to_a_fixed_point() -> None:
+    assert _only_cue_text("&amp;lt;") == "<"
+    assert _only_cue_text("&amp;amp;amp;") == "&"
+
+
+def test_entities_nested_deeper_than_the_rounds_lose_their_ampersands() -> None:
+    text = _only_cue_text("&" + "amp;" * 40 + "x")
+
+    assert "&" not in text
+    assert text.endswith("x")
+
+
+def test_a_decoded_timing_line_cannot_make_a_phantom_cue_on_re_read() -> None:
+    raw = srt_with(
+        ("00:00:01,000", "00:00:02,000", "first"),
+        ("00:00:03,000", "00:00:04,000", "&lt;i&gt;00:59:00,000 --&gt; 00:59:05,000"),
+        ("00:00:05,000", "00:00:06,000", "last"),
+    )
+
+    first = normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+    again = normalise_subtitle(first.srt.encode(), max_bytes=BIG, min_cues=1)
+
+    assert [c.text for c in first.cues] == ["first", "last"]
+    assert again.cues == first.cues
 
 
 def test_a_lone_angle_bracket_is_not_a_tag() -> None:
