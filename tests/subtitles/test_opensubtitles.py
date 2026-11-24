@@ -23,6 +23,7 @@ from video_cleaner.subtitles.models import QuotaInfo
 from video_cleaner.subtitles.opensubtitles import (
     MAX_JSON_BYTES,
     MAX_RETRIES,
+    ApiEndpoint,
     AuthError,
     ConnectTimeout,
     HttpResponse,
@@ -170,6 +171,7 @@ class Harness:
         *script: HttpResponse | Exception,
         token: str | None = None,
         now: Callable[[], datetime] | None = None,
+        endpoint: ApiEndpoint | None = None,
     ) -> None:
         self.transport = FakeTransport(*script)
         self.store = MemoryStore(**({TOKEN: token} if token else {}))
@@ -180,6 +182,7 @@ class Harness:
             self.store,
             self.transport,
             self.reporter,
+            endpoint=endpoint,
             sleep=self.sleeps.append,
             now=now or (lambda: NOW),
         )
@@ -1371,3 +1374,110 @@ def test_a_provider_error_at_login_is_not_remembered() -> None:
     with pytest.raises(ProviderError):
         h.client.search(moviehash=HASH, title=None, year=None)
     assert [r.file_id for r in h.client.search(moviehash=HASH, title=None, year=None)] == [7]
+
+
+# --- a configurable endpoint ------------------------------------------------------------------
+
+MOVED = ApiEndpoint(
+    domain="opensubtitles.example",
+    host="api.opensubtitles.example",
+    path="/api/v2",
+    language="fr",
+)
+
+
+def test_the_default_endpoint_is_the_current_service() -> None:
+    default = ApiEndpoint()
+    assert (default.domain, default.host, default.path, default.language) == (
+        "opensubtitles.com",
+        "api.opensubtitles.com",
+        "/api/v1",
+        "en",
+    )
+    assert default.base == "https://api.opensubtitles.com/api/v1"
+
+
+def test_an_endpoint_comes_from_the_settings() -> None:
+    from video_cleaner.config import Settings
+
+    settings = Settings(
+        library_root=Path("L"),
+        scratch_dir=Path("S"),
+        completed_dir=Path("C"),
+        state_db=Path("d.db"),
+        log_dir=Path("logs"),
+        opensubtitles_domain="opensubtitles.example",
+        opensubtitles_api_host="api.opensubtitles.example",
+        opensubtitles_api_path="/api/v2",
+        subtitle_language="fr",
+    )
+    assert ApiEndpoint.from_settings(settings) == MOVED
+
+
+def test_a_moved_service_gets_the_login_and_the_search_at_the_new_address() -> None:
+    login = dict(fixture_json("login_ok.json"), base_url="api.opensubtitles.example")
+    h = Harness(reply(200, login), search_ok([]), endpoint=MOVED)
+    h.client.search(moviehash=HASH, title=None, year=None)
+    first, second = h.transport.requests
+    assert (first.host, first.path) == ("api.opensubtitles.example", "/api/v2/login")
+    assert (second.host, second.path) == ("api.opensubtitles.example", "/api/v2/subtitles")
+    assert second.query["languages"] == ["fr"]
+
+
+def test_a_moved_service_without_base_url_in_the_login_uses_the_configured_host() -> None:
+    body = {k: v for k, v in fixture_json("login_ok.json").items() if k != "base_url"}
+    h = Harness(reply(200, body), search_ok([]), endpoint=MOVED)
+    h.client.search(moviehash=HASH, title=None, year=None)
+    assert h.transport.requests[1].host == "api.opensubtitles.example"
+
+
+def test_the_language_setting_picks_the_results_and_ignores_case() -> None:
+    portuguese = ApiEndpoint(language="pt-br")
+    data = [item(1, language="pt-BR"), item(2, language="en"), item(3, language="pt-br")]
+    h = Harness(fx("login_ok.json"), search_ok(data), endpoint=portuguese)
+    found = h.client.search(moviehash=HASH, title=None, year=None)
+    assert sorted(r.file_id for r in found) == [1, 3]
+    assert h.transport.requests[1].query["languages"] == ["pt-br"]
+
+
+@pytest.mark.parametrize("base_url", ["api.opensubtitles.com", "https://vip-api.opensubtitles.com"])
+def test_a_moved_service_refuses_a_login_that_names_the_old_domain(base_url: str) -> None:
+    body = dict(fixture_json("login_ok.json"), base_url=base_url)
+    h = Harness(reply(200, body), endpoint=MOVED)
+    with pytest.raises(AuthError):
+        h.client.search(moviehash=HASH, title=None, year=None)
+    assert len(h.transport.requests) == 1
+
+
+def test_a_moved_service_uses_its_own_subdomains_and_path_from_the_login() -> None:
+    body = dict(fixture_json("login_ok.json"), base_url="vip-api.opensubtitles.example")
+    h = Harness(reply(200, body), search_ok([]), endpoint=MOVED)
+    h.client.search(moviehash=HASH, title=None, year=None)
+    assert h.transport.requests[1].host == "vip-api.opensubtitles.example"
+    assert h.transport.requests[1].path == "/api/v2/subtitles"
+
+
+def test_a_moved_service_accepts_a_download_link_on_its_domain_only() -> None:
+    good = dict(fixture_json("download_ok.json"), link="https://dl.opensubtitles.example/x.srt")
+    login = dict(fixture_json("login_ok.json"), base_url="api.opensubtitles.example")
+    h = Harness(reply(200, login), reply(200, good), reply(200, b"1\n"), endpoint=MOVED)
+    assert h.client.download(result(7), max_bytes=1000) == b"1\n"
+    assert h.transport.requests[2].host == "dl.opensubtitles.example"
+    old = dict(fixture_json("download_ok.json"))  # a link on the old domain
+    h = Harness(reply(200, login), reply(200, old), endpoint=MOVED)
+    with pytest.raises(ProviderError):
+        h.client.download(result(7), max_bytes=1000)
+
+
+def test_the_host_rule_follows_the_domain_it_is_given() -> None:
+    assert is_opensubtitles_host("api.opensubtitles.example", "opensubtitles.example")
+    assert is_opensubtitles_host("OPENSUBTITLES.EXAMPLE", "opensubtitles.example")
+    assert not is_opensubtitles_host("api.opensubtitles.com", "opensubtitles.example")
+    assert not is_opensubtitles_host("evilopensubtitles.example", "opensubtitles.example")
+    assert not is_opensubtitles_host("opensubtitles.example.evil.net", "opensubtitles.example")
+    assert not is_opensubtitles_host("api.opensubtitles.example", "opensubtitles.com")
+    assert https_host("https://dl.opensubtitles.example/x", "opensubtitles.example") == (
+        "dl.opensubtitles.example"
+    )
+    assert https_host("https://dl.opensubtitles.com/x", "opensubtitles.example") is None
+    assert https_host("https://dl.opensubtitles.example/x") is None  # the default domain

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import MISSING, dataclass, fields
@@ -36,6 +37,12 @@ X265_PRESETS = frozenset(
 
 
 LOG_FILE_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+# Where the subtitle service lives. The service has changed domain before, so these are
+# settings; the defaults are today's values.
+DEFAULT_OPENSUBTITLES_DOMAIN = "opensubtitles.com"
+DEFAULT_OPENSUBTITLES_API_HOST = "api.opensubtitles.com"
+DEFAULT_OPENSUBTITLES_API_PATH = "/api/v1"
+DEFAULT_SUBTITLE_LANGUAGE = "en"
 MAX_HEARTBEAT_S = 15.0  # plan 4.4: never silent longer than 15 s
 
 
@@ -74,6 +81,10 @@ class Settings:
     subtitle_max_bytes: int = 2_000_000
     subtitle_min_cues: int = 20
     subtitle_candidates_per_file: int = 3
+    opensubtitles_domain: str = DEFAULT_OPENSUBTITLES_DOMAIN
+    opensubtitles_api_host: str = DEFAULT_OPENSUBTITLES_API_HOST
+    opensubtitles_api_path: str = DEFAULT_OPENSUBTITLES_API_PATH
+    subtitle_language: str = DEFAULT_SUBTITLE_LANGUAGE
 
 
 def _to_int(name: str, value: object) -> int:
@@ -180,6 +191,55 @@ def _require(cond: bool, message: str) -> None:
         raise ConfigError(message)
 
 
+_DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+# At least two labels, so a bare top-level name (which would trust every site under it) is out.
+_DOMAIN = re.compile(rf"(?:{_DNS_LABEL}\.)+{_DNS_LABEL}")
+_API_PATH = re.compile(r"/[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+)*")
+_LANGUAGE = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,4})?")
+
+
+def _is_domain(value: str) -> bool:
+    """A lower-case ASCII DNS name of two or more labels that is not an IP address."""
+    return (
+        len(value) <= 253
+        and _DOMAIN.fullmatch(value) is not None
+        and not value.rsplit(".", 1)[1].isdigit()  # "127.0.0.1" and "10.0.0.1.1" are numbers
+    )
+
+
+def _normalise_endpoint(values: dict[str, Any]) -> None:
+    """Trim and lower-case the host names and language; drop a trailing "/" from the path."""
+    for name in ("opensubtitles_domain", "opensubtitles_api_host", "subtitle_language"):
+        values[name] = str(values[name]).strip().lower()
+    path = str(values["opensubtitles_api_path"]).strip()
+    values["opensubtitles_api_path"] = path[:-1] if len(path) > 1 and path.endswith("/") else path
+
+
+def _validate_endpoint(values: Mapping[str, Any]) -> None:
+    domain, host = values["opensubtitles_domain"], values["opensubtitles_api_host"]
+    _require(
+        _is_domain(domain),
+        f"opensubtitles_domain {domain!r} must be a DNS name such as 'opensubtitles.com': "
+        "letters, digits, hyphens and dots, at least two labels, no scheme, port or path",
+    )
+    _require(
+        _is_domain(host) and (host == domain or host.endswith("." + domain)),
+        f"opensubtitles_api_host {host!r} must be {domain!r} or a host under it "
+        "(requests carrying your credentials only go to that domain)",
+    )
+    _require(
+        _API_PATH.fullmatch(values["opensubtitles_api_path"]) is not None
+        and ".." not in values["opensubtitles_api_path"].split("/"),
+        f"opensubtitles_api_path {values['opensubtitles_api_path']!r} must start with '/' and "
+        "hold only letters, digits, '.', '_', '~', '-' and '/' (no '..', query or fragment)",
+    )
+    _require(
+        _LANGUAGE.fullmatch(values["subtitle_language"]) is not None,
+        f"subtitle_language {values['subtitle_language']!r} must be one language code such as "
+        "'en' or 'pt-br'",
+    )
+
+
 def _validate(values: Mapping[str, Any]) -> None:
     _require(0 <= values["crf_min"] <= 51, "crf_min must be within 0..51")
     _require(0 <= values["crf_max"] <= 51, "crf_max must be within 0..51")
@@ -219,6 +279,7 @@ def _validate(values: Mapping[str, Any]) -> None:
         values["subtitle_candidates_per_file"] >= 1,
         "subtitle_candidates_per_file must be at least 1",
     )
+    _validate_endpoint(values)
     _require(
         values["preset"] in X265_PRESETS,
         f"preset {values['preset']!r} is not an x265 preset ({', '.join(sorted(X265_PRESETS))})",
@@ -325,5 +386,6 @@ def load_settings(
             )
 
     values["log_file_level"] = str(values["log_file_level"]).strip().upper()
+    _normalise_endpoint(values)
     _validate(values)
     return Settings(**values)

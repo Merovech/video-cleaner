@@ -443,3 +443,23 @@ def test_a_redirect_loop_is_a_final_refusal() -> None:
     t, _ = transport(lambda req: (302, {"Location": URL}, b""))
     with pytest.raises(RedirectRefused):
         get(t, URL)
+
+
+def test_a_transport_for_a_moved_domain_follows_that_domain_only() -> None:
+    t, handler = transport(lambda req: (200, {}, b"{}"), domain="opensubtitles.example")
+    assert get(t, "https://api.opensubtitles.example/api/v2/subtitles").status == 200
+    with pytest.raises(TransportError):
+        get(t, URL)  # the old domain
+    assert len(handler.seen) == 1
+
+
+def test_a_redirect_is_held_to_the_transports_domain() -> None:
+    def responder(req: urllib.request.Request) -> Answer:
+        if req.full_url.startswith("https://api.opensubtitles.example"):
+            return 302, {"Location": "https://dl.opensubtitles.com/x"}, b""
+        return 200, {}, b"{}"
+
+    t, handler = transport(responder, domain="opensubtitles.example")
+    with pytest.raises(RedirectRefused):
+        get(t, "https://api.opensubtitles.example/x")
+    assert len(handler.seen) == 1

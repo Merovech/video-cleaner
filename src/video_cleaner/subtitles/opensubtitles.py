@@ -1,7 +1,8 @@
 """A client for the OpenSubtitles REST API (v1): log in, search by hash or title, download.
 
 The server is not trusted. Every URL the client is about to contact (the host the login names,
-the link a download names) must be HTTPS on ``opensubtitles.com`` or one of its subdomains;
+the link a download names) must be HTTPS on the service's domain (``opensubtitles.com`` unless
+the ``opensubtitles_domain`` setting says otherwise) or one of its subdomains;
 redirects are held to the same rule; every response is read with a size cap and its JSON is
 checked before use, so an odd or hostile reply raises `ProviderError` (`AuthError` when a login
 reply names an API host outside opensubtitles.com, `QuotaExhausted` when the limit is reached)
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import email.utils
+import functools
 import http.client
 import io
 import json
@@ -33,6 +35,13 @@ from http.client import HTTPMessage
 from typing import IO, Any, Literal, Protocol
 
 from video_cleaner import __version__
+from video_cleaner.config import (
+    DEFAULT_OPENSUBTITLES_API_HOST,
+    DEFAULT_OPENSUBTITLES_API_PATH,
+    DEFAULT_OPENSUBTITLES_DOMAIN,
+    DEFAULT_SUBTITLE_LANGUAGE,
+    Settings,
+)
 from video_cleaner.credentials import TOKEN, CredentialError, CredentialStore
 from video_cleaner.credentials import OpenSubtitlesCredentials as OpenSubtitlesCredentials
 from video_cleaner.logging_setup import register_secrets
@@ -42,10 +51,35 @@ from video_cleaner.tools import heartbeat
 
 _log = logging.getLogger("video_cleaner.subtitles.opensubtitles")
 
-DOMAIN = "opensubtitles.com"
-DEFAULT_HOST = "api." + DOMAIN
-API_PATH = "/api/v1"
-LANGUAGE = "en"
+
+@dataclass(frozen=True)
+class ApiEndpoint:
+    """Where the service is and which language is wanted; the defaults are today's values.
+
+    *domain* is the trust boundary: every URL the client contacts, a login's ``base_url``, a
+    download link and each redirect must be HTTPS on *domain* or a subdomain of it. *host* is
+    the API host used before a login names one, and must lie on *domain* (`load_settings`
+    checks it). *language* is compared with the results' language in lower case.
+    """
+
+    domain: str = DEFAULT_OPENSUBTITLES_DOMAIN
+    host: str = DEFAULT_OPENSUBTITLES_API_HOST
+    path: str = DEFAULT_OPENSUBTITLES_API_PATH
+    language: str = DEFAULT_SUBTITLE_LANGUAGE
+
+    @property
+    def base(self) -> str:
+        return f"https://{self.host}{self.path}"
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> ApiEndpoint:
+        return cls(
+            domain=settings.opensubtitles_domain,
+            host=settings.opensubtitles_api_host,
+            path=settings.opensubtitles_api_path,
+            language=settings.subtitle_language,
+        )
+
 
 REQUEST_TIMEOUT_S = 30.0
 MAX_TOTAL_S = 120.0  # one request, however slowly the server drips its reply
@@ -63,7 +97,6 @@ MAX_COUNT = 10**12
 MAX_FILE_ID = 2**53
 _READ_CHUNK = 64 * 1024
 
-_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*opensubtitles\.com")
 _TOKEN = re.compile(rf"[A-Za-z0-9._~+/=-]{{1,{MAX_TOKEN_CHARS}}}")
 _MOVIEHASH = re.compile(r"[0-9a-f]{16}")
 _RETRY_AFTER_SECONDS = re.compile(r"\d{1,6}(?:\.\d{1,3})?")
@@ -134,22 +167,29 @@ class Transport(Protocol):
 # --- the host rule ---------------------------------------------------------------------------
 
 
-def is_opensubtitles_host(host: str | None) -> bool:
-    """True for ``opensubtitles.com`` and its subdomains, with a dot boundary.
+@functools.lru_cache(maxsize=8)
+def _host_pattern(domain: str) -> re.Pattern[str]:
+    return re.compile(rf"(?:[a-z0-9](?:[a-z0-9-]{{0,61}}[a-z0-9])?\.)*{re.escape(domain.lower())}")
+
+
+def is_opensubtitles_host(host: str | None, domain: str = DEFAULT_OPENSUBTITLES_DOMAIN) -> bool:
+    """True for *domain* (``opensubtitles.com`` unless told otherwise) and its subdomains,
+    with a dot boundary.
 
     ``evilopensubtitles.com``, ``opensubtitles.com.evil.net``, a trailing-dot name and anything
     that is not plain ASCII are refused.
     """
     if not host or len(host) > 253 or not host.isascii():
         return False
-    return _HOST.fullmatch(host.lower()) is not None
+    return _host_pattern(domain).fullmatch(host.lower()) is not None
 
 
-def https_host(url: object) -> str | None:
-    """The lower-case host of *url* when it is an acceptable HTTPS URL on opensubtitles.com.
+def https_host(url: object, domain: str = DEFAULT_OPENSUBTITLES_DOMAIN) -> str | None:
+    """The lower-case host of *url* when it is an acceptable HTTPS URL on *domain*.
 
     Acceptable: ``https``, no user information, no port other than 443, no whitespace, control
-    character or backslash anywhere, a host `is_opensubtitles_host` accepts. None otherwise.
+    character or backslash anywhere, a host `is_opensubtitles_host` accepts for *domain*. None
+    otherwise.
     """
     if not isinstance(url, str) or not url or len(url) > MAX_URL_CHARS:
         return None
@@ -163,7 +203,7 @@ def https_host(url: object) -> str | None:
     if parts.scheme != "https" or "@" in parts.netloc or port not in (None, 443):
         return None
     host = parts.hostname
-    if host is None or not is_opensubtitles_host(host):
+    if host is None or not is_opensubtitles_host(host, domain):
         return None
     return host.lower()
 
@@ -172,11 +212,15 @@ def https_host(url: object) -> str | None:
 
 
 class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
-    """Follows a redirect only to HTTPS on opensubtitles.com; anything else is refused.
+    """Follows a redirect only to HTTPS on the service's domain; anything else is refused.
 
     A redirect's body is never read: urllib would read it whole before following (no size cap,
     no time limit), so it is closed unread first and urllib is handed an empty one.
     """
+
+    def __init__(self, domain: str = DEFAULT_OPENSUBTITLES_DOMAIN) -> None:
+        super().__init__()
+        self._domain = domain
 
     def http_error_301(
         self, req: urllib.request.Request, fp: IO[bytes], code: int, msg: str, headers: HTTPMessage
@@ -217,15 +261,13 @@ class _GuardedRedirects(urllib.request.HTTPRedirectHandler):
         headers: object,
         newurl: str,
     ) -> urllib.request.Request | None:
-        if https_host(newurl) is None:
-            raise RedirectRefused(
-                "redirect to a URL that is not https on opensubtitles.com refused"
-            )
+        if https_host(newurl, self._domain) is None:
+            raise RedirectRefused(f"redirect to a URL that is not https on {self._domain} refused")
         return super().redirect_request(req, fp, code, msg, headers, newurl)  # type: ignore[arg-type]
 
 
 class UrllibTransport:
-    """`Transport` over ``urllib``: HTTPS to opensubtitles.com only, capped reads.
+    """`Transport` over ``urllib``: HTTPS to the service's *domain* only, capped reads.
 
     *https_handler* and *monotonic* exist for tests. A reply is read in pieces and stops with
     `ResponseTooLarge` the moment it passes the cap, or with `TransportTimeout` when the whole
@@ -236,12 +278,14 @@ class UrllibTransport:
     def __init__(
         self,
         *,
+        domain: str = DEFAULT_OPENSUBTITLES_DOMAIN,
         https_handler: urllib.request.HTTPSHandler | None = None,
         max_duration_s: float = MAX_TOTAL_S,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        self._domain = domain
         self._opener = urllib.request.build_opener(
-            _GuardedRedirects(), https_handler or urllib.request.HTTPSHandler()
+            _GuardedRedirects(domain), https_handler or urllib.request.HTTPSHandler()
         )
         self._max_duration_s = max_duration_s
         self._monotonic = monotonic
@@ -256,8 +300,8 @@ class UrllibTransport:
         timeout_s: float,
         max_bytes: int,
     ) -> HttpResponse:
-        if https_host(url) is None:
-            raise TransportError("refusing a URL that is not https on opensubtitles.com")
+        if https_host(url, self._domain) is None:
+            raise TransportError(f"refusing a URL that is not https on {self._domain}")
         deadline = self._monotonic() + self._max_duration_s
         try:
             return self._exchange(method, url, headers, body, timeout_s, max_bytes, deadline)
@@ -285,7 +329,7 @@ class UrllibTransport:
         max_bytes: int,
         deadline: float,
     ) -> HttpResponse:
-        # The URL was checked above (https, opensubtitles.com), and so is every redirect.
+        # The URL was checked above (https, the service's domain), and so is every redirect.
         req = urllib.request.Request(url, data=body, headers=dict(headers), method=method)  # noqa: S310
         try:
             with contextlib.closing(self._opener.open(req, timeout=timeout_s)) as response:  # nosec B310
@@ -383,19 +427,19 @@ def _flag(attributes: Mapping[str, object], name: str) -> bool:
     return attributes.get(name) is True
 
 
-def _parse_item(item: object) -> SubtitleResult | Literal[False] | None:
-    """A result, None when it is well formed but unusable (not English, no single file), or
-    False when it is malformed."""
+def _parse_item(item: object, language: str) -> SubtitleResult | Literal[False] | None:
+    """A result, None when it is well formed but unusable (not in *language*, no single file),
+    or False when it is malformed."""
     if not isinstance(item, dict):
         return False
     attributes = item.get("attributes")
     if not isinstance(attributes, dict):
         return False
-    language = attributes.get("language")
+    found_language = attributes.get("language")
     files = attributes.get("files")
-    if not isinstance(language, str) or not isinstance(files, list):
+    if not isinstance(found_language, str) or not isinstance(files, list):
         return False
-    if language.lower() != LANGUAGE:
+    if found_language.lower() != language.lower():
         return None
     if not files:
         return None
@@ -421,7 +465,7 @@ def _parse_item(item: object) -> SubtitleResult | Literal[False] | None:
     )
 
 
-def _parse_search(body: bytes) -> list[SubtitleResult]:
+def _parse_search(body: bytes, language: str) -> list[SubtitleResult]:
     payload = _json_object(body, "search")
     data = payload.get("data")
     if not isinstance(data, list):
@@ -430,7 +474,7 @@ def _parse_search(body: bytes) -> list[SubtitleResult]:
     found: list[SubtitleResult] = []
     malformed = 0
     for entry in items:
-        parsed = _parse_item(entry)
+        parsed = _parse_item(entry, language)
         if isinstance(parsed, SubtitleResult):
             found.append(parsed)
         elif parsed is False:
@@ -479,7 +523,8 @@ class OpenSubtitlesClient:
 
     The first call logs in (user name and password, over HTTPS) and caches the session token in
     *store* under `credentials.TOKEN`; a later run reuses it, and a 401 triggers one fresh login
-    and one retry. Only English subtitles are asked for and returned.
+    and one retry. Only subtitles in the endpoint's language (English unless configured) are
+    asked for and returned.
     """
 
     def __init__(
@@ -489,6 +534,7 @@ class OpenSubtitlesClient:
         transport: Transport,
         reporter: Reporter,
         *,
+        endpoint: ApiEndpoint | None = None,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -502,8 +548,9 @@ class OpenSubtitlesClient:
         self._reporter = reporter
         self._sleep = sleep
         self._now = now
+        self._endpoint = endpoint or ApiEndpoint()
         self._token: str | None = None
-        self._base = f"https://{DEFAULT_HOST}{API_PATH}"
+        self._base = self._endpoint.base
         self._quota: QuotaInfo | None = None
         self._auth_failure: AuthError | None = None
 
@@ -516,13 +563,14 @@ class OpenSubtitlesClient:
     def search(
         self, *, moviehash: str | None, title: str | None, year: int | None
     ) -> list[SubtitleResult]:
-        """English subtitles for a file hash and/or a title, best first (`rank_results`)."""
+        """Subtitles in the configured language for a file hash and/or a title, best first
+        (`rank_results`)."""
         title = (title or "").strip()[:200].lower() or None
         if moviehash is not None and not _MOVIEHASH.fullmatch(moviehash):
             raise ValueError("moviehash must be 16 lower-case hex digits")
         if moviehash is None and title is None:
             raise ValueError("a search needs a moviehash or a title")
-        params = {"languages": LANGUAGE}
+        params = {"languages": self._endpoint.language.lower()}
         if moviehash is not None:
             params["moviehash"] = moviehash
         if title is not None:
@@ -533,7 +581,7 @@ class OpenSubtitlesClient:
         resp = self._api("GET", "/subtitles", "OpenSubtitles search", query=query)
         if resp.status != 200:
             raise ProviderError(f"OpenSubtitles search failed: HTTP {resp.status}")
-        return rank_results(_parse_search(resp.body))
+        return rank_results(_parse_search(resp.body, self._endpoint.language))
 
     def download(self, result: SubtitleResult, *, max_bytes: int) -> bytes:
         """The subtitle file for *result*, at most *max_bytes* long.
@@ -560,8 +608,8 @@ class OpenSubtitlesClient:
         if remaining is not None and reset_at is not None:
             self._quota = QuotaInfo(remaining, reset_at)
         link = info.get("link")
-        if https_host(link) is None or not isinstance(link, str):
-            raise ProviderError("download: the reply names a link outside opensubtitles.com")
+        if https_host(link, self._endpoint.domain) is None or not isinstance(link, str):
+            raise ProviderError(f"download: the reply names a link outside {self._endpoint.domain}")
         # The link is fetched with nothing but the User-Agent: no key, no token.
         reply = self._send("GET", link, label, self._plain_headers(), None, max_bytes)
         if reply.status != 200:
@@ -674,7 +722,7 @@ class OpenSubtitlesClient:
         body = json.dumps({"username": self._creds.username, "password": self._creds.password})
         resp = self._send(
             "POST",
-            f"https://{DEFAULT_HOST}{API_PATH}/login",
+            f"{self._endpoint.base}/login",
             "OpenSubtitles login",
             headers,
             body.encode("utf-8"),
@@ -699,18 +747,18 @@ class OpenSubtitlesClient:
         except CredentialError:
             _log.warning("could not cache the OpenSubtitles session token; it lasts for this run")
 
-    @staticmethod
-    def _trusted_base(value: object) -> str:
-        """The API root the login names, only if it is on opensubtitles.com; else `AuthError`."""
+    def _trusted_base(self, value: object) -> str:
+        """The API root the login names, only if it is on the service's domain; else
+        `AuthError`."""
         if value is None:
-            return f"https://{DEFAULT_HOST}{API_PATH}"
+            return self._endpoint.base
         if not isinstance(value, str) or not value.strip():
             raise AuthError("login: the reply names an unusable API host")
         text = value.strip()
-        host = https_host(text if "://" in text else f"https://{text}")
+        host = https_host(text if "://" in text else f"https://{text}", self._endpoint.domain)
         if host is None:
-            raise AuthError("login: the reply names an API host outside opensubtitles.com")
-        return f"https://{host}{API_PATH}"
+            raise AuthError(f"login: the reply names an API host outside {self._endpoint.domain}")
+        return f"https://{host}{self._endpoint.path}"
 
     # -- one request, with retries --
 

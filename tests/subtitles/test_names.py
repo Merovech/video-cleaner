@@ -369,6 +369,7 @@ def test_a_disc_marker_or_an_edition_is_not_part_of_the_title() -> None:
         ("Kill Bill Vol. 2", "kill bill volume 2"),
         ("Kill Bill Volume Two", "kill bill volume 2"),
         ("Rocky IV", "rocky 4"),
+        ("Rocky IIII", "rocky 4"),  # the clock-face form of four
         ("Rocky 4", "rocky 4"),
         ("Rocky", "rocky"),
         ("Malcolm X", "malcolm 10"),
@@ -405,6 +406,9 @@ def test_titles_that_differ_in_a_part_number_are_never_similar(a: str, b: str) -
         ("Dune Pt 2", "Dune Part Two"),
         ("Kill Bill Vol. 2", "Kill Bill Volume Two"),
         ("Rocky II", "Rocky 2"),
+        ("Rocky IIII", "Rocky IV"),
+        ("Rocky IIII", "Rocky 4"),
+        ("Godfather Part IIII", "Godfather Part Four"),
         ("Godfather Part I", "Godfather Part 1"),
     ],
 )

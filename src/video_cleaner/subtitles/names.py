@@ -51,6 +51,7 @@ _NUMBER_WORDS = {
             ("ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"), start=2
         )
     },
+    "iiii": "4",  # the clock-face form of four, still used for historical titles
 }
 # guessit results that say nothing about where the title area ends.
 _STRUCTURAL_KEYS = frozenset({"title", "type"})

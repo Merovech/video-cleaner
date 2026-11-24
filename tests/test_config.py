@@ -421,3 +421,94 @@ def test_invalid_subtitle_values_raise(tmp_path: Path, var: str, value: str) -> 
 def test_a_bad_local_subtitle_dir_names_its_source(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"local_subtitle_dirs.*VC_LOCAL_SUBTITLE_DIRS"):
         load_settings(None, _env(tmp_path, VC_LOCAL_SUBTITLE_DIRS="relative"))
+
+
+# --- OpenSubtitles endpoint and language -------------------------------------------------------
+
+
+def test_endpoint_defaults_are_the_current_service(tmp_path: Path) -> None:
+    s = load_settings(None, _env(tmp_path))
+    assert s.opensubtitles_domain == "opensubtitles.com"
+    assert s.opensubtitles_api_host == "api.opensubtitles.com"
+    assert s.opensubtitles_api_path == "/api/v1"
+    assert s.subtitle_language == "en"
+
+
+def test_endpoint_from_toml_is_normalised(tmp_path: Path) -> None:
+    cfg = _write(
+        tmp_path / "c.toml",
+        _paths_toml()
+        + "opensubtitles_domain = ' OpenSubtitles.Example '\n"
+        + "opensubtitles_api_host = 'API.opensubtitles.example'\n"
+        + "opensubtitles_api_path = '/api/v2/'\n"
+        + "subtitle_language = 'PT-BR'\n",
+    )
+    s = load_settings(cfg, _env(tmp_path))
+    assert s.opensubtitles_domain == "opensubtitles.example"
+    assert s.opensubtitles_api_host == "api.opensubtitles.example"
+    assert s.opensubtitles_api_path == "/api/v2"
+    assert s.subtitle_language == "pt-br"
+
+
+def test_endpoint_from_env_beats_the_file(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "c.toml", _paths_toml() + "subtitle_language = 'fr'\n")
+    s = load_settings(cfg, _env(tmp_path, VC_SUBTITLE_LANGUAGE="de"))
+    assert s.subtitle_language == "de"
+
+
+def test_the_api_host_may_equal_the_domain(tmp_path: Path) -> None:
+    env = _env(
+        tmp_path, VC_OPENSUBTITLES_DOMAIN="subs.example", VC_OPENSUBTITLES_API_HOST="subs.example"
+    )
+    assert load_settings(None, env).opensubtitles_api_host == "subs.example"
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("VC_OPENSUBTITLES_DOMAIN", ""),
+        ("VC_OPENSUBTITLES_DOMAIN", "com"),  # one label: would trust a whole top-level domain
+        ("VC_OPENSUBTITLES_DOMAIN", "https://opensubtitles.com"),
+        ("VC_OPENSUBTITLES_DOMAIN", "opensubtitles.com/path"),
+        ("VC_OPENSUBTITLES_DOMAIN", "opensubtitles.com:443"),
+        ("VC_OPENSUBTITLES_DOMAIN", "user@opensubtitles.com"),
+        ("VC_OPENSUBTITLES_DOMAIN", ".opensubtitles.com"),
+        ("VC_OPENSUBTITLES_DOMAIN", "opensubtitles.com."),
+        ("VC_OPENSUBTITLES_DOMAIN", "open subtitles.com"),
+        ("VC_OPENSUBTITLES_DOMAIN", "-bad.com"),
+        ("VC_OPENSUBTITLES_DOMAIN", "127.0.0.1"),
+        ("VC_OPENSUBTITLES_DOMAIN", "10.0.0.1.1"),
+        ("VC_OPENSUBTITLES_DOMAIN", "opensubtitlés.com"),
+        ("VC_OPENSUBTITLES_DOMAIN", "a" * 64 + ".com"),
+        ("VC_OPENSUBTITLES_API_HOST", "api.evil.net"),  # not on the domain
+        ("VC_OPENSUBTITLES_API_HOST", "evilopensubtitles.com"),
+        ("VC_OPENSUBTITLES_API_HOST", "api.opensubtitles.com/x"),
+        ("VC_OPENSUBTITLES_API_HOST", ""),
+        ("VC_OPENSUBTITLES_API_PATH", ""),
+        ("VC_OPENSUBTITLES_API_PATH", "api/v1"),
+        ("VC_OPENSUBTITLES_API_PATH", "/api/../v1"),
+        ("VC_OPENSUBTITLES_API_PATH", "/api/v1?x=1"),
+        ("VC_OPENSUBTITLES_API_PATH", "/api/v1#x"),
+        ("VC_OPENSUBTITLES_API_PATH", "/api v1"),
+        ("VC_OPENSUBTITLES_API_PATH", "//evil.net/x"),
+        ("VC_SUBTITLE_LANGUAGE", ""),
+        ("VC_SUBTITLE_LANGUAGE", "english"),
+        ("VC_SUBTITLE_LANGUAGE", "e"),
+        ("VC_SUBTITLE_LANGUAGE", "en,fr"),
+        ("VC_SUBTITLE_LANGUAGE", "en&x=1"),
+    ],
+)
+def test_invalid_endpoint_values_raise(tmp_path: Path, var: str, value: str) -> None:
+    with pytest.raises(ConfigError):
+        load_settings(None, _env(tmp_path, **{var: value}))
+
+
+def test_the_api_host_must_follow_a_changed_domain(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="opensubtitles_api_host"):
+        load_settings(None, _env(tmp_path, VC_OPENSUBTITLES_DOMAIN="opensubtitles.example"))
+
+
+def test_wrong_endpoint_toml_types_raise(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "c.toml", _paths_toml() + "opensubtitles_api_path = 7\n")
+    with pytest.raises(ConfigError):
+        load_settings(cfg, _env(tmp_path))
