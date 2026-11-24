@@ -221,6 +221,38 @@ def test_a_failed_density_measurement_is_logged_with_the_file_name(
     )
 
 
+def test_a_hung_density_extraction_does_not_hang_the_survey(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from video_cleaner.subtitles import embedded
+    from video_cleaner.tools import ToolTimedOut
+
+    def hung(*args: object, **kwargs: object) -> object:
+        assert kwargs["timeout_s"] == embedded.DENSITY_TIMEOUT_S
+        raise ToolTimedOut("extract subtitle stream 3", embedded.DENSITY_TIMEOUT_S)
+
+    monkeypatch.setattr(embedded, "run_tool", hung)
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Hung.mkv")
+    state = State.open(settings.state_db)
+    try:
+        with caplog.at_level(logging.WARNING, logger="video_cleaner.survey"):
+            run_survey(
+                settings,
+                FAKE_TOOLS,
+                state,
+                RecordingReporter(),
+                probe_fn=_fake_probe({"Hung.mkv": lambda p: _with(p, _sub(3, forced=True))}),
+                hash_fn=lambda _p: None,
+                density_fn=embedded.measure_cue_density,
+            )
+        sub = _sub_row(state, film)
+        assert sub is not None and sub.status is SubtitleStatus.WANTED
+    finally:
+        state.close()
+    assert any("cue density could not be measured" in r.getMessage() for r in caplog.records)
+
+
 def test_a_file_with_no_english_subtitles_is_wanted(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     film = _touch(settings.library_root / "Plain.mkv")
