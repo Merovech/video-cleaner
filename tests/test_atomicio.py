@@ -12,6 +12,7 @@ import pytest
 from video_cleaner.atomicio import (
     csv_cell,
     csv_cell_value,
+    read_bytes_capped,
     write_csv_atomic,
     write_text_atomic,
 )
@@ -113,3 +114,74 @@ def test_write_csv_atomic_neutralises_formulas(tmp_path: Path) -> None:
     write_csv_atomic(target, ("name", "n"), [["=1+1", -4], ["@cmd", "-0.5"]])
     with target.open(encoding="utf-8", newline="") as fh:
         assert list(csv.reader(fh)) == [["name", "n"], ["'=1+1", "-4"], ["'@cmd", "-0.5"]]
+
+
+# --- read_bytes_capped ---------------------------------------------------------------------
+
+
+def test_read_bytes_capped_returns_a_file_of_exactly_the_cap(tmp_path: Path) -> None:
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"abcde")
+
+    assert read_bytes_capped(path, 5) == b"abcde"
+
+
+def test_read_bytes_capped_returns_none_for_one_byte_over(tmp_path: Path) -> None:
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"abcdef")
+
+    assert read_bytes_capped(path, 5) is None
+
+
+def test_read_bytes_capped_returns_empty_bytes_for_an_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"")
+
+    assert read_bytes_capped(path, 5) == b""
+
+
+@pytest.mark.parametrize("max_bytes", [0, -1])
+def test_read_bytes_capped_refuses_a_cap_below_one(tmp_path: Path, max_bytes: int) -> None:
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"abc")
+
+    with pytest.raises(ValueError, match="max_bytes"):
+        read_bytes_capped(path, max_bytes)
+
+
+def test_read_bytes_capped_propagates_os_errors(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        read_bytes_capped(tmp_path / "missing.bin", 5)
+
+
+def test_read_bytes_capped_never_asks_for_more_than_one_byte_past_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "big.bin"
+    path.write_bytes(b"x" * 100_000)  # the file grew after the caller looked at its size
+    requested: list[int] = []
+    real_open = Path.open
+
+    class Spy:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> Spy:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._handle.close()
+
+        def read(self, size: int = -1) -> bytes:
+            requested.append(size)
+            data: bytes = self._handle.read(size)
+            return data
+
+    def spy_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        return Spy(handle) if self == path else handle
+
+    monkeypatch.setattr(Path, "open", spy_open)
+
+    assert read_bytes_capped(path, 10) is None
+    assert requested == [11]

@@ -24,7 +24,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_cleaner.atomicio import write_text_atomic
+from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
 from video_cleaner.logging_setup import redact
@@ -292,13 +292,14 @@ def _failure_reason(text: str, what: str) -> str:
 def _validated_srt(path: Path, settings: Settings) -> tuple[str | None, str]:
     """(clean SRT text, "") for ffsubsync's output, or (None, why it is unusable)."""
     try:
-        with path.open("rb") as handle:
-            # One byte past the limit is enough for `normalise_subtitle` to refuse it.
-            raw = handle.read(settings.subtitle_max_bytes + 1)
+        raw = read_bytes_capped(path, settings.subtitle_max_bytes)
     except FileNotFoundError:
         return None, "ffsubsync produced no subtitle"
     except OSError:
         return None, "the subtitle ffsubsync produced could not be read"
+    if raw is None:
+        limit = settings.subtitle_max_bytes
+        return None, f"ffsubsync output rejected: subtitle is larger than {limit} bytes"
     if not raw:
         return None, "ffsubsync wrote an empty subtitle"
     try:
