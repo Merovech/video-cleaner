@@ -779,6 +779,36 @@ class State:
             if changed:
                 self._event(conn, f"{key}: subtitle reset -> {SubtitleStatus.WANTED.value}")
 
+    def downgrade_stale_subtitle(self, path: Path, size: int, mtime: float, reason: str) -> bool:
+        """Turn a FOUND record whose cached file no longer verifies back into WANTED.
+
+        The caller has already found the cache file missing or changed; this does no file I/O.
+        Cache path, hash, provenance, provider and the exact-hash flag are cleared and *reason*
+        is stored; the tried ids and the attempt count stay, so the next search does not repeat
+        what was rejected. Any other status, or no row, is left alone (`set_subtitle` refuses
+        this transition on purpose and `reset_subtitle` only touches UNAVAILABLE and UNCLEAR).
+        Returns True when it changed a row.
+        """
+        key = _key(path)
+        with self._tx(write=True) as conn:
+            changed = conn.execute(
+                "UPDATE subtitles SET status = ?, provider = '', cache_path = NULL, sha256 = '', "
+                "provenance = '', hash_exact = 0, reason = ?, updated_at = ? "
+                "WHERE path = ? AND size = ? AND mtime = ? AND status = ?",
+                (
+                    SubtitleStatus.WANTED.value,
+                    reason,
+                    _now(),
+                    key,
+                    size,
+                    mtime,
+                    SubtitleStatus.FOUND.value,
+                ),
+            ).rowcount
+            if changed:
+                self._event(conn, f"{key}: subtitle found -> {SubtitleStatus.WANTED.value}")
+        return bool(changed)
+
     # -- subtitle download allowance --------------------------------------------------------
 
     def quota(self) -> QuotaInfo | None:
