@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,9 @@ def test_status_says_when_the_plan_changed_since_ack(tmp_path: Path) -> None:
         add_record(st, lib / "a.avi", "encode", ("h264",), size=2000)
     result = _invoke("status", "--config", str(cfg))
     assert "plan changed since" in result.output
+    text = " ".join(result.output.split())
+    assert "a subtitle was found or went stale" in text
+    assert "run `plan`, review it, then `plan --ack`" in text
 
 
 def test_status_shows_only_the_last_10_events(tmp_path: Path) -> None:
@@ -238,6 +242,44 @@ def test_report_writes_results_csv_and_summary(tmp_path: Path) -> None:
     assert "Flagged: 1" in out and "Dune.mkv: HDR (transfer smpte2084)" in out
     assert "Retry: 1" in out and "Alien.avi: scratch full: no room" in out
     assert str(tmp_path / "appdata" / "report.csv") in out
+
+
+def test_results_csv_has_a_subtitle_column_from_the_manifest(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    lib = tmp_path / "library"
+    done = tmp_path / "completed"
+    with_sub = ManifestEntry(
+        original=(lib / "Heat.avi",),
+        original_sizes=(4 * GIB,),
+        original_mtimes=(1.0,),
+        completed=done / "Heat.mkv",
+        completed_size=GIB,
+        vmaf_mean=95.5,
+        vmaf_worst=91.25,
+        crf=21,
+        verified=True,
+        action="encode",
+        subtitle="English (OpenSubtitles)",
+    )
+    formula = replace(
+        with_sub,
+        original=(lib / "Ran.avi",),
+        completed=done / "Ran.mkv",
+        subtitle="=HYPERLINK(1)",
+    )
+    without = replace(with_sub, original=(lib / "Up.avi",), completed=done / "Up.mkv", subtitle="")
+    write_manifest(done / "manifest.csv", [with_sub, formula, without])
+    with _state(tmp_path) as st:
+        _populate(st, lib)
+    result = _invoke("report", "--config", str(cfg))
+    assert result.exit_code == 0, result.output
+    assert "subtitle" in planning.REPORT_COLUMNS
+    heat, ran, up = _read(tmp_path / "appdata" / "report.csv")
+    assert heat["subtitle"] == "English (OpenSubtitles)"
+    assert up["subtitle"] == ""
+    assert not ran["subtitle"].startswith("=")  # a title is never a spreadsheet formula
+    assert "=HYPERLINK(1)" in ran["subtitle"]
+    assert "Subtitles added: 2" in result.output
 
 
 def test_report_without_manifest_has_no_completed_rows(tmp_path: Path) -> None:

@@ -829,8 +829,11 @@ def test_cli_survey_ctrl_c_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyP
     code, output = _cli_with_failing_survey(tmp_path, monkeypatch, KeyboardInterrupt())
     assert code == 130
     assert "interrupted" in output
-    assert "stay recorded" not in output  # nothing is recorded while files are being probed
-    assert "nothing from this survey was recorded" in " ".join(output.split())
+    text = " ".join(output.split())
+    # Records are written while the survey runs, so the old "nothing was recorded" is wrong.
+    assert "nothing from this survey was recorded" not in text
+    assert "files already surveyed are recorded" in text
+    assert "can simply be run again" in text
     assert "Traceback" not in output
 
 

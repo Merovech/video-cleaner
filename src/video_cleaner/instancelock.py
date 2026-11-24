@@ -1,4 +1,6 @@
-"""One `run` or `calibrate` at a time: an exclusive OS lock on a file beside the state database.
+"""One `run` or `calibrate` at a time (and one `subs resolve`, on its own lock).
+
+The lock is an exclusive OS lock on a file beside the state database.
 
 A second run would reset the first one's live records, sweep its scratch mid-encode and race on
 ``manifest.csv``. The lock is an OS lock (``msvcrt.locking`` on Windows, ``fcntl.flock``
@@ -35,6 +37,12 @@ class AlreadyRunning(Exception):
 
 def lock_path_for(state_db: Path) -> Path:
     return state_db.parent / LOCK_NAME
+
+
+def subs_lock_path_for(state_db: Path) -> Path:
+    """The lock of `subs resolve`: its own file, so a subtitle lookup may run beside a `run`
+    (which keeps `lock_path_for`) while two lookups never overlap."""
+    return lock_path_for(state_db).with_suffix(".subs.lock")
 
 
 def _try_lock(fd: int) -> bool:

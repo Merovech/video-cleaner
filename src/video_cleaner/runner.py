@@ -1236,9 +1236,7 @@ def run_queue(
             "the plan has not been acknowledged: review and acknowledge it with `plan` first"
         )
     if planning.plan_hash(planning.build_plan(state)) != acknowledged:
-        raise PlanNotAcknowledged(
-            "plan changed since it was acknowledged: run plan, review, plan --ack"
-        )
+        raise PlanNotAcknowledged(planning.PLAN_CHANGED)
     settings = apply_calibration(settings, state)
     refuse_outputs_in_library(settings)
     with instance_lock(lock_path_for(settings.state_db)):

@@ -362,6 +362,7 @@ def test_ack_requires_matching_hash(tmp_path: Path) -> None:
     result = _invoke("plan", "--ack", "--config", str(cfg), "-q")
     assert result.exit_code == 2
     assert "run `plan` first and review it" in result.output
+    assert "a subtitle was found or went stale" in " ".join(result.output.split())
     with _cli_state(tmp_path) as st:
         assert st.plan_acknowledged() == digest  # unchanged
 

@@ -1931,7 +1931,9 @@ def test_run_refused_when_plan_changed_since_ack(
     _plan(state, src)
     events = len(state.events(10_000))
     fakes = Fakes()
-    with pytest.raises(PlanNotAcknowledged, match="plan changed since it was acknowledged"):
+    with pytest.raises(
+        PlanNotAcknowledged, match="plan changed since it was acknowledged"
+    ) as raised:
         run_queue(
             settings,
             TOOLS,
@@ -1941,6 +1943,9 @@ def test_run_refused_when_plan_changed_since_ack(
             now=Clock(),
             pipeline=fakes.pipeline(),
         )
+    message = str(raised.value)
+    assert "a subtitle was found or went stale" in message
+    assert "run `plan`, review it, then `plan --ack`" in message
     assert fakes.calls == []
     assert len(state.events(10_000)) == events
     assert not settings.scratch_dir.exists()

@@ -32,6 +32,11 @@ PLAN_CSV = "plan.csv"
 PLAN_HASH = "plan.hash"
 REPORT_CSV = "report.csv"
 LIST_SEPARATOR = "; "
+# What the user is told when the plan they acknowledged is not the current one any more.
+PLAN_CHANGED = (
+    "the plan changed since it was acknowledged (for example a subtitle was found or went "
+    "stale): run `plan`, review it, then `plan --ack`"
+)
 MEMBER_REASON_PREFIX = "part of group "
 PLAN_COLUMNS = (
     "path",
@@ -54,6 +59,7 @@ REPORT_COLUMNS = (
     "vmaf_worst",
     "crf",
     "action",
+    "subtitle",
     "original_unchanged",
 )
 UNCHANGED_YES = "yes"
@@ -399,7 +405,8 @@ def _optional(value: float | int | None) -> object:
 
 
 def write_results_csv(results: ResultsReport, path: Path) -> None:
-    """One row per completed file: sizes, saving %, VMAF, CRF, action, original unchanged."""
+    """One row per completed file: sizes, saving %, VMAF, CRF, action, the subtitle added (its
+    title, blank when none) and whether the original is unchanged."""
     verdicts = results.unchanged or tuple("" for _ in results.entries)
     _write_csv(
         path,
@@ -415,6 +422,7 @@ def write_results_csv(results: ResultsReport, path: Path) -> None:
                 _optional(e.vmaf_worst),
                 _optional(e.crf),
                 e.action,
+                e.subtitle,
                 verdict,
             ]
             for e, verdict in zip(results.entries, verdicts, strict=True)
