@@ -48,6 +48,7 @@ def make_entry(
     crf: int | None = 21,
     verified: bool = True,
     action: str = "reencode",
+    subtitle: str = "",
 ) -> ManifestEntry:
     return ManifestEntry(
         original=originals,
@@ -64,6 +65,7 @@ def make_entry(
         crf=crf,
         verified=verified,
         action=action,
+        subtitle=subtitle,
     )
 
 
@@ -328,7 +330,74 @@ def test_manifest_columns_are_the_documented_ones() -> None:
         "crf",
         "verified",
         "action",
+        "subtitle",
     )
+
+
+def test_manifest_subtitle_round_trips(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.csv"
+    entry = make_entry(
+        (tmp_path / "a.avi",),
+        tmp_path / "a.mkv",
+        action="remux",
+        subtitle="English (OpenSubtitles)",
+    )
+    write_manifest(manifest, [entry])
+    assert read_manifest(manifest)[0].subtitle == "English (OpenSubtitles)"
+    with manifest.open(encoding="utf-8", newline="") as fh:
+        assert [r["subtitle"] for r in csv.DictReader(fh)] == ["English (OpenSubtitles)"]
+    assert make_entry((tmp_path / "b.avi",), tmp_path / "b.mkv").subtitle == ""
+
+
+def test_manifest_subtitle_is_repeated_on_every_row_of_a_multi_part_entry(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.csv"
+    entry = make_entry(
+        (tmp_path / "a1.avi", tmp_path / "a2.avi"),
+        tmp_path / "a.mkv",
+        subtitle="English (local file)",
+    )
+    write_manifest(manifest, [entry])
+    with manifest.open(encoding="utf-8", newline="") as fh:
+        assert [r["subtitle"] for r in csv.DictReader(fh)] == ["English (local file)"] * 2
+    assert read_manifest(manifest) == [entry]
+
+
+@pytest.mark.parametrize("title", ["=cmd|' /C calc'!A0", "-2+3", "@SUM(1)", "+cmd", "'quoted"])
+def test_manifest_subtitle_cannot_become_a_spreadsheet_formula(tmp_path: Path, title: str) -> None:
+    manifest = tmp_path / "manifest.csv"
+    entry = make_entry((tmp_path / "a.avi",), tmp_path / "a.mkv", subtitle=title)
+    write_manifest(manifest, [entry])
+    with manifest.open(encoding="utf-8", newline="") as fh:
+        raw = next(csv.DictReader(fh))["subtitle"]
+    assert not raw.startswith(("=", "+", "-", "@"))
+    assert read_manifest(manifest) == [entry]
+
+
+def test_manifest_written_before_the_subtitle_column_still_reads(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.csv"
+    legacy = [c for c in MANIFEST_COLUMNS if c != "subtitle"]
+    manifest.write_text(
+        ",".join(legacy) + f"\na.avi,10,{MTIME!r},a.mkv,5,95.5,90.0,21,true,remux\n",
+        encoding="utf-8",
+    )
+    (entry,) = read_manifest(manifest)
+    assert entry.subtitle == "" and entry.action == "remux" and entry.crf == 21
+    # rewriting it adds the new column
+    write_manifest(manifest, [entry])
+    with manifest.open(encoding="utf-8", newline="") as fh:
+        assert csv.DictReader(fh).fieldnames == list(MANIFEST_COLUMNS)
+    assert read_manifest(manifest) == [entry]
+
+
+def test_manifest_legacy_header_with_a_row_that_is_too_long_is_rejected(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.csv"
+    legacy = [c for c in MANIFEST_COLUMNS if c != "subtitle"]
+    manifest.write_text(
+        ",".join(legacy) + f"\na.avi,10,{MTIME!r},a.mkv,5,,,,true,remux,extra\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError, match="line 2"):
+        read_manifest(manifest)
 
 
 def test_manifest_roundtrip_unicode_and_brackets(tmp_path: Path) -> None:
@@ -741,7 +810,7 @@ def test_write_manifest_rejects_path_not_representable_as_utf8(tmp_path: Path) -
 def test_read_manifest_rejects_non_finite_mtime(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.csv"
     manifest.write_text(
-        ",".join(MANIFEST_COLUMNS) + "\na.avi,10,nan,a.mkv,5,,,,true,remux\n", encoding="utf-8"
+        ",".join(MANIFEST_COLUMNS) + "\na.avi,10,nan,a.mkv,5,,,,true,remux,\n", encoding="utf-8"
     )
 
     with pytest.raises(ManifestError, match="original_mtime"):
@@ -751,7 +820,7 @@ def test_read_manifest_rejects_non_finite_mtime(tmp_path: Path) -> None:
 def test_read_manifest_rejects_broken_quoting(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.csv"
     manifest.write_text(
-        ",".join(MANIFEST_COLUMNS) + '\n"a.avi,10,1.0,a.mkv,5,,,,true,remux\n', encoding="utf-8"
+        ",".join(MANIFEST_COLUMNS) + '\n"a.avi,10,1.0,a.mkv,5,,,,true,remux,\n', encoding="utf-8"
     )
 
     with pytest.raises(ManifestError, match="line"):

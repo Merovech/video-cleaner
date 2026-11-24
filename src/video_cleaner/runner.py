@@ -11,6 +11,14 @@ original is re-checked against its state record, and then:
 * multi-part: the parts are appended into one combined file first, which is then
   decided, encoded or delivered like a single file.
 
+A file whose subtitle is still WANTED waits for the resolver and is skipped (counted in the
+summary) unless ``include_unresolved`` is set. A FOUND subtitle is checked against its cache file
+before the video is copied, staged as a private copy in the file's scratch folder and added by
+mkvmerge as one last track on both the remux and the encode path; `verify_output` then insists on
+exactly that one new English track. A cache file that is gone or changed sends the file to RETRY
+and the subtitle back to WANTED. A remux whose only change is the subtitle is delivered even
+though it is not smaller.
+
 A verified output is moved to the completed folder and recorded in ``manifest.csv``; scratch is
 released after every file, whatever happened. The library is never written: every output path
 lives under ``scratch_dir`` or ``completed_dir``, and a run refuses to start if any of them is
@@ -34,6 +42,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from video_cleaner import encode, logarchive, planning, quality
 from video_cleaner.config import Settings
@@ -51,7 +60,7 @@ from video_cleaner.manifest import (
     write_manifest,
 )
 from video_cleaner.multipart import find_part_groups
-from video_cleaner.mux import build_mux_cmd
+from video_cleaner.mux import SubtitleInput, build_mux_cmd
 from video_cleaner.paths import (
     OutputInLibrary,
     is_under,
@@ -75,7 +84,20 @@ from video_cleaner.scratch import (
     is_tool_scratch,
     prepare_tool_scratch,
 )
-from video_cleaner.state import IN_PROGRESS, FileRecord, StaleRecord, State, Status
+from video_cleaner.state import (
+    IN_PROGRESS,
+    FileRecord,
+    StaleRecord,
+    State,
+    Status,
+    SubtitleRecord,
+    SubtitleStatus,
+)
+from video_cleaner.subtitles.stage import (
+    SubtitleCacheStale,
+    check_cached_subtitle,
+    stage_subtitle,
+)
 from video_cleaner.tools import (
     ToolFailed,
     ToolNotFound,
@@ -94,6 +116,10 @@ STOP_MANIFEST_UNREADABLE = "manifest unreadable"
 STOP_MANIFEST_NOT_WRITABLE = "manifest not writable"
 STOP_COMPLETED_NOT_WRITABLE = "completed folder not writable"
 STALE_NOTE = "source changed"
+# A FOUND subtitle whose cache file is gone, moved or changed: the file waits for a new one.
+SUBTITLE_STALE_NOTE = "subtitle cache missing or changed"
+# Appended to a LEFT_ALONE note when a found subtitle was not delivered with the file.
+SUBTITLE_NOT_ADDED = "; the found subtitle was not added"
 # A file that fails this many runs (tool failure, I/O error) is flagged instead of retried.
 MAX_ATTEMPTS = 3
 MANIFEST_NAME = "manifest.csv"
@@ -132,6 +158,10 @@ class _Refused(Exception):
     """The file cannot be delivered safely; it is flagged with this reason."""
 
 
+class _SubtitleStale(Exception):
+    """The cache file of the file's FOUND subtitle is gone or changed; the file is retried."""
+
+
 class _ManifestTrouble(Exception):
     """The manifest cannot be read or written: no file can be delivered, so the run stops."""
 
@@ -167,9 +197,11 @@ def mux(
     new_video: Path | None,
     output: Path,
     reporter: Reporter,
+    subtitle: SubtitleInput | None = None,
 ) -> None:
-    """mkvmerge *sources* (with *new_video* swapped in, when given) into *output*."""
-    _run_mkvmerge(tools, build_mux_cmd(tools, output, sources, new_video), output, reporter)
+    """mkvmerge *sources* (with *new_video* swapped in and *subtitle* added, when given)."""
+    cmd = build_mux_cmd(tools, output, sources, new_video, subtitle)
+    _run_mkvmerge(tools, cmd, output, reporter)
 
 
 # The post-encode guard scores this many windows of this length.
@@ -229,7 +261,9 @@ class Pipeline:
         encode.encode_full
     )
     append_parts: Callable[[Tools, Sequence[Path], Path, Reporter], None] = append_parts
-    mux: Callable[[Tools, Sequence[Path], Path | None, Path, Reporter], None] = mux
+    mux: Callable[
+        [Tools, Sequence[Path], Path | None, Path, Reporter, SubtitleInput | None], None
+    ] = mux
     window_scores: Callable[[Tools, MediaInfo, Path, Settings, Path, Reporter], Sequence[float]] = (
         guard_window_scores
     )
@@ -250,6 +284,8 @@ class RunSummary:
     bytes_saved: int
     stopped_by_deadline: bool
     stop_reason: str = ""
+    # Queued files skipped because their subtitle is still WANTED (see `include_unresolved`).
+    waiting_on_subtitles: int = 0
 
 
 def deadline_from(until: str | None, max_hours: float | None, now: datetime) -> datetime | None:
@@ -378,7 +414,9 @@ class _Runner:
         deadline: datetime | None,
         only: Path | None,
         now: Callable[[], datetime],
+        include_unresolved: bool = False,
     ) -> None:
+        self.include_unresolved = include_unresolved
         self.settings = settings
         self.tools = tools
         self.state = state
@@ -422,16 +460,40 @@ class _Runner:
             return True
         return any(name_under(p, self.scope) for p in (rec.path, *rec.parts))
 
-    def _wanted(self, rec: FileRecord) -> bool:
+    def _waiting(self) -> frozenset[tuple[str, int, float]]:
+        """Keys of the files whose subtitle is still WANTED, none when they run regardless."""
+        if self.include_unresolved:
+            return frozenset()
+        return frozenset(
+            (name_key(sub.path), sub.size, sub.mtime) for sub in self.state.wanted_subtitles()
+        )
+
+    def _wanted(self, rec: FileRecord, waiting: frozenset[tuple[str, int, float]]) -> bool:
+        key = (name_key(rec.path), rec.size, rec.mtime)
         return (
             rec.decision in _WORK_DECISIONS
-            and (name_key(rec.path), rec.size, rec.mtime) not in self.attempted
+            and key not in self.attempted
+            and key not in waiting
             and self.in_scope(rec)
         )
 
+    def _count_waiting(self) -> int:
+        """Queued files (pending or retry, in scope) that wait for their subtitle."""
+        waiting = self._waiting()
+        if not waiting:
+            return 0
+        return sum(
+            1
+            for rec in self.state.records(Status.PENDING, Status.RETRY)
+            if rec.decision in _WORK_DECISIONS
+            and self.in_scope(rec)
+            and (name_key(rec.path), rec.size, rec.mtime) in waiting
+        )
+
     def _next(self) -> FileRecord | None:
+        waiting = self._waiting()
         for status in (Status.PENDING, Status.RETRY):
-            records = [r for r in self.state.records(status) if self._wanted(r)]
+            records = [r for r in self.state.records(status) if self._wanted(r, waiting)]
             if records:
                 # records() is ordered by path, so equal savings keep a stable order
                 return max(records, key=lambda r: r.est_saving_bytes)
@@ -568,6 +630,12 @@ class _Runner:
             self._precheck(nxt)
         except _Refused:
             return
+        sub = self._found_subtitle(nxt)
+        if sub is not None:
+            try:
+                check_cached_subtitle(sub, self.settings)
+            except SubtitleCacheStale:
+                return  # reported and downgraded when its turn comes; nothing is copied for it
         src = (nxt.parts or (nxt.path,))[0]
         self.prefetcher.start(src)
         self.prefetched = src
@@ -793,6 +861,28 @@ class _Runner:
         if live is None or live.status is Status.STALE or not same:
             raise StaleRecord(f"{rec.path} was re-planned during the run")
 
+    def _found_subtitle(self, rec: FileRecord) -> SubtitleRecord | None:
+        """The FOUND subtitle record of *rec*, or None (no row, or any other status)."""
+        sub = self.state.subtitle(rec.path, rec.size, rec.mtime)
+        return sub if sub is not None and sub.status is SubtitleStatus.FOUND else None
+
+    def _subtitle_gone(self, sub: SubtitleRecord, exc: SubtitleCacheStale) -> _SubtitleStale:
+        """Send the subtitle back to WANTED (keeping what was tried) and say why."""
+        _log.warning("%s: %s; the subtitle is looked up again", sub.path, exc)
+        self.state.downgrade_stale_subtitle(
+            sub.path, sub.size, sub.mtime, f"{SUBTITLE_STALE_NOTE}: {exc}"
+        )
+        return _SubtitleStale(str(exc))
+
+    def _stage_subtitle(self, sub: SubtitleRecord, workdir: Path) -> SubtitleInput:
+        """The private copy of the cached subtitle for the mux; see `stage_subtitle`."""
+        try:
+            return stage_subtitle(sub, self.settings, workdir)
+        except SubtitleCacheStale as exc:
+            raise self._subtitle_gone(sub, exc) from None
+        except ValueError as exc:
+            raise _Refused(f"the stored subtitle cannot be used: {exc}") from None
+
     def _deliver(
         self,
         rec: FileRecord,
@@ -804,6 +894,7 @@ class _Runner:
         action: str,
         crf: int | None,
         vmaf: tuple[float, float] | None,
+        subtitle: SubtitleInput | None = None,
     ) -> _Outcome:
         completed_size = output.stat().st_size
         entry = ManifestEntry(
@@ -817,6 +908,7 @@ class _Runner:
             crf=crf,
             verified=True,
             action=action,
+            subtitle="" if subtitle is None else subtitle.title,
         )
         # Second line of defence: the original may have changed during the encode.
         if not check_unchanged(entry):
@@ -861,10 +953,17 @@ class _Runner:
             tmp.unlink(missing_ok=True)
             raise _Refused(f"output {target} could not be put in place: {exc}") from exc
         saved = sum(entry.original_sizes) - completed_size
-        return _Outcome(Status.COMPLETED, f"{action}: saved {saved} bytes", saved)
+        added = "" if subtitle is None else f" with subtitle {subtitle.title!r}"
+        return _Outcome(Status.COMPLETED, f"{action}{added}: saved {saved} bytes", saved)
 
     def _work(self, rec: FileRecord, target: Path, work: _Work) -> _Outcome:
         s, tools, rep, pipe = self.settings, self.tools, self.reporter, self.pipeline
+        sub = self._found_subtitle(rec)
+        if sub is not None:
+            try:
+                check_cached_subtitle(sub, s)  # before anything is copied from the library
+            except SubtitleCacheStale as exc:
+                raise self._subtitle_gone(sub, exc) from None
         self._set(rec, Status.QUEUED)
         self._set(rec, Status.COPYING)
         sources = list(rec.parts) or [rec.path]
@@ -875,6 +974,7 @@ class _Runner:
         self._assert_unchanged(sources, expected)
         self._start_prefetch()
         work.workdir.mkdir(parents=True, exist_ok=True)
+        subtitle = None if sub is None else self._stage_subtitle(sub, work.workdir)
 
         duration_s: float | None = None
         original_size: int | None = None
@@ -886,7 +986,7 @@ class _Runner:
             pipe.append_parts(tools, copies, combined, rep)
             duration_s = sum(pipe.probe(c, tools, rep).duration_s for c in copies)
             info = pipe.probe(combined, tools, rep)
-            decision = decide(info, s, multipart=True)
+            decision = decide(info, s, needs_subs=subtitle is not None, multipart=True)
             if decision.action is Action.FLAG:
                 return _Outcome(Status.FLAGGED, "; ".join(decision.reasons))
             source = combined
@@ -896,26 +996,41 @@ class _Runner:
             source = copies[0]
             action = Action(rec.decision)
 
-        verify_args = {
+        verify_args: dict[str, Any] = {
             "min_saving": s.min_saving,
             "original_duration_s": duration_s,
             "original_size": original_size,
         }
+        if subtitle is not None:
+            verify_args["expected_new_subtitles"] = 1
+            verify_args["expected_subtitle_title"] = subtitle.title
         if action is Action.REMUX:
-            if rec.parts:
+            if rec.parts and subtitle is None:
                 output = source  # the append already is the remux
             else:
                 self._set(rec, Status.MUXING)
                 output = work.workdir / target.name
-                self._reserve(rec.size, output, work)
-                pipe.mux(tools, [source], None, output, rep)
+                self._reserve(
+                    original_size if original_size is not None else rec.size, output, work
+                )
+                pipe.mux(tools, [source], None, output, rep, subtitle)
             self._set(rec, Status.VERIFYING)
             verdict = pipe.verify(tools, info, output, rep, encoded=False, **verify_args)
             if not verdict.ok:
                 return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
             return self._deliver(
-                rec, sources, expected, output, target, action="remux", crf=None, vmaf=None
+                rec,
+                sources,
+                expected,
+                output,
+                target,
+                action="remux",
+                crf=None,
+                vmaf=None,
+                subtitle=subtitle,
             )
+
+        unused = "" if subtitle is None else SUBTITLE_NOT_ADDED
 
         self._set(rec, Status.ENCODING)
         search = pipe.search_crf(info, tools, s, work.workdir, rep)
@@ -923,7 +1038,7 @@ class _Runner:
             return _Outcome(
                 Status.LEFT_ALONE,
                 f"projected saving {search.projected_saving:.1%} at CRF {search.crf} is below "
-                f"the minimum {s.min_saving:.0%}",
+                f"the minimum {s.min_saving:.0%}{unused}",
             )
         # Both are estimated at the original's size: an encode is never kept if it is bigger.
         estimate = original_size if original_size is not None else rec.size
@@ -933,16 +1048,16 @@ class _Runner:
         self._set(rec, Status.MUXING)
         output = work.workdir / target.name
         self._reserve(estimate, output, work)
-        pipe.mux(tools, [source], encoded, output, rep)
+        pipe.mux(tools, [source], encoded, output, rep, subtitle)
         self._set(rec, Status.VERIFYING)
         scores = pipe.window_scores(tools, info, output, s, work.workdir, rep)
         guard = quality.evaluate_guard(scores, s.guard_mean_floor, s.guard_worst_floor)
         if not guard.ok:
-            return _Outcome(Status.LEFT_ALONE, f"quality guard failed: {guard.reason}")
+            return _Outcome(Status.LEFT_ALONE, f"quality guard failed: {guard.reason}{unused}")
         verdict = pipe.verify(tools, info, output, rep, encoded=True, **verify_args)
         if not verdict.ok:
             if verdict.too_large:
-                return _Outcome(Status.LEFT_ALONE, f"output not kept: {verdict.reason}")
+                return _Outcome(Status.LEFT_ALONE, f"output not kept: {verdict.reason}{unused}")
             return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
         return self._deliver(
             rec,
@@ -953,6 +1068,7 @@ class _Runner:
             action="encode",
             crf=search.crf,
             vmaf=(guard.mean, guard.worst),
+            subtitle=subtitle,
         )
 
     def process(self, rec: FileRecord) -> str:
@@ -981,6 +1097,8 @@ class _Runner:
         except StaleRecord as exc:
             _log.warning("%s; result discarded", exc)
             return ""
+        except _SubtitleStale:
+            outcome = _Outcome(Status.RETRY, SUBTITLE_STALE_NOTE)
         except _Refused as exc:
             outcome = _Outcome(Status.FLAGGED, str(exc))
         except ScratchFull as exc:
@@ -1026,6 +1144,7 @@ class _Runner:
             bytes_saved=self.bytes_saved,
             stopped_by_deadline=stopped_by_deadline,
             stop_reason=stop_reason,
+            waiting_on_subtitles=self._count_waiting(),
         )
 
     def records(self) -> Iterator[FileRecord]:
@@ -1044,8 +1163,12 @@ def run_queue(
     now: Callable[[], datetime] = datetime.now,
     pipeline: Pipeline | None = None,
     current_log: Path | None = None,
+    include_unresolved: bool = False,
 ) -> RunSummary:
     """Work through the queue until it is empty, the deadline passes or a stop condition hits.
+
+    A file whose subtitle lookup is still WANTED is skipped and counted in
+    ``RunSummary.waiting_on_subtitles``; with *include_unresolved* it runs without a subtitle.
 
     Raises `PlanNotAcknowledged` before touching anything if the plan was not acknowledged or
     the current plan (`planning.plan_hash`) differs from the acknowledged one,
@@ -1072,7 +1195,16 @@ def run_queue(
     refuse_outputs_in_library(settings)
     with instance_lock(lock_path_for(settings.state_db)):
         return _run_locked(
-            settings, tools, state, reporter, pipeline, deadline, only, now, current_log
+            settings,
+            tools,
+            state,
+            reporter,
+            pipeline,
+            deadline,
+            only,
+            now,
+            current_log,
+            include_unresolved,
         )
 
 
@@ -1086,6 +1218,7 @@ def _run_locked(
     only: Path | None,
     now: Callable[[], datetime],
     current_log: Path | None,
+    include_unresolved: bool,
 ) -> RunSummary:
     """The body of `run_queue`, run while this process holds the single-instance lock."""
     reset = state.reset_in_progress()
@@ -1095,7 +1228,9 @@ def _run_locked(
     if removed:
         _log.info("archived %d old log file(s)", len(removed))
 
-    runner = _Runner(settings, tools, state, reporter, pipeline, deadline, only, now)
+    runner = _Runner(
+        settings, tools, state, reporter, pipeline, deadline, only, now, include_unresolved
+    )
     if only is not None and not any(runner.in_scope(r) for r in state.records()):
         reason = f"no surveyed files under {only}: run `survey --root {only}`, `plan`, `plan --ack`"
         _log.error("run stopped before any file: %s", reason)

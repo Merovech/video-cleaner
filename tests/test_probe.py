@@ -223,6 +223,21 @@ def _subtitle_with_title(title: str) -> Any:
     return parse_ffprobe(data, Path("x.mkv"), SIZE, MTIME).subtitles[0]
 
 
+def test_subtitle_stream_reports_its_title_and_default_flag() -> None:
+    data = load_fixture("hevc_subrip_sdh_disposition_mkv")
+    data["streams"][2]["tags"] = {"language": "eng", "TITLE": "English (OpenSubtitles)"}
+    data["streams"][2]["disposition"] = {"default": 1}
+    first, second = parse_ffprobe(data, Path("x.mkv"), SIZE, MTIME).subtitles
+    assert (first.title, first.default) == ("English (OpenSubtitles)", True)
+    assert second.default is False
+
+
+def test_subtitle_stream_without_a_title_has_an_empty_one() -> None:
+    data = load_fixture("hevc_subrip_sdh_disposition_mkv")
+    data["streams"][2]["tags"] = {"language": "eng"}
+    assert parse_ffprobe(data, Path("x.mkv"), SIZE, MTIME).subtitles[0].title == ""
+
+
 @pytest.mark.parametrize(
     ("title", "forced"),
     [

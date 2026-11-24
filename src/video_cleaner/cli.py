@@ -431,6 +431,13 @@ def _print_run_summary(summary: _runner.RunSummary) -> None:
         print_tagged(Level.INFO, "Run ended: deadline reached (the file in progress was finished)")
     else:
         print_tagged(Level.OK, "Run ended: queue finished")
+    if summary.waiting_on_subtitles:
+        n = summary.waiting_on_subtitles
+        print_tagged(
+            Level.INFO,
+            f"{n} {'file' if n == 1 else 'files'} waiting on subtitles were skipped "
+            "(`run --include-unresolved` runs them without one)",
+        )
 
 
 @app.command()
@@ -445,6 +452,13 @@ def run(
     path: Annotated[
         Path | None, typer.Option("--path", help="Only process this file or folder.")
     ] = None,
+    include_unresolved: Annotated[
+        bool,
+        typer.Option(
+            "--include-unresolved",
+            help="Also run files whose subtitle lookup is not finished, without a subtitle.",
+        ),
+    ] = False,
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
@@ -471,6 +485,7 @@ def run(
                     deadline=deadline,
                     only=path,
                     current_log=log_path,
+                    include_unresolved=include_unresolved,
                 )
         except (
             _runner.PlanNotAcknowledged,
@@ -507,7 +522,8 @@ def status(config: ConfigOption = None) -> None:
         with State.open(settings.state_db) as state:
             counts, members = planning.status_counts(state)
             acknowledged = state.plan_acknowledged()
-            current = planning.plan_hash(planning.build_plan(state))
+            plan = planning.build_plan(state)
+            current = planning.plan_hash(plan)
             calibration = state.calibration()
             events = state.events(LAST_EVENTS)
     except StateError as exc:
@@ -516,6 +532,8 @@ def status(config: ConfigOption = None) -> None:
     for st, n in counts.items():
         _say(f"  {st.value:<12} {n}")
     _say(f"Multi-part members: {members} (counted with their group)")
+    waiting = plan.waiting_on_subtitles
+    _say(f"Files waiting on subtitles: {waiting} (`run` skips them until a subtitle is found)")
     if acknowledged is None:
         _say("Plan acknowledged: no (run `plan`, review it, then `plan --ack`)")
     else:

@@ -93,6 +93,10 @@ class SubtitleStream:
     forced: bool
     sdh: bool
     is_image: bool
+    # The default-track disposition, and the track name (None: not reported, as in a stub; a
+    # probe of a real file gives "" for a track without a name).
+    default: bool = False
+    title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +230,8 @@ def _subtitle_stream(stream: Mapping[str, Any]) -> SubtitleStream:
         forced=_is_forced(stream),
         sdh=_is_sdh(stream),
         is_image=codec in IMAGE_SUBTITLE_CODECS,
+        default=_flag(stream, "default"),
+        title=_tag(stream, "title"),
     )
 
 

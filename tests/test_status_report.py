@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from helpers import add_record, write_config
+from helpers import MTIME, add_record, write_config
 from video_cleaner import planning
 from video_cleaner.cli import app
 from video_cleaner.manifest import ManifestEntry, write_manifest
@@ -85,6 +85,28 @@ def test_status_lists_counts(tmp_path: Path) -> None:
     assert "matches the current plan" in result.output
     assert "Calibration approved: yes (vmaf_target 94.5, crf_max 23)" in result.output
     assert "calibration approved" in result.output  # the last events include it
+
+
+def test_status_says_how_many_files_wait_on_subtitles(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    lib = tmp_path / "library"
+    with _state(tmp_path) as st:
+        add_record(st, lib / "a.avi", "encode", ("h264",))
+        add_record(st, lib / "b.avi", "encode", ("h264",))
+        add_record(st, lib / "c.avi", "encode", ("h264",))
+        st.ensure_wanted(lib / "a.avi", 1000, MTIME, english_audio=True)
+        st.ensure_wanted(lib / "b.avi", 1000, MTIME, english_audio=True)
+    result = _invoke("status", "--config", str(cfg))
+    assert result.exit_code == 0, result.output
+    assert "Files waiting on subtitles: 2" in result.output
+
+
+def test_status_with_no_file_waiting_on_subtitles_says_zero(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    with _state(tmp_path) as st:
+        add_record(st, tmp_path / "library" / "a.avi", "encode", ("h264",))
+    result = _invoke("status", "--config", str(cfg))
+    assert "Files waiting on subtitles: 0" in result.output
 
 
 def test_status_without_ack_or_calibration(tmp_path: Path) -> None:

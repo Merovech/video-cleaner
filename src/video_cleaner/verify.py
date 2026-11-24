@@ -1,7 +1,8 @@
 """Output verification: the last gate before a file is moved to ``completed``.
 
 `verify_output` probes the produced file and checks it against the original: duration within
-1% + 2 s, a video stream, the same number of audio and subtitle streams, chapters, attachments
+1% + 2 s, a video stream, the same number of audio streams and of subtitle streams (plus the one
+added subtitle track, when the caller muxed one in), chapters, attachments
 (cover art) and extra video streams kept, a clean full decode, and, for an encode, 10-bit HEVC
 video and a size at least ``min_saving`` smaller than the original. Every failed check is
 named in the reason.
@@ -13,13 +14,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_cleaner.probe import MediaInfo, ProbeError, probe
+from video_cleaner.probe import MediaInfo, ProbeError, SubtitleStream, probe
 from video_cleaner.progress import Reporter
 from video_cleaner.tools import Tools, run_tool
 
 DURATION_TOLERANCE_FRACTION = 0.01
 DURATION_TOLERANCE_S = 2.0
 ENCODED_CODEC = "hevc"
+NEW_SUBTITLE_LANGUAGE = "eng"
 # What build_x265_cmd writes is yuv420p10le; these 10-bit formats are accepted. An explicit set,
 # not a substring test: "10" also occurs in the 8-bit yuv410p.
 TEN_BIT_PIX_FMTS = frozenset({"yuv420p10le", "yuv420p10be", "yuv422p10le", "yuv444p10le", "p010le"})
@@ -70,17 +72,50 @@ def decode_errors(tools: Tools, output: Path, reporter: Reporter) -> str:
     return errors
 
 
-def _count_problems(original: MediaInfo, out: MediaInfo) -> list[str]:
+def _new_subtitle_problems(stream: SubtitleStream, title: str | None) -> list[str]:
+    """What is wrong with the added track: not English, flagged default or forced, misnamed.
+
+    mkvmerge appends the new track after every source track, so it is the last subtitle stream.
+    The title is compared only when the probe reports titles (``stream.title`` is not None) and
+    the caller says which one it muxed.
+    """
+    name = f"new subtitle stream (index {stream.index})"
+    problems: list[str] = []
+    if stream.language.lower() != NEW_SUBTITLE_LANGUAGE:
+        problems.append(f"{name} has language {stream.language}, expected {NEW_SUBTITLE_LANGUAGE}")
+    if stream.default:
+        problems.append(f"{name} is flagged default")
+    if stream.forced:
+        problems.append(f"{name} is flagged forced")
+    if title is not None and stream.title is not None and stream.title != title:
+        problems.append(f"{name} has title {stream.title!r}, expected {title!r}")
+    return problems
+
+
+def _count_problems(
+    original: MediaInfo, out: MediaInfo, new_subtitles: int, title: str | None
+) -> list[str]:
     problems: list[str] = []
     if out.video is None:
         problems.append("no video stream in the output")
-    pairs = (
-        ("audio streams", len(out.audio), len(original.audio)),
-        ("subtitle streams", len(out.subtitles), len(original.subtitles)),
-    )
-    for label, got, want in pairs:
-        if got != want:
-            problems.append(f"{label}: {got} in the output, {want} in the original")
+    if len(out.audio) != len(original.audio):
+        problems.append(
+            f"audio streams: {len(out.audio)} in the output, {len(original.audio)} in the original"
+        )
+    want_subtitles = len(original.subtitles) + new_subtitles
+    if len(out.subtitles) != want_subtitles:
+        if new_subtitles:
+            problems.append(
+                f"subtitle streams: {len(out.subtitles)} in the output, {want_subtitles} expected "
+                f"({len(original.subtitles)} in the original + {new_subtitles} new)"
+            )
+        else:
+            problems.append(
+                f"subtitle streams: {len(out.subtitles)} in the output, "
+                f"{len(original.subtitles)} in the original"
+            )
+    elif new_subtitles:
+        problems.extend(_new_subtitle_problems(out.subtitles[-1], title))
     kept = (
         ("chapters", out.chapters, original.chapters),
         ("attachments (cover art)", out.cover_art, original.cover_art),
@@ -104,12 +139,21 @@ def verify_output(
     original_size: int | None = None,
     probe_fn: ProbeFn = probe,
     decode_fn: DecodeFn = decode_errors,
+    expected_new_subtitles: int = 0,
+    expected_subtitle_title: str | None = None,
 ) -> VerifyResult:
     """Check *output* against *original*; see the module docstring for the checks.
+
+    *expected_new_subtitles* is 0, or 1 when a subtitle was muxed in: the output must then have
+    one more subtitle stream than the original, and the last one (the new track) must be
+    English, neither default nor forced, and carry *expected_subtitle_title* when that is given.
+    Any other value raises `ValueError`.
 
     For a multi-part movie pass the summed duration and size of the parts as
     *original_duration_s* and *original_size*; the stream checks still use *original*.
     """
+    if expected_new_subtitles not in (0, 1):
+        raise ValueError(f"expected_new_subtitles must be 0 or 1, got {expected_new_subtitles}")
     try:
         out = probe_fn(output, tools, reporter)
     except ProbeError as exc:
@@ -125,7 +169,7 @@ def verify_output(
             f"duration {out.duration_s:.1f} s differs from the original {want_duration:.1f} s "
             f"by more than {tolerance:.1f} s"
         )
-    problems.extend(_count_problems(original, out))
+    problems.extend(_count_problems(original, out, expected_new_subtitles, expected_subtitle_title))
     if encoded and out.video is not None:
         if out.video.codec.lower() != ENCODED_CODEC:
             problems.append(f"encoded video is codec {out.video.codec}, expected {ENCODED_CODEC}")
