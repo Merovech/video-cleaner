@@ -239,7 +239,24 @@ def test_subtitle_input_rejects_a_bad_language(language: str) -> None:
 
 @pytest.mark.parametrize(
     "title",
-    ["", "x" * 201, "line\nbreak", "tab\there", "nul\x00", "bell\x07", "del\x7f", "c1\x85"],
+    [
+        "",
+        "x" * 201,
+        "line\nbreak",
+        "tab\there",
+        "nul\x00",
+        "bell\x07",
+        "del\x7f",
+        "c1\x85",
+        "line\u2028sep",  # Zl
+        "para\u2029sep",  # Zp
+        "rtl\u202eoverride",  # Cf
+        "zero\u200bwidth",  # Cf
+        "\ufeffbom",  # Cf
+        "   ",
+        "\u3000\u3000",  # only Zs
+        "\u00a0",
+    ],
 )
 def test_subtitle_input_rejects_a_bad_title(title: str) -> None:
     with pytest.raises(ValueError, match="title"):

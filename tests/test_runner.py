@@ -2671,6 +2671,7 @@ def test_a_stale_subtitle_cache_sends_the_file_to_retry_and_the_subtitle_back_to
 
         assert fakes.calls == []  # nothing was copied, probed or muxed
         assert summary.retry == 1 and summary.completed == 0
+        assert summary.waiting_on_subtitles == 0  # it was tried, not skipped
         record = _status(state, src)
         assert record.status is Status.RETRY and record.note == STALE_NOTE
         assert record.attempts == 0  # not the file's fault
@@ -2797,19 +2798,139 @@ def test_ctrl_c_during_the_mux_leaves_no_staged_subtitle_behind(
     assert not (settings.completed_dir / "a.mkv").exists()
 
 
-def test_an_encode_that_is_not_worth_keeping_says_the_found_subtitle_was_not_added(
-    settings: Settings, state: State
+def _abandon_by_projection(fakes: Fakes) -> None:
+    fakes.crf = CrfSearchResult(crf=24, projected_saving=0.05, points=())
+
+
+def _abandon_by_guard(fakes: Fakes) -> None:
+    fakes.scores = [94.0, 86.0, 95.0]
+
+
+def _abandon_by_size(fakes: Fakes) -> None:
+    fakes.ratio = 0.95  # the encode is only 5% smaller: verify says too large
+
+
+ABANDONED = {
+    "projection": (_abandon_by_projection, "projected saving 5.0%", 0, 1),
+    "guard": (_abandon_by_guard, "quality guard failed", 1, 1),
+    "too_large": (_abandon_by_size, "output not kept", 1, 2),
+}
+
+
+@pytest.mark.parametrize("path", list(ABANDONED))
+def test_an_abandoned_encode_delivers_a_subtitle_only_remux_instead(
+    settings: Settings, state: State, path: str
 ) -> None:
+    abandon, why, encodes, verifies = ABANDONED[path]
+    src = _source(settings, "Films/a.avi", size=3000)
+    rec = _plan(state, src)
+    cache = _found_subtitle(settings, state, rec)
+    library_before = _tree(settings.library_root)
+    fakes = Fakes()
+    abandon(fakes)
+    summary = _run(settings, state, fakes)
+
+    assert (summary.completed, summary.left_alone, summary.flagged) == (1, 0, 0)
+    assert fakes.names().count("encode_full") == encodes
+    muxes = [c for c in fakes.calls if c[0] == "mux"]
+    assert muxes[-1][2] is None  # the delivered file is a remux: the video is the original's
+    assert isinstance(muxes[-1][4], SubtitleInput)
+    assert fakes.staged[-1][1] == SRT_BYTES
+    verifies_made = [c for c in fakes.calls if c[0] == "verify"]
+    assert len(verifies_made) == verifies
+    assert verifies_made[-1][3]["encoded"] is False  # no size gate for a remux
+    assert verifies_made[-1][3]["expected_new_subtitles"] == 1
+    out = settings.completed_dir / "Films" / "a.mkv"
+    assert out.stat().st_size == 3000 + len(SRT_BYTES)
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert (entry.action, entry.subtitle, entry.crf) == ("remux", SUB_TITLE, None)
+    assert (entry.vmaf_mean, entry.vmaf_worst, entry.verified) == (None, None, True)
+    record = _status(state, src)
+    assert record.status is Status.COMPLETED
+    assert why in record.note and "subtitle-only remux" in record.note
+    assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
+    assert _scratch_files(settings) == []
+    assert _tree(settings.library_root) == library_before
+    assert cache.read_bytes() == SRT_BYTES
+
+
+@pytest.mark.parametrize("path", ["projection", "guard"])
+def test_an_abandoned_encode_whose_remux_fails_verify_is_flagged_and_delivers_nothing(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, _, _, _ = ABANDONED[path]
     src = _source(settings, "a.avi")
     rec = _plan(state, src)
     _found_subtitle(settings, state, rec)
     fakes = Fakes()
-    fakes.crf = CrfSearchResult(crf=24, projected_saving=0.05, points=())
+    abandon(fakes)
+    fakes.drop_subtitle = True  # the fallback mux loses the subtitle
     summary = _run(settings, state, fakes)
-    assert summary.left_alone == 1
-    note = _status(state, src).note
-    assert "projected saving 5.0%" in note and "subtitle was not added" in note
-    assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
+    assert (summary.flagged, summary.completed, summary.left_alone) == (1, 0, 0)
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED and "subtitle streams" in record.note
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert _scratch_files(settings) == []
+
+
+@pytest.mark.parametrize("path", list(ABANDONED))
+def test_an_abandoned_multi_part_encode_muxes_the_combined_file_with_the_subtitle(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, why, _, _ = ABANDONED[path]
+    pt1 = _source(settings, "Epic cd1.avi", size=2000)
+    pt2 = _source(settings, "Epic cd2.avi", size=3000)
+    rec = _plan(state, pt1, parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    abandon(fakes)
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1, _status(state, pt1).note
+    combined = fakes.calls[fakes.names().index("append_parts")][2]
+    last = [c for c in fakes.calls if c[0] == "mux"][-1]
+    assert last[1] == [combined] and last[2] is None and isinstance(last[4], SubtitleInput)
+    assert (settings.completed_dir / "Epic.mkv").stat().st_size == 5000 + len(SRT_BYTES)
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert (entry.action, entry.original, entry.subtitle) == ("remux", (pt1, pt2), SUB_TITLE)
+    assert why in _status(state, pt1).note
+    assert _scratch_files(settings) == []
+
+
+@pytest.mark.parametrize("path", list(ABANDONED))
+def test_an_abandoned_encode_without_a_found_subtitle_is_left_alone_as_before(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, why, encodes, _ = ABANDONED[path]
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    abandon(fakes)
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert (summary.left_alone, summary.completed) == (1, 0)
+    record = _status(state, src)
+    assert record.status is Status.LEFT_ALONE and why in record.note
+    assert "subtitle" not in record.note
+    assert fakes.names().count("encode_full") == encodes
+    assert fakes.names().count("mux") == encodes  # no extra remux
+    assert not (settings.completed_dir / "manifest.csv").exists()
+
+
+def test_the_remux_reservation_leaves_room_for_the_subtitle(tmp_path: Path) -> None:
+    # room for the copy and an output of the video's size (1000 each) but not for the subtitle
+    settings = _settings(tmp_path, scratch_cap_bytes=3200, subtitle_max_bytes=5000)
+    src = _source(settings, "a.mp4", size=1000)
+    with _open_state(settings) as state:
+        rec = _plan(state, src, decision="remux", est=0)
+        _found_subtitle(settings, state, rec)
+        fakes = Fakes()
+        summary = _run(settings, state, fakes)
+        assert summary.stop_reason == "scratch full" and summary.completed == 0
+        assert "mux" not in fakes.names()
+        assert _status(state, src).status is Status.RETRY
+        assert _scratch_files(settings) == []
 
 
 def test_the_library_and_the_cache_are_never_written_when_a_subtitle_is_muxed(

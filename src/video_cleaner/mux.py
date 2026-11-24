@@ -13,6 +13,9 @@ from video_cleaner.tools import Tools
 
 MAX_TITLE_CHARS = 200
 _LANGUAGE = re.compile(r"[a-z]{3}")
+# Controls (Cc), line and paragraph separators (Zl, Zp) and invisible format characters such as
+# U+200B or the right-to-left override U+202E (Cf): none belongs in a track name.
+_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Zl", "Zp", "Cf"})
 
 
 @dataclass(frozen=True)
@@ -20,9 +23,9 @@ class SubtitleInput:
     """One subtitle file to add as a new track: its path, track name and ISO 639-2 language.
 
     The title and language reach mkvmerge as command-line arguments (never a shell string), but
-    they are still checked here: a title is 1 to 200 characters without control characters (the
-    resolver writes constants, so anything else is a damaged record), a language is three
-    lowercase letters.
+    they are still checked here: a title is 1 to 200 characters with at least one visible one and
+    no control, line-separator or invisible format characters (the resolver writes constants, so
+    anything else is a damaged record), a language is three lowercase letters.
     """
 
     path: Path
@@ -36,8 +39,12 @@ class SubtitleInput:
             )
         if not 1 <= len(self.title) <= MAX_TITLE_CHARS:
             raise ValueError(f"subtitle title must be 1 to {MAX_TITLE_CHARS} characters")
-        if any(unicodedata.category(ch) == "Cc" for ch in self.title):
-            raise ValueError("subtitle title must not contain control characters")
+        if any(unicodedata.category(ch) in _FORBIDDEN_CATEGORIES for ch in self.title):
+            raise ValueError(
+                "subtitle title must not contain control, format or line-separator characters"
+            )
+        if not self.title.strip():
+            raise ValueError("subtitle title must contain a visible character")
 
 
 def _subtitle_args(subtitle: SubtitleInput) -> tuple[str, ...]:

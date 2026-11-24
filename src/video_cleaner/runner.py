@@ -118,8 +118,6 @@ STOP_COMPLETED_NOT_WRITABLE = "completed folder not writable"
 STALE_NOTE = "source changed"
 # A FOUND subtitle whose cache file is gone, moved or changed: the file waits for a new one.
 SUBTITLE_STALE_NOTE = "subtitle cache missing or changed"
-# Appended to a LEFT_ALONE note when a found subtitle was not delivered with the file.
-SUBTITLE_NOT_ADDED = "; the found subtitle was not added"
 # A file that fails this many runs (tool failure, I/O error) is flagged instead of retried.
 MAX_ATTEMPTS = 3
 MANIFEST_NAME = "manifest.csv"
@@ -357,6 +355,21 @@ class _Work:
     reserved: list[Path] = field(default_factory=list)
 
 
+@dataclass
+class _FileJob:
+    """What `_work` has prepared for one file: the inputs of the remux and delivery steps."""
+
+    rec: FileRecord
+    sources: Sequence[Path]
+    expected: Sequence[tuple[int, float]]
+    source: Path  # the scratch copy (or the combined file of a multi-part group)
+    info: MediaInfo  # the probe of `source`
+    target: Path
+    work: _Work
+    subtitle: SubtitleInput | None
+    verify_args: dict[str, Any]
+
+
 def _delivery_part(target: Path) -> Path:
     return target.with_name(target.name + DELIVERY_SUFFIX)
 
@@ -478,17 +491,19 @@ class _Runner:
         )
 
     def _count_waiting(self) -> int:
-        """Queued files (pending or retry, in scope) that wait for their subtitle."""
+        """Queued files (pending or retry, in scope) this run skipped for their subtitle.
+
+        A file that was tried and downgraded to WANTED during the run is not one of them.
+        """
         waiting = self._waiting()
         if not waiting:
             return 0
-        return sum(
-            1
+        keys = (
+            (name_key(rec.path), rec.size, rec.mtime)
             for rec in self.state.records(Status.PENDING, Status.RETRY)
-            if rec.decision in _WORK_DECISIONS
-            and self.in_scope(rec)
-            and (name_key(rec.path), rec.size, rec.mtime) in waiting
+            if rec.decision in _WORK_DECISIONS and self.in_scope(rec)
         )
+        return sum(1 for key in keys if key in waiting and key not in self.attempted)
 
     def _next(self) -> FileRecord | None:
         waiting = self._waiting()
@@ -956,6 +971,59 @@ class _Runner:
         added = "" if subtitle is None else f" with subtitle {subtitle.title!r}"
         return _Outcome(Status.COMPLETED, f"{action}{added}: saved {saved} bytes", saved)
 
+    def _remux_and_deliver(self, job: _FileJob) -> _Outcome:
+        """Remux (and add the subtitle, when there is one), verify and deliver.
+
+        The one exception: a multi-part group without a subtitle is already remuxed by the
+        append. A remux is never size-gated, so a subtitle-only remux is delivered although it
+        is not smaller.
+        """
+        s, tools, rep, pipe = self.settings, self.tools, self.reporter, self.pipeline
+        rec, work, subtitle = job.rec, job.work, job.subtitle
+        if rec.parts and subtitle is None:
+            output = job.source  # the append already is the remux
+        else:
+            self._set(rec, Status.MUXING)
+            output = work.workdir / job.target.name
+            size = job.verify_args["original_size"]
+            # the subtitle is not in the estimate: leave room for the largest one allowed
+            margin = 0 if subtitle is None else s.subtitle_max_bytes
+            self._reserve((rec.size if size is None else size) + margin, output, work)
+            pipe.mux(tools, [job.source], None, output, rep, subtitle)
+        self._set(rec, Status.VERIFYING)
+        verdict = pipe.verify(tools, job.info, output, rep, encoded=False, **job.verify_args)
+        if not verdict.ok:
+            return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
+        return self._deliver(
+            rec,
+            job.sources,
+            job.expected,
+            output,
+            job.target,
+            action="remux",
+            crf=None,
+            vmaf=None,
+            subtitle=subtitle,
+        )
+
+    def _encode_abandoned(self, job: _FileJob, why: str, drop: tuple[Path, ...] = ()) -> _Outcome:
+        """The encode is not worth keeping: leave the file alone, or, when a found subtitle is
+        waiting to be delivered, deliver a subtitle-only remux of the original instead.
+
+        *drop* are the scratch files of the abandoned encode (its output and encoded video);
+        they are removed first so the remux has the space and the output name to itself.
+        """
+        if job.subtitle is None:
+            return _Outcome(Status.LEFT_ALONE, why)
+        for path in drop:
+            self.scratch.release(path)
+            if path in job.work.reserved:
+                job.work.reserved.remove(path)
+        _log.info("%s: %s; delivering a subtitle-only remux instead", job.rec.path, why)
+        outcome = self._remux_and_deliver(job)
+        note = f"{why}; subtitle-only remux instead: {outcome.note}"
+        return dataclasses.replace(outcome, note=note)
+
     def _work(self, rec: FileRecord, target: Path, work: _Work) -> _Outcome:
         s, tools, rep, pipe = self.settings, self.tools, self.reporter, self.pipeline
         sub = self._found_subtitle(rec)
@@ -1004,41 +1072,17 @@ class _Runner:
         if subtitle is not None:
             verify_args["expected_new_subtitles"] = 1
             verify_args["expected_subtitle_title"] = subtitle.title
+        job = _FileJob(rec, sources, expected, source, info, target, work, subtitle, verify_args)
         if action is Action.REMUX:
-            if rec.parts and subtitle is None:
-                output = source  # the append already is the remux
-            else:
-                self._set(rec, Status.MUXING)
-                output = work.workdir / target.name
-                self._reserve(
-                    original_size if original_size is not None else rec.size, output, work
-                )
-                pipe.mux(tools, [source], None, output, rep, subtitle)
-            self._set(rec, Status.VERIFYING)
-            verdict = pipe.verify(tools, info, output, rep, encoded=False, **verify_args)
-            if not verdict.ok:
-                return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
-            return self._deliver(
-                rec,
-                sources,
-                expected,
-                output,
-                target,
-                action="remux",
-                crf=None,
-                vmaf=None,
-                subtitle=subtitle,
-            )
-
-        unused = "" if subtitle is None else SUBTITLE_NOT_ADDED
+            return self._remux_and_deliver(job)
 
         self._set(rec, Status.ENCODING)
         search = pipe.search_crf(info, tools, s, work.workdir, rep)
         if search.projected_saving < s.min_saving:
-            return _Outcome(
-                Status.LEFT_ALONE,
+            return self._encode_abandoned(
+                job,
                 f"projected saving {search.projected_saving:.1%} at CRF {search.crf} is below "
-                f"the minimum {s.min_saving:.0%}{unused}",
+                f"the minimum {s.min_saving:.0%}",
             )
         # Both are estimated at the original's size: an encode is never kept if it is bigger.
         estimate = original_size if original_size is not None else rec.size
@@ -1053,11 +1097,15 @@ class _Runner:
         scores = pipe.window_scores(tools, info, output, s, work.workdir, rep)
         guard = quality.evaluate_guard(scores, s.guard_mean_floor, s.guard_worst_floor)
         if not guard.ok:
-            return _Outcome(Status.LEFT_ALONE, f"quality guard failed: {guard.reason}{unused}")
+            return self._encode_abandoned(
+                job, f"quality guard failed: {guard.reason}", drop=(output, encoded)
+            )
         verdict = pipe.verify(tools, info, output, rep, encoded=True, **verify_args)
         if not verdict.ok:
             if verdict.too_large:
-                return _Outcome(Status.LEFT_ALONE, f"output not kept: {verdict.reason}{unused}")
+                return self._encode_abandoned(
+                    job, f"output not kept: {verdict.reason}", drop=(output, encoded)
+                )
             return _Outcome(Status.FLAGGED, f"verify failed: {verdict.reason}")
         return self._deliver(
             rec,

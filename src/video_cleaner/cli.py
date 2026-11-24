@@ -533,7 +533,7 @@ def status(config: ConfigOption = None) -> None:
         _say(f"  {st.value:<12} {n}")
     _say(f"Multi-part members: {members} (counted with their group)")
     waiting = plan.waiting_on_subtitles
-    _say(f"Files waiting on subtitles: {waiting} (`run` skips them until a subtitle is found)")
+    _say(f"Files waiting on subtitles: {waiting} (`run` skips queued ones until one is found)")
     if acknowledged is None:
         _say("Plan acknowledged: no (run `plan`, review it, then `plan --ack`)")
     else:
