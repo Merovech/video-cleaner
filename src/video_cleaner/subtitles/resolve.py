@@ -623,7 +623,9 @@ class _Resolution:
         raw: bytes | None
         try:
             raw = read_bytes_capped(names.staged, self.settings.subtitle_max_bytes)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # No kept download. (Linux says "not a directory" when the cache path is a file;
+            # the probe before the download then reports the unwritable cache.)
             raw = None
         else:
             if raw is None:
