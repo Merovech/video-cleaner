@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from dataclasses import replace
 from datetime import timedelta
@@ -27,12 +28,17 @@ from resolve_fakes import (
     srt_text,
     writing,
 )
-from video_cleaner.atomicio import write_text_atomic
+from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.logging_setup import register_secrets
 from video_cleaner.state import SubtitleRecord, SubtitleStatus
 from video_cleaner.subtitles.align import AlignResult
 from video_cleaner.subtitles.models import QuotaInfo
-from video_cleaner.subtitles.opensubtitles import AuthError, ProviderError, QuotaExhausted
+from video_cleaner.subtitles.opensubtitles import (
+    AuthError,
+    DownloadNotCounted,
+    ProviderError,
+    QuotaExhausted,
+)
 from video_cleaner.subtitles.resolve import (
     CacheUnwritable,
     OnlineFailure,
@@ -162,9 +168,12 @@ def test_the_first_candidate_fails_alignment_and_the_second_is_accepted(tmp_path
     out = case.resolve()
     assert out.status is SubtitleStatus.FOUND
     assert out.tried_ids == (1,)
-    assert out.attempts == 1
+    assert out.attempts == 2  # every download counts toward the cap, the accepted one too
     assert out.cache_path is not None and out.cache_path.name.endswith("-opensubtitles-2.srt")
-    assert case.cache_files() == [out.cache_path.name]
+    # The accepted file, and the first candidate's download (rejected for a tunable reason).
+    assert case.cache_files() == sorted(
+        [out.cache_path.name, f"{key_of(case)}-opensubtitles-1.dl.srt"]
+    )
 
 
 def test_candidates_exhausted_gives_unavailable_with_a_reason(tmp_path: Path) -> None:
@@ -184,7 +193,10 @@ def test_candidates_exhausted_gives_unavailable_with_a_reason(tmp_path: Path) ->
     )
     assert "not a positive match" in out.reason
     assert len(out.reason) < 300
-    assert case.cache_files() == []
+    assert case.cache_files() == [  # both downloads are kept: an alignment rejection is tunable
+        f"{key_of(case)}-opensubtitles-1.dl.srt",
+        f"{key_of(case)}-opensubtitles-2.dl.srt",
+    ]
 
 
 def test_no_result_at_all_is_unavailable(tmp_path: Path) -> None:
@@ -584,7 +596,7 @@ def test_a_download_left_by_a_killed_run_is_adopted_without_another_download(
     assert case.cache_files() == [f"{key_of(case)}-opensubtitles-1.srt"]
 
 
-def test_a_left_download_that_fails_alignment_is_rejected_and_removed(tmp_path: Path) -> None:
+def test_a_left_download_that_fails_alignment_is_rejected_and_kept(tmp_path: Path) -> None:
     client = FakeClient(title_results=[result(1)], downloads={})
     case = online(tmp_path, client, failing(), movie_hash=None)
     case.cache_dir.mkdir()
@@ -594,8 +606,9 @@ def test_a_left_download_that_fails_alignment_is_rejected_and_removed(tmp_path: 
     out = case.resolve()
     assert out.status is SubtitleStatus.UNAVAILABLE
     assert out.tried_ids == (1,)
+    assert out.attempts == 0  # nothing was requested, so nothing counts
     assert client.download_calls == []
-    assert case.cache_files() == []
+    assert case.cache_files() == [f"{key_of(case)}-opensubtitles-1.dl.srt"]  # for a retry
 
 
 def test_a_finished_cache_file_is_adopted_with_no_download_and_no_alignment(
@@ -625,11 +638,13 @@ def test_a_cache_file_that_is_not_our_normalised_output_is_not_adopted(tmp_path:
     assert out.cache_path.read_text(encoding="utf-8") == normalised(srt_bytes(tag="fresh"))
 
 
-def test_the_intermediates_are_removed_after_a_rejection(tmp_path: Path) -> None:
+def test_the_aligner_output_is_removed_after_a_rejection_but_the_download_is_kept(
+    tmp_path: Path,
+) -> None:
     client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes()})
     case = online(tmp_path, client, failing(), movie_hash=None)
     case.resolve()
-    assert case.cache_files() == []
+    assert case.cache_files() == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
 
 
 def _failing_writes(
@@ -786,3 +801,262 @@ def test_a_stored_record_is_unchanged_in_its_key_fields(tmp_path: Path) -> None:
     out = case.resolve()
     assert isinstance(out, SubtitleRecord)
     assert (out.path, out.size, out.mtime) == (case.sub.path, case.sub.size, case.sub.mtime)
+
+
+# --- the per-file cap counts every download of the file, across calls ----------------------------
+
+
+def _kept(case: Case) -> list[str]:
+    return [name for name in case.cache_files() if name.endswith(".dl.srt")]
+
+
+def test_the_per_file_cap_spans_calls(tmp_path: Path) -> None:
+    """Day 1: two rejected downloads, then the allowance runs out. Day 2 may spend one more."""
+    day1 = FakeClient(
+        title_results=[result(1), result(2), result(3)],
+        downloads={
+            1: srt_bytes(tag="one"),
+            2: srt_bytes(tag="two"),
+            3: QuotaExhausted("used", None),
+        },
+    )
+    case = online(tmp_path, day1, failing(), failing(), movie_hash=None)
+    with pytest.raises(QuotaStop) as stopped:
+        case.resolve()
+    partial = stopped.value.record
+    assert (partial.tried_ids, partial.attempts) == ((1, 2), 2)
+
+    day2 = FakeClient(
+        title_results=[result(3), result(4), result(5)],
+        downloads={n: srt_bytes(tag=str(n)) for n in (3, 4, 5)},
+    )
+    case.ctx = replace(case.ctx, client=day2, align=FakeAligner(failing(), failing(), failing()))
+    out = case.resolve(partial)
+    assert day2.download_calls == [3]  # 2 + 1 = the cap of 3 for this file
+    assert out.status is SubtitleStatus.UNAVAILABLE
+    assert out.attempts == 3
+    assert "limit" in out.reason and "subs retry" in out.reason
+
+
+def test_a_file_at_its_cap_is_unavailable_without_a_download(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(9)], downloads={9: srt_bytes()})
+    case = online(tmp_path, client, movie_hash=None)
+    out = case.resolve(replace(case.sub, tried_ids=(1, 2, 3), attempts=3))
+    assert client.download_calls == []
+    assert out.status is SubtitleStatus.UNAVAILABLE
+    assert "per-file download limit (3)" in out.reason and "`subs retry` resets it" in out.reason
+    assert (out.tried_ids, out.attempts) == ((1, 2, 3), 3)
+
+
+def test_a_file_at_its_cap_still_adopts_a_kept_download_for_free(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(9)], downloads={})
+    case = online(tmp_path, client, movie_hash=None)
+    case.cache_dir.mkdir()
+    (case.cache_dir / f"{key_of(case)}-opensubtitles-9.dl.srt").write_text(
+        normalised(srt_bytes(tag="kept")), encoding="utf-8"
+    )
+    out = case.resolve(replace(case.sub, tried_ids=(1, 2, 3), attempts=3))
+    assert out.status is SubtitleStatus.FOUND
+    assert client.download_calls == []
+    assert out.attempts == 3  # adopting is free: it does not count
+
+
+def test_a_file_at_its_cap_still_adopts_a_finished_cache_file_for_free(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(9)], downloads={})
+    case = online(tmp_path, client, movie_hash=None)
+    case.cache_dir.mkdir()
+    (case.cache_dir / f"{key_of(case)}-opensubtitles-9.srt").write_bytes(
+        normalised(srt_bytes(tag="done")).encode("utf-8")
+    )
+    out = case.resolve(replace(case.sub, attempts=3))
+    assert out.status is SubtitleStatus.FOUND
+    assert client.download_calls == [] and case.aligner.calls == []
+    assert out.attempts == 3
+
+
+def test_a_kept_download_that_is_rejected_again_costs_nothing(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(1), result(2)], downloads={2: srt_bytes(tag="b")})
+    case = online(tmp_path, client, failing(), passthrough(), movie_hash=None)
+    case.cache_dir.mkdir()
+    (case.cache_dir / f"{key_of(case)}-opensubtitles-1.dl.srt").write_text(
+        normalised(srt_bytes(tag="kept")), encoding="utf-8"
+    )
+    out = case.resolve(replace(case.sub, attempts=2))
+    assert client.download_calls == [2]  # the kept one was free, so one download was still due
+    assert out.status is SubtitleStatus.FOUND
+    assert out.tried_ids == (1,)
+    assert out.attempts == 3  # one real download counted on top of the two from before
+
+
+# --- a candidate rejected for a tunable reason keeps its download --------------------------------
+
+
+def test_a_candidate_rejected_by_alignment_keeps_its_download(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes(tag="one")})
+    case = online(tmp_path, client, failing(), movie_hash=None)
+    out = case.resolve()
+    assert out.status is SubtitleStatus.UNAVAILABLE and out.tried_ids == (1,)
+    assert _kept(case) == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
+    assert case.cache_files() == _kept(case)  # and nothing else is left behind
+    kept = case.cache_dir / _kept(case)[0]
+    assert kept.read_text(encoding="utf-8") == normalised(srt_bytes(tag="one"))
+
+
+def test_a_retry_after_relaxing_the_alignment_threshold_needs_no_download(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes(tag="one")})
+    case = online(tmp_path, client, failing("score 0.5 is below the minimum"), movie_hash=None)
+    first = case.resolve()
+    assert first.status is SubtitleStatus.UNAVAILABLE and client.download_calls == [1]
+
+    reset = replace(first, status=SubtitleStatus.WANTED, tried_ids=(), attempts=0, reason="")
+    again = FakeClient(title_results=[result(1)], downloads={})  # a download would KeyError
+    case.ctx = replace(case.ctx, client=again, align=FakeAligner(passthrough()))
+    out = case.resolve(reset)
+    assert out.status is SubtitleStatus.FOUND
+    assert again.download_calls == []
+    assert out.attempts == 0
+    assert out.cache_path is not None
+    assert case.cache_files() == [out.cache_path.name]
+
+
+def test_a_candidate_rejected_for_its_length_keeps_its_download(tmp_path: Path) -> None:
+    client = FakeClient(
+        hash_results=[result(1, hash_match=True)], downloads={1: srt_bytes(30, start_s=5000.0)}
+    )
+    case = online(tmp_path, client)
+    assert case.resolve().status is SubtitleStatus.UNAVAILABLE
+    assert _kept(case) == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
+
+
+def test_a_candidate_rejected_for_too_few_cues_keeps_its_download(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes(30)})
+    case = online(tmp_path, client, writing(srt_text(25)), movie_hash=None)
+    assert case.resolve().status is SubtitleStatus.UNAVAILABLE
+    assert _kept(case) == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
+
+
+@pytest.mark.parametrize(
+    "raw", [HTML, srt_bytes(german=True), b"", b"garbage"], ids=["html", "german", "empty", "junk"]
+)
+def test_a_content_rejection_removes_the_download(tmp_path: Path, raw: bytes) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: raw})
+    case = online(tmp_path, client, movie_hash=None)
+    assert case.resolve().status is SubtitleStatus.UNAVAILABLE
+    assert case.cache_files() == []
+
+
+def test_an_aligned_output_that_is_not_english_removes_the_download(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(1)], downloads={1: srt_bytes(30)})
+    case = online(tmp_path, client, writing(srt_text(30, german=True)), movie_hash=None)
+    assert case.resolve().status is SubtitleStatus.UNAVAILABLE
+    assert case.cache_files() == []
+
+
+def test_no_more_downloads_are_kept_than_the_per_file_cap(tmp_path: Path) -> None:
+    client = FakeClient(title_results=[result(9)], downloads={9: srt_bytes(tag="nine")})
+    case = online(tmp_path, client, failing(), movie_hash=None, subtitle_candidates_per_file=2)
+    case.cache_dir.mkdir()
+    for older, age in ((1, 300), (2, 200), (3, 100)):
+        path = case.cache_dir / f"{key_of(case)}-opensubtitles-{older}.dl.srt"
+        path.write_text(normalised(srt_bytes(tag=str(older))), encoding="utf-8")
+        os.utime(path, (NOW.timestamp() - age, NOW.timestamp() - age))
+    other = case.cache_dir / "0000000000000000-opensubtitles-1.dl.srt"
+    other.write_text("another video's", encoding="utf-8")
+    case.resolve()
+    kept = _kept(case)
+    assert f"{key_of(case)}-opensubtitles-9.dl.srt" in kept  # the one just rejected
+    assert len([n for n in kept if n.startswith(key_of(case))]) == 2
+    assert other.exists()  # another video's files are never touched
+
+
+# --- which download failures blame the id ---------------------------------------------------------
+
+
+def test_a_download_that_never_reached_the_server_does_not_blame_the_id(tmp_path: Path) -> None:
+    client = FakeClient(
+        title_results=[result(1)], downloads={1: DownloadNotCounted("network is down")}
+    )
+    case = online(tmp_path, client, movie_hash=None)
+    with pytest.raises(OnlineFailure) as caught:
+        case.resolve()
+    stop = caught.value
+    assert stop.fatal is False
+    assert (stop.record.tried_ids, stop.record.attempts) == ((), 0)
+    assert stop.record.status is SubtitleStatus.WANTED
+    with pytest.raises(OnlineFailure):
+        case.resolve(stop.record)
+    assert client.download_calls == [1, 1]  # the same id is asked for again
+
+
+def test_a_not_counted_failure_after_a_rejection_keeps_only_the_rejected_id(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(
+        title_results=[result(1), result(2)],
+        downloads={1: srt_bytes(tag="one"), 2: DownloadNotCounted("network is down")},
+    )
+    case = online(tmp_path, client, failing(), movie_hash=None)
+    with pytest.raises(OnlineFailure) as caught:
+        case.resolve()
+    assert (caught.value.record.tried_ids, caught.value.record.attempts) == ((1,), 1)
+
+
+# --- a disk error after a download stops the resolution ------------------------------------------
+
+
+def test_an_os_error_in_the_aligner_after_a_download_stops_before_the_next_download(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(
+        title_results=[result(1), result(2), result(3)],
+        downloads={n: srt_bytes(tag=str(n)) for n in (1, 2, 3)},
+    )
+    case = online(tmp_path, client, raising(OSError("disk went away")), movie_hash=None)
+    with pytest.raises(CacheUnwritable) as caught:
+        case.resolve()
+    assert client.download_calls == [1]
+    record = caught.value.record
+    assert record.status is SubtitleStatus.WANTED
+    assert record.tried_ids == ()  # the id is not blamed: the disk failed, not the subtitle
+    assert record.attempts == 1  # but the download was spent
+    assert _kept(case) == [f"{key_of(case)}-opensubtitles-1.dl.srt"]
+
+
+def test_an_os_error_removing_the_old_aligned_file_stops_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeClient(
+        title_results=[result(1), result(2)], downloads={n: srt_bytes(tag=str(n)) for n in (1, 2)}
+    )
+    case = online(tmp_path, client, movie_hash=None)
+    real_unlink = Path.unlink
+
+    def broken(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self.name.endswith(".aligned.srt"):
+            raise PermissionError("denied")
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", broken)
+    with pytest.raises(CacheUnwritable):
+        case.resolve()
+    assert client.download_calls == [1]
+
+
+def test_an_os_error_reading_the_aligned_output_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = FakeClient(
+        title_results=[result(1), result(2)], downloads={n: srt_bytes(tag=str(n)) for n in (1, 2)}
+    )
+    case = online(tmp_path, client, movie_hash=None)
+    real = read_bytes_capped
+
+    def broken(path: Path, limit: int) -> bytes | None:
+        if path.name.endswith(".aligned.srt"):
+            raise PermissionError("denied")
+        return real(path, limit)
+
+    monkeypatch.setattr("video_cleaner.subtitles.resolve.read_bytes_capped", broken)
+    with pytest.raises(CacheUnwritable):
+        case.resolve()
+    assert client.download_calls == [1]

@@ -30,6 +30,8 @@ _SIDECAR_LANGUAGES = ("", ".en", ".eng")
 MAX_SIDECARS = 3
 _MAX_ENTRIES_EXAMINED = 100_000
 _STAGED_SUFFIX = ".dl.srt"
+_FINAL_SUFFIX = ".srt"
+_MAX_IDENT_DIGITS = 19  # a file id fits 63 bits
 _ALIGNED_SUFFIX = ".aligned.srt"
 _PROBE_PREFIX = ".probe-"
 
@@ -67,6 +69,71 @@ def discard(*paths: Path) -> None:
             path.unlink(missing_ok=True)
         except OSError:
             _log.debug("could not remove %r", path.name)
+
+
+def _own_files(cache_dir: Path, key: str, provider: str, suffix: str) -> list[tuple[int, Path]]:
+    """The regular files in *cache_dir* named ``<key>-<provider>-<number><suffix>``, with their
+    numbers. Names that do not fit exactly (an aligner output, another video's file) are not ours
+    to count; an unlistable folder gives an empty list."""
+    prefix = f"{key}-{provider}-"
+    found: list[tuple[int, Path]] = []
+    try:
+        with os.scandir(cache_dir) as entries:
+            for entry in itertools.islice(entries, _MAX_ENTRIES_EXAMINED):
+                name = entry.name
+                if not (name.startswith(prefix) and name.endswith(suffix)):
+                    continue
+                ident = name[len(prefix) : len(name) - len(suffix)]
+                if not (ident.isascii() and ident.isdecimal()) or len(ident) > _MAX_IDENT_DIGITS:
+                    continue
+                try:
+                    if is_link_like(entry) or not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                found.append((int(ident), cache_dir / name))
+    except OSError:
+        return []
+    return found
+
+
+def reusable_ids(cache_dir: Path, key: str, provider: str) -> set[int]:
+    """Ids of the candidates of one video that have a finished cache file or a kept download."""
+    return {
+        number
+        for suffix in (_FINAL_SUFFIX, _STAGED_SUFFIX)
+        for number, _ in _own_files(cache_dir, key, provider, suffix)
+    }
+
+
+def prune_kept_downloads(
+    cache_dir: Path, key: str, provider: str, *, keep: int, protect: Path | None = None
+) -> int:
+    """Remove the oldest kept downloads (``.dl.srt``) of one video beyond *keep*; *protect* (the
+    one just kept) is never removed. Returns how many were removed; a failure is only logged."""
+    kept = _own_files(cache_dir, key, provider, _STAGED_SUFFIX)
+    dated: list[tuple[float, Path]] = []
+    for _, path in kept:
+        try:
+            dated.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    dated.sort(key=lambda item: (item[0], item[1].name))
+    removed = 0
+    surplus = len(dated) - max(keep, 1)
+    for _, path in dated:
+        if surplus <= 0:
+            break
+        if protect is not None and path == protect:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            _log.debug("could not remove %r", path.name)
+            continue
+        surplus -= 1
+        removed += 1
+    return removed
 
 
 def check_cache_dir(settings: Settings, video: Path) -> Path:

@@ -15,11 +15,29 @@ download of a killed run is reused before anything is requested, and the downloa
 disk before the slow alignment starts. Nothing a server or a subtitle file says reaches a path,
 a command line or a log unescaped: cache names are built from a hash and a number only.
 
-Failure surface of `resolve_subtitle`: `QuotaStop` (the allowance is spent), `OnlineFailure`
-(a login or service failure; the record stays WANTED), `ToolNotFound` from the aligner, and
-`ValueError` for a bad argument or a cache folder that overlaps the library (bugs). A problem
-with one candidate (a rejected file, a disk error) is a rejection of that candidate, not an
-exception.
+A download is spent once per file and never twice: the ids that were downloaded and rejected are
+remembered, and `subtitle_candidates_per_file` bounds the downloads of the file in total, across
+calls (the record's `attempts` counts them). A download kept on disk is reused for free: a
+candidate rejected for a reason a setting can undo (the alignment score, the length, the cue
+count) keeps its normalised download, so that after `subs retry` and a looser setting it is
+checked again without another request; one rejected for its content (not English, not a
+subtitle) does not. Adopting a kept download or a finished cache file never counts.
+
+Failure surface of `resolve_subtitle`:
+
+- `QuotaStop`: the allowance is spent.
+- `OnlineFailure`: a login or service failure; the record stays WANTED. The id of a download
+  that failed after the server may have counted it is remembered; one that provably never
+  reached the server (`DownloadNotCounted`) is not.
+- `CacheUnwritable`: the cache folder cannot be written (before a download, or when the
+  download cannot be kept), or any disk error after a download (the aligner's folder, its
+  output, the result): nothing more may be downloaded, the download stays on disk and its id is
+  not blamed.
+- `ToolNotFound` from the aligner.
+- `ValueError` for a bad argument or a cache folder that overlaps the library (bugs).
+
+A problem with the candidate itself (a rejected file, a sidecar that cannot be read) is a
+rejection of that candidate, not an exception.
 """
 
 from __future__ import annotations
@@ -48,6 +66,8 @@ from video_cleaner.subtitles.cache import (
     check_cache_dir,
     discard,
     probe_writable,
+    prune_kept_downloads,
+    reusable_ids,
     sidecar_candidates,
     sweep_align_workdirs,
 )
@@ -61,6 +81,7 @@ from video_cleaner.subtitles.models import QuotaInfo
 from video_cleaner.subtitles.names import TitleYear, normalise_title, parse_library_name
 from video_cleaner.subtitles.opensubtitles import (
     AuthError,
+    DownloadNotCounted,
     ProviderError,
     QuotaExhausted,
     SubtitleResult,
@@ -184,6 +205,23 @@ def _bounded_ids(ids: Iterable[int]) -> list[int]:
     return sorted(last, key=lambda item: last[item])[-MAX_TRIED_IDS:]
 
 
+class _PerFileLimit(Exception):
+    """The file's downloads have reached `subtitle_candidates_per_file` (internal)."""
+
+
+@dataclass(frozen=True)
+class _Vetted:
+    """The outcome of vetting a candidate: its accepted cues, or why it was rejected.
+
+    *keep* says a rejection is one a setting can undo (alignment score, length, cue count), so
+    that a download of it is kept for a later retry; a content rejection is not kept.
+    """
+
+    cues: NormalisedSubtitle | None
+    detail: str
+    keep: bool = False
+
+
 class _Resolution:
     """One run of `resolve_subtitle` for one file."""
 
@@ -215,8 +253,8 @@ class _Resolution:
             reason="",
         )
         self.tried = _bounded_ids(sub.tried_ids)
+        # The downloads of this file so far, across calls: the per-file cap counts them all.
         self.attempts = sub.attempts
-        self.downloads = 0
         self.online_tried = 0
         self._probed = False
         self.notes: dict[str, list[str]] = {"sidecar": [], "local": [], "online": []}
@@ -320,13 +358,11 @@ class _Resolution:
             return None, "does not look English"
         return norm, ""
 
-    def _vet(
-        self, norm: NormalisedSubtitle, names: CacheNames, hash_exact: bool
-    ) -> tuple[NormalisedSubtitle | None, str]:
-        """Language, alignment and the checks on its result: (accepted cues, detail) or
-        (None, why not). An `OSError` and `ToolNotFound` propagate."""
+    def _vet(self, norm: NormalisedSubtitle, names: CacheNames, hash_exact: bool) -> _Vetted:
+        """Language, alignment and the checks on its result. An `OSError` and `ToolNotFound`
+        propagate."""
         if not looks_english(norm.cues):
-            return None, "does not look English"
+            return _Vetted(None, "does not look English")
         if hash_exact:
             final, detail = norm, "matched by hash; not aligned"
         else:
@@ -349,16 +385,18 @@ class _Resolution:
                 _safe(aligned.reason, 200),
             )
             if not aligned.ok or aligned.output is None:
-                return None, f"alignment failed: {aligned.reason}"
+                return _Vetted(None, f"alignment failed: {aligned.reason}", keep=True)
             reread, why = self._reread(aligned.output)
             if reread is None:
-                return None, f"aligned output rejected: {why}"
+                return _Vetted(None, f"aligned output rejected: {why}")
             final = reread
             if len(final.cues) * 100 < len(norm.cues) * MIN_CUES_KEPT_PERCENT:
-                return None, f"alignment kept only {len(final.cues)} of {len(norm.cues)} cues"
+                return _Vetted(
+                    None, f"alignment kept only {len(final.cues)} of {len(norm.cues)} cues", True
+                )
             detail = aligned.reason
         problem = self._length_problem(final)
-        return (None, problem) if problem else (final, detail)
+        return _Vetted(None, problem, keep=True) if problem else _Vetted(final, detail)
 
     def _adopt_final(
         self, provider: str, names: CacheNames, hash_exact: bool
@@ -406,11 +444,11 @@ class _Resolution:
             adopted = self._adopt_final(provider, names, False)
             if adopted is not None:
                 return adopted
-            final, detail = self._vet(norm, names, False)
-            if final is None:
-                self._reject_file(provider, detail)
+            vetted = self._vet(norm, names, False)
+            if vetted.cues is None:
+                self._reject_file(provider, vetted.detail)
                 return None
-            return self._accept(provider, names, final, False, detail)
+            return self._accept(provider, names, vetted.cues, False, vetted.detail)
         except SubtitleRejected as exc:
             self._reject_file(provider, str(exc))
             return None
@@ -440,15 +478,20 @@ class _Resolution:
             f"{reason} ({type(exc).__name__})",
         )
 
-    def _spend(self, file_id: int) -> None:
+    def _remember(self, file_id: int) -> None:
         """Remember that *file_id* was downloaded (and so possibly counted) and is not wanted
         again for this file."""
         self.tried = _bounded_ids([*self.tried, file_id])
+
+    def _count_download(self) -> None:
+        """Count one request to the download endpoint against the file's cap."""
         self.attempts += 1
 
     def _call(self, call: Callable[[], _T], spent: int | None = None) -> _T:
         """Run a client call, turning its errors into the resolver's stops. *spent* is the id
-        of a download: if it fails after the server may have counted it, the id is blamed."""
+        of a download: if it fails in a way that the server may have counted, the id is blamed
+        (and the download counts); a failure that never reached the server (`DownloadNotCounted`)
+        blames nothing."""
         try:
             return call()
         except QuotaExhausted as exc:
@@ -458,23 +501,33 @@ class _Resolution:
             reason = f"OpenSubtitles refused the login: {_safe(exc, 150)}"
             raise OnlineFailure(self._record(SubtitleStatus.WANTED, reason), reason, True) from None
         except ProviderError as exc:
-            if spent is not None:
-                self._spend(spent)
+            if spent is not None and not isinstance(exc, DownloadNotCounted):
+                self._remember(spent)
+                self._count_download()
             reason = f"OpenSubtitles failed: {_safe(exc, 150)}"
             raise OnlineFailure(
                 self._record(SubtitleStatus.WANTED, reason), reason, False
             ) from None
 
-    def _candidates(self, client: SubtitleClient) -> Iterator[tuple[SubtitleResult, bool]]:
+    def _capped(self, seen: set[int]) -> bool:
+        """Whether the file's downloads are used up and no kept or finished file of an id not
+        yet seen could still be adopted for free: a search could not be acted on."""
+        if self.attempts < self.settings.subtitle_candidates_per_file:
+            return False
+        return not (reusable_ids(self.cache_dir, self.key, "opensubtitles") - seen)
+
+    def _candidates(
+        self, client: SubtitleClient, seen: set[int]
+    ) -> Iterator[tuple[SubtitleResult, bool]]:
         """The results to try in order, each with whether it came from the hash search. The
         title search only runs when the hash search's results are used up."""
-        if self.movie_hash is not None:
+        if self.movie_hash is not None and not self._capped(seen):
             digest = self.movie_hash
             _log.info("%s: searching OpenSubtitles by file hash", self.label)
             for item in self._call(lambda: client.search(moviehash=digest, title=None, year=None)):
                 yield item, True
         target = self.target
-        if self.downloads >= self.settings.subtitle_candidates_per_file:
+        if self._capped(seen):
             return  # the downloads are used up: a second search could not be acted on
         if not target.is_episode and normalise_title(target.title):
             _log.info("%s: searching OpenSubtitles by title", self.label)
@@ -501,10 +554,7 @@ class _Resolution:
 
     def _online(self, client: SubtitleClient) -> SubtitleRecord:
         seen = set(self.tried)
-        limit = self.settings.subtitle_candidates_per_file
-        for item, from_hash in self._candidates(client):
-            if self.downloads >= limit:
-                break
+        for item, from_hash in self._candidates(client, seen):
             problem = self._drop_reason(item, from_hash, seen)
             if problem:
                 _log.debug(
@@ -519,6 +569,9 @@ class _Resolution:
             self.online_tried += 1
             try:
                 found = self._online_candidate(client, item, from_hash and item.hash_match)
+            except _PerFileLimit:
+                self.online_tried -= 1
+                break
             except OSError as exc:
                 _log.warning("%s: a file error stopped one candidate: %s", self.label, _safe(exc))
                 self._note("online", f"file error ({type(exc).__name__})")
@@ -528,6 +581,8 @@ class _Resolution:
         return self._record(SubtitleStatus.UNAVAILABLE, self._unavailable_reason())
 
     def _download(self, client: SubtitleClient, item: SubtitleResult) -> bytes:
+        if self.attempts >= self.settings.subtitle_candidates_per_file:
+            raise _PerFileLimit
         quota = client.last_quota()
         if quota is not None and not quota_usable(quota, self.ctx.now()):
             raise QuotaStop(
@@ -539,11 +594,12 @@ class _Resolution:
             except OSError as exc:
                 raise self._unwritable(exc) from None
             self._probed = True
-        self.downloads += 1
-        return self._call(
+        data = self._call(
             lambda: client.download(item, max_bytes=self.settings.subtitle_max_bytes),
             spent=item.file_id,
         )
+        self._count_download()
+        return data
 
     def _online_candidate(
         self, client: SubtitleClient, item: SubtitleResult, hash_exact: bool
@@ -566,7 +622,7 @@ class _Resolution:
             raw = None
         else:
             if raw is None:
-                self._reject_online(item.file_id, names, "kept download is too large")
+                self._reject_online(item.file_id, names, "kept download is too large", keep=False)
                 return None
             _log.info("%s: reusing the download a stopped run kept (no request)", self.label)
         downloaded = raw is None
@@ -575,31 +631,54 @@ class _Resolution:
         try:
             norm = self._normalise(raw)
         except SubtitleRejected as exc:
-            self._reject_online(item.file_id, names, str(exc))
+            self._reject_online(item.file_id, names, str(exc), keep=False)
             return None
         if downloaded:
             try:
                 write_text_atomic(names.staged, norm.srt, fsync=True)
             except OSError as exc:
                 # The download is spent and cannot be resumed, so it must not be spent again.
-                self._spend(item.file_id)
+                self._remember(item.file_id)
                 raise self._unwritable(exc) from None
         try:
-            final, detail = self._vet(norm, names, hash_exact)
-            if final is None:
-                self._reject_online(item.file_id, names, detail)
+            vetted = self._vet(norm, names, hash_exact)
+            if vetted.cues is None:
+                self._reject_online(item.file_id, names, vetted.detail, keep=vetted.keep)
                 return None
-            record = self._accept("opensubtitles", names, final, hash_exact, detail)
+            record = self._accept("opensubtitles", names, vetted.cues, hash_exact, vetted.detail)
+        except OSError as exc:
+            # A disk error after a download: the download stays on disk, the id is not blamed,
+            # and nothing more is downloaded in this call.
+            raise self._unwritable(exc) from None
         finally:
             discard(names.aligned)
         discard(names.staged)
         return record
 
-    def _reject_online(self, file_id: int, names: CacheNames, reason: str) -> None:
-        self._spend(file_id)
+    def _reject_online(self, file_id: int, names: CacheNames, reason: str, *, keep: bool) -> None:
+        """Remember *file_id* as rejected. Its download is kept for a retry when *keep* (the
+        reason is one a setting can undo) and the file's kept downloads stay within the cap."""
+        self._remember(file_id)
         self._note("online", reason)
-        discard(names.staged, names.aligned)
-        _log.info("%s: rejected OpenSubtitles file %d: %s", self.label, file_id, _safe(reason))
+        kept = keep and names.staged.exists()
+        if not kept:
+            discard(names.staged)
+        discard(names.aligned)
+        if kept:
+            prune_kept_downloads(
+                self.cache_dir,
+                self.key,
+                "opensubtitles",
+                keep=self.settings.subtitle_candidates_per_file,
+                protect=names.staged,
+            )
+        _log.info(
+            "%s: rejected OpenSubtitles file %d: %s%s",
+            self.label,
+            file_id,
+            _safe(reason),
+            " (download kept)" if kept else "",
+        )
 
     def _unavailable_reason(self) -> str:
         def part(name: str) -> str:
@@ -610,6 +689,9 @@ class _Resolution:
         if self.notes["online"]:
             online += f" (rejected: {'; '.join(self.notes['online'])})"
         text = f"no English subtitle found: {part('sidecar')}, {part('local')}, {online}"
+        limit = self.settings.subtitle_candidates_per_file
+        if self.attempts >= limit:
+            text = f"per-file download limit ({limit}) reached (`subs retry` resets it); {text}"
         if len(text) > MAX_REASON_CHARS:
             text = text[: MAX_REASON_CHARS - 3] + "..."
         _log.info("%s: %s", self.label, text)
