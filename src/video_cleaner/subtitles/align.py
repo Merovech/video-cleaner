@@ -67,7 +67,7 @@ _SPEECH_FRAMES_PER_S = 100.0
 _EXCERPT_LINES = 10
 _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
-_WORK_PREFIX = ".align-"
+WORK_PREFIX = ".align-"
 # Environment variables that are not passed to ffsubsync: this tool's OpenSubtitles credentials
 # and, as a net for others, any name with one of these words in it (compared in upper case).
 _OPENSUBTITLES_ENV_PREFIX = "VC_OPENSUBTITLES_"
@@ -382,7 +382,7 @@ def align_subtitle(
             ok=True, reason="matched this file by hash; no alignment needed", output=subtitle
         )
     out.parent.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=_WORK_PREFIX, dir=out.parent))
+    work = Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=out.parent))
     try:
         shutil.copyfile(subtitle, work / _STAGED_INPUT)
         result, text, why = _run(tools, media, work, media.name, settings, reporter, timeout_s)

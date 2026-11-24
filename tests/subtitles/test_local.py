@@ -421,10 +421,10 @@ def test_a_windows_reparse_point_counts_as_a_link() -> None:
 
     symlink = types.SimpleNamespace(is_symlink=lambda: True)
 
-    assert local._is_link_like(cast("os.DirEntry[str]", symlink)) is True
-    assert local._is_link_like(cast("os.DirEntry[str]", reparse)) is True
-    assert local._is_link_like(cast("os.DirEntry[str]", plain)) is False
-    assert local._is_link_like(cast("os.DirEntry[str]", posix)) is False
+    assert local.is_link_like(cast("os.DirEntry[str]", symlink)) is True
+    assert local.is_link_like(cast("os.DirEntry[str]", reparse)) is True
+    assert local.is_link_like(cast("os.DirEntry[str]", plain)) is False
+    assert local.is_link_like(cast("os.DirEntry[str]", posix)) is False
 
 
 # ---------------------------------------------------------------- matching

@@ -1,0 +1,699 @@
+"""Resolving one subtitle for one file: sidecar, then local folders, then OpenSubtitles.
+
+`resolve_subtitle` takes a file's `SubtitleRecord` and returns the new one; it does not touch
+the state database (the caller stores the record). Every candidate, wherever it comes from,
+goes through the same gauntlet: it is normalised to plain cues, its text must look English,
+it is aligned to the video's audio (skipped only for a hash match, which says the subtitle was
+made for this very file), and the result is read back and checked again (still English, at
+least 95% of the cues, not longer than the video can hold). The text that is cached is always
+our own normalised SRT of the accepted result, never a file as it was downloaded or as
+ffsubsync wrote it. A wrong subtitle is worse than none, so every doubt is a rejection.
+
+OpenSubtitles downloads are the scarce thing (the allowance is counted on the download
+request), so an online candidate is handled in a quota-safe order: a finished cache file or the
+download of a killed run is reused before anything is requested, and the download is written to
+disk before the slow alignment starts. Nothing a server or a subtitle file says reaches a path,
+a command line or a log unescaped: cache names are built from a hash and a number only.
+
+Failure surface of `resolve_subtitle`: `QuotaStop` (the allowance is spent), `OnlineFailure`
+(a login or service failure; the record stays WANTED), `ToolNotFound` from the aligner, and
+`ValueError` for a bad argument or a cache folder that overlaps the library (bugs). A problem
+with one candidate (a rejected file, a disk error) is a rejection of that candidate, not an
+exception.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import logging
+import math
+import os
+import shutil
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol, TypeVar
+
+from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
+from video_cleaner.config import Settings
+from video_cleaner.logging_setup import redact
+from video_cleaner.paths import is_under
+from video_cleaner.probe import MediaInfo
+from video_cleaner.progress import Reporter
+from video_cleaner.state import FileRecord, SubtitleRecord, SubtitleStatus
+from video_cleaner.subtitles.align import WORK_PREFIX, AlignResult, align_subtitle
+from video_cleaner.subtitles.language import looks_english
+from video_cleaner.subtitles.local import (
+    LocalSubtitle,
+    is_link_like,
+    match_local,
+    title_year_confidence,
+)
+from video_cleaner.subtitles.models import QuotaInfo
+from video_cleaner.subtitles.names import TitleYear, normalise_title, parse_library_name
+from video_cleaner.subtitles.opensubtitles import (
+    AuthError,
+    ProviderError,
+    QuotaExhausted,
+    SubtitleResult,
+)
+from video_cleaner.subtitles.quota import quota_usable
+from video_cleaner.subtitles.textfmt import NormalisedSubtitle, SubtitleRejected, normalise_subtitle
+from video_cleaner.tools import Tools
+
+_log = logging.getLogger("video_cleaner.subtitles.resolve")
+_T = TypeVar("_T")
+
+SIDECAR_EXTENSIONS = (".srt", ".ass", ".vtt")
+_SIDECAR_LANGUAGES = ("", ".en", ".eng")
+MAX_SIDECARS = 3
+_MAX_ENTRIES_EXAMINED = 100_000
+#: The most ids kept in a record's `tried_ids` (the state database reads back a longer list as
+#: empty), keeping the latest.
+MAX_TRIED_IDS = 50
+_MAX_FILE_ID = 2**63 - 1
+#: An aligned subtitle must keep at least this share of the cues it was given.
+MIN_CUES_KEPT_PERCENT = 95
+#: A subtitle may end this much (factor, plus seconds) after the video does, for credits and
+#: for a cut that differs a little; a hash match on the wrong cut is caught by this alone.
+DURATION_FACTOR = 1.10
+DURATION_SLACK_S = 120.0
+MAX_REASON_CHARS = 300
+_SHORT_REASON_CHARS = 70
+_PROVENANCE = {
+    "sidecar": "English (sidecar)",
+    "local": "English (local file)",
+    "opensubtitles": "English (OpenSubtitles)",
+}
+_STAGED_SUFFIX = ".dl.srt"
+_ALIGNED_SUFFIX = ".aligned.srt"
+NO_CREDENTIALS = "unavailable: no OpenSubtitles credentials"
+MULTI_PART = "multi-part film: subtitle lookup needs the parts combined (not supported yet)"
+
+
+class SubtitleClient(Protocol):
+    """What the resolver uses of `OpenSubtitlesClient` (a fake can stand in for it)."""
+
+    def search(
+        self, *, moviehash: str | None, title: str | None, year: int | None
+    ) -> list[SubtitleResult]: ...
+
+    def download(self, result: SubtitleResult, *, max_bytes: int) -> bytes: ...
+
+    def last_quota(self) -> QuotaInfo | None: ...
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class ResolveContext:
+    """Everything `resolve_subtitle` needs besides the file: settings, tools, the console,
+    the indexed local subtitle folders, the OpenSubtitles client (None when there are no
+    credentials: the online step is skipped), the aligner and the clock (both replaceable)."""
+
+    settings: Settings
+    tools: Tools
+    reporter: Reporter
+    local_index: Sequence[LocalSubtitle]
+    client: SubtitleClient | None
+    align: Callable[..., AlignResult] = align_subtitle
+    now: Callable[[], datetime] = field(default=_utc_now)
+
+
+class ResolveStop(Exception):
+    """The resolution stopped before an outcome. *record* is the partial `SubtitleRecord`
+    (still WANTED, with the `tried_ids` and `attempts` so far) and *reason* says why."""
+
+    def __init__(self, record: SubtitleRecord, reason: str) -> None:
+        super().__init__(reason)
+        self.record = record
+        self.reason = reason
+
+
+class QuotaStop(ResolveStop):
+    """The OpenSubtitles download allowance is spent; *reset_at* is when it renews, if known."""
+
+    def __init__(self, record: SubtitleRecord, reset_at: datetime | None) -> None:
+        when = f"; it renews at {reset_at:%Y-%m-%d %H:%M} UTC" if reset_at else ""
+        super().__init__(record, f"the OpenSubtitles download allowance is used up{when}")
+        self.reset_at = reset_at
+
+
+class OnlineFailure(ResolveStop):
+    """OpenSubtitles failed. *fatal* is a refused login: the job must stop using the client."""
+
+    def __init__(self, record: SubtitleRecord, reason: str, fatal: bool) -> None:
+        super().__init__(record, reason)
+        self.fatal = fatal
+
+
+def _safe(value: object, limit: int = _SHORT_REASON_CHARS) -> str:
+    """*value* as one short line of printable ASCII with credentials masked, for logs and
+    reasons: the server's and the subtitle's text is never trusted to be tidy."""
+    text = ascii(redact(str(value)))[1:-1]
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _bounded_ids(ids: Iterable[int]) -> list[int]:
+    """*ids* without repeats, in order of last use, at most `MAX_TRIED_IDS` of the latest."""
+    last = {item: position for position, item in enumerate(ids)}
+    return sorted(last, key=lambda item: last[item])[-MAX_TRIED_IDS:]
+
+
+def _discard(*paths: Path) -> None:
+    """Remove the resolver's own intermediate files; a failure is not worth an error."""
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            _log.debug("could not remove %r", path.name)
+
+
+def _check_cache_dir(settings: Settings) -> Path:
+    """The cache folder, after checking it is absolute and apart from the library.
+
+    A violation is a configuration bug, so it raises `ValueError` before anything is written.
+    """
+    cache = settings.subtitle_cache_dir
+    if not cache.is_absolute():
+        raise ValueError(f"subtitle_cache_dir must be an absolute path, not {str(cache)!r}")
+    root = settings.library_root
+    if is_under(cache, root) or is_under(root, cache):
+        raise ValueError(
+            f"subtitle_cache_dir {str(cache)!r} overlaps the library {str(root)!r}; "
+            "nothing is ever written to the library"
+        )
+    return cache
+
+
+def sidecar_candidates(path: Path) -> list[Path]:
+    """Subtitle files that sit beside *path*, named like it: same folder, same stem (any case),
+    an optional ".en" or ".eng", and an extension from `SIDECAR_EXTENSIONS`.
+
+    Sorted by name, at most `MAX_SIDECARS`, regular files only (never a link). The folder is
+    only listed; one that cannot be listed gives an empty list.
+    """
+    stem = path.stem.lower()
+    wanted = {f"{stem}{lang}{ext}" for lang in _SIDECAR_LANGUAGES for ext in SIDECAR_EXTENSIONS}
+    found: list[str] = []
+    try:
+        with os.scandir(path.parent) as entries:
+            for entry in itertools.islice(entries, _MAX_ENTRIES_EXAMINED):
+                if entry.name.lower() not in wanted:
+                    continue
+                try:
+                    if is_link_like(entry) or not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                found.append(entry.name)
+    except OSError:
+        return []
+    return [path.parent / name for name in sorted(found)[:MAX_SIDECARS]]
+
+
+def sweep_align_workdirs(cache_dir: Path) -> int:
+    """Remove the work folders ffsubsync runs left in *cache_dir* (killed runs) and count them.
+
+    Only direct children that are real folders named with the align work prefix are removed;
+    files, links, junctions and everything else stay. A folder that cannot be removed is logged
+    and skipped.
+    """
+    folders: list[str] = []
+    try:
+        with os.scandir(cache_dir) as entries:
+            for entry in itertools.islice(entries, _MAX_ENTRIES_EXAMINED):
+                try:
+                    if (
+                        entry.name.startswith(WORK_PREFIX)
+                        and entry.is_dir(follow_symlinks=False)
+                        and not is_link_like(entry)
+                    ):
+                        folders.append(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    removed = 0
+    for folder in folders:
+        try:
+            shutil.rmtree(folder)
+        except OSError as exc:
+            _log.warning("could not remove an old align work folder: %s", type(exc).__name__)
+            continue
+        removed += 1
+    return removed
+
+
+def _cached_result_is_valid(sub: SubtitleRecord, cache_dir: Path, max_bytes: int) -> bool:
+    """Whether a FOUND record's cache file is still there, inside the cache, and unchanged."""
+    path = sub.cache_path
+    if path is None or not sub.sha256 or not path.is_absolute() or not is_under(path, cache_dir):
+        return False
+    try:
+        data = read_bytes_capped(path, max_bytes)
+    except OSError:
+        return False
+    return data is not None and hashlib.sha256(data).hexdigest() == sub.sha256
+
+
+@dataclass(frozen=True)
+class _Names:
+    """The cache files of one candidate; the name is a hash and a number, never text."""
+
+    final: Path
+    staged: Path
+    aligned: Path
+
+
+class _Resolution:
+    """One run of `resolve_subtitle` for one file."""
+
+    def __init__(
+        self,
+        rec: FileRecord,
+        info: MediaInfo,
+        movie_hash: str | None,
+        sub: SubtitleRecord,
+        ctx: ResolveContext,
+        cache_dir: Path,
+    ) -> None:
+        self.rec = rec
+        self.info = info
+        self.movie_hash = movie_hash
+        self.ctx = ctx
+        self.settings = ctx.settings
+        self.cache_dir = cache_dir
+        text = f"{sub.path}|{sub.size}|{sub.mtime}"
+        self.key = hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+        self.label = _safe(rec.path.name, 80)
+        self.base = replace(
+            sub,
+            status=SubtitleStatus.WANTED,
+            provider="",
+            cache_path=None,
+            sha256="",
+            provenance="",
+            hash_exact=False,
+            reason="",
+        )
+        self.tried = _bounded_ids(sub.tried_ids)
+        self.attempts = sub.attempts
+        self.downloads = 0
+        self.online_tried = 0
+        self.notes: dict[str, list[str]] = {"sidecar": [], "local": [], "online": []}
+        self._target: TitleYear | None = None
+
+    def run(self) -> SubtitleRecord:
+        if len(self.rec.parts) > 1:
+            _log.info("%s: a multi-part film; no subtitle lookup", self.label)
+            return self._record(SubtitleStatus.UNCLEAR, MULTI_PART)
+        for path in sidecar_candidates(self.rec.path):
+            found = self._file_candidate(path, "sidecar")
+            if found is not None:
+                return found
+        local = match_local(self.ctx.local_index, self.target)
+        if local is not None:
+            _log.info("%s: a local file matches (confidence %.2f)", self.label, local.confidence)
+            found = self._file_candidate(local.path, "local")
+            if found is not None:
+                return found
+        client = self.ctx.client
+        if client is None:
+            _log.info("%s: no OpenSubtitles client; the online step is skipped", self.label)
+            return self._record(SubtitleStatus.WANTED, NO_CREDENTIALS)
+        return self._online(client)
+
+    @property
+    def target(self) -> TitleYear:
+        if self._target is None:
+            self._target = parse_library_name(self.rec.path)
+        return self._target
+
+    def _record(self, status: SubtitleStatus, reason: str) -> SubtitleRecord:
+        return replace(
+            self.base,
+            status=status,
+            reason=reason,
+            tried_ids=tuple(self.tried),
+            attempts=self.attempts,
+        )
+
+    def _note(self, source: str, reason: str) -> None:
+        self.notes[source].append(_safe(reason))
+
+    def _names(self, provider: str, ident: str) -> _Names:
+        stem = f"{self.key}-{provider}-{ident}"
+        return _Names(
+            self.cache_dir / f"{stem}.srt",
+            self.cache_dir / f"{stem}{_STAGED_SUFFIX}",
+            self.cache_dir / f"{stem}{_ALIGNED_SUFFIX}",
+        )
+
+    def _found(
+        self, provider: str, names: _Names, data: bytes, hash_exact: bool, detail: str
+    ) -> SubtitleRecord:
+        _log.info("%s: accepted the %s subtitle (%s)", self.label, provider, _safe(detail))
+        return replace(
+            self._record(SubtitleStatus.FOUND, _safe(detail, 200)),
+            provider=provider,
+            cache_path=names.final,
+            sha256=hashlib.sha256(data).hexdigest(),
+            provenance=_PROVENANCE[provider],
+            hash_exact=hash_exact,
+        )
+
+    def _normalise(self, raw: bytes) -> NormalisedSubtitle:
+        """Normalise *raw*; `SubtitleRejected` unless the result is usable and writable."""
+        norm = normalise_subtitle(
+            raw,
+            max_bytes=self.settings.subtitle_max_bytes,
+            min_cues=self.settings.subtitle_min_cues,
+        )
+        try:
+            size = len(norm.srt.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise SubtitleRejected("subtitle text cannot be written as UTF-8") from None
+        if size > self.settings.subtitle_max_bytes:
+            raise SubtitleRejected(
+                f"normalised subtitle is larger than {self.settings.subtitle_max_bytes} bytes"
+            )
+        return norm
+
+    def _length_problem(self, norm: NormalisedSubtitle) -> str:
+        """Why the subtitle cannot belong to this video by its length, or "" if it can."""
+        duration = self.info.duration_s
+        if not (math.isfinite(duration) and duration > 0):
+            return "the video's length is unknown, so the subtitle's length cannot be checked"
+        limit_s = duration * DURATION_FACTOR + DURATION_SLACK_S
+        end_s = max((cue.end_ms for cue in norm.cues), default=0) / 1000.0
+        if end_s > limit_s:
+            return f"the subtitle runs to {end_s:.0f} s but the video allows {limit_s:.0f} s"
+        return ""
+
+    def _reread(self, path: Path) -> tuple[NormalisedSubtitle | None, str]:
+        """The aligner's output, read back and normalised again, or (None, why not)."""
+        try:
+            raw = read_bytes_capped(path, self.settings.subtitle_max_bytes)
+        except FileNotFoundError:
+            return None, "no output file"
+        if raw is None:
+            return None, f"larger than {self.settings.subtitle_max_bytes} bytes"
+        try:
+            norm = self._normalise(raw)
+        except SubtitleRejected as exc:
+            return None, str(exc)
+        if not looks_english(norm.cues):
+            return None, "does not look English"
+        return norm, ""
+
+    def _vet(
+        self, norm: NormalisedSubtitle, names: _Names, hash_exact: bool
+    ) -> tuple[NormalisedSubtitle | None, str]:
+        """Language, alignment and the checks on its result: (accepted cues, detail) or
+        (None, why not). An `OSError` and `ToolNotFound` propagate."""
+        if not looks_english(norm.cues):
+            return None, "does not look English"
+        if hash_exact:
+            final, detail = norm, "matched by hash; not aligned"
+        else:
+            if not names.staged.exists():
+                write_text_atomic(names.staged, norm.srt)
+            names.aligned.unlink(missing_ok=True)
+            aligned = self.ctx.align(
+                self.ctx.tools,
+                self.info.path,
+                names.staged,
+                names.aligned,
+                self.settings,
+                self.ctx.reporter,
+                hash_exact=False,
+            )
+            _log.info(
+                "%s: alignment %s: %s",
+                self.label,
+                "accepted" if aligned.ok else "rejected",
+                _safe(aligned.reason, 200),
+            )
+            if not aligned.ok or aligned.output is None:
+                return None, f"alignment failed: {aligned.reason}"
+            reread, why = self._reread(aligned.output)
+            if reread is None:
+                return None, f"aligned output rejected: {why}"
+            final = reread
+            if len(final.cues) * 100 < len(norm.cues) * MIN_CUES_KEPT_PERCENT:
+                return None, f"alignment kept only {len(final.cues)} of {len(norm.cues)} cues"
+            detail = aligned.reason
+        problem = self._length_problem(final)
+        return (None, problem) if problem else (final, detail)
+
+    def _adopt_final(self, provider: str, names: _Names, hash_exact: bool) -> SubtitleRecord | None:
+        """The record for a finished cache file of this candidate, if it is still our own
+        normalised output and still fits the video; None otherwise (it will be overwritten)."""
+        try:
+            data = read_bytes_capped(names.final, self.settings.subtitle_max_bytes)
+        except OSError:
+            return None
+        if data is None:
+            return None
+        try:
+            norm = self._normalise(data)
+        except SubtitleRejected:
+            return None
+        if norm.srt.encode("utf-8") != data or not looks_english(norm.cues):
+            return None
+        if self._length_problem(norm):
+            return None
+        return self._found(provider, names, data, hash_exact, "reused an earlier result")
+
+    def _accept(
+        self,
+        provider: str,
+        names: _Names,
+        final: NormalisedSubtitle,
+        hash_exact: bool,
+        detail: str,
+    ) -> SubtitleRecord:
+        write_text_atomic(names.final, final.srt)
+        return self._found(provider, names, final.srt.encode("utf-8"), hash_exact, detail)
+
+    def _file_candidate(self, path: Path, provider: str) -> SubtitleRecord | None:
+        self.ctx.reporter.stage(f"subtitle: checking {provider} file {_safe(path.name, 60)}")
+        names: _Names | None = None
+        try:
+            raw = read_bytes_capped(path, self.settings.subtitle_max_bytes)
+            if raw is None:
+                self._reject_file(provider, "larger than the size limit")
+                return None
+            norm = self._normalise(raw)
+            ident = hashlib.sha256(norm.srt.encode("utf-8")).hexdigest()[:12]
+            names = self._names(provider, ident)
+            adopted = self._adopt_final(provider, names, False)
+            if adopted is not None:
+                return adopted
+            final, detail = self._vet(norm, names, False)
+            if final is None:
+                self._reject_file(provider, detail)
+                return None
+            return self._accept(provider, names, final, False, detail)
+        except SubtitleRejected as exc:
+            self._reject_file(provider, str(exc))
+            return None
+        except OSError as exc:
+            self._reject_file(provider, f"file error ({type(exc).__name__})")
+            return None
+        finally:
+            if names is not None:
+                _discard(names.staged, names.aligned)
+
+    def _reject_file(self, provider: str, reason: str) -> None:
+        _log.info("%s: rejected the %s file: %s", self.label, provider, _safe(reason))
+        self._note(provider, reason)
+
+    def _call(self, call: Callable[[], _T]) -> _T:
+        """Run a client call, turning its errors into the resolver's stops."""
+        try:
+            return call()
+        except QuotaExhausted as exc:
+            record = self._record(SubtitleStatus.WANTED, "OpenSubtitles quota used up")
+            raise QuotaStop(record, exc.reset_at) from None
+        except AuthError as exc:
+            reason = f"OpenSubtitles refused the login: {_safe(exc, 150)}"
+            raise OnlineFailure(self._record(SubtitleStatus.WANTED, reason), reason, True) from None
+        except ProviderError as exc:
+            reason = f"OpenSubtitles failed: {_safe(exc, 150)}"
+            raise OnlineFailure(
+                self._record(SubtitleStatus.WANTED, reason), reason, False
+            ) from None
+
+    def _candidates(self, client: SubtitleClient) -> Iterator[tuple[SubtitleResult, bool]]:
+        """The results to try in order, each with whether it came from the hash search. The
+        title search only runs when the hash search's results are used up."""
+        if self.movie_hash is not None:
+            digest = self.movie_hash
+            _log.info("%s: searching OpenSubtitles by file hash", self.label)
+            for item in self._call(lambda: client.search(moviehash=digest, title=None, year=None)):
+                yield item, True
+        target = self.target
+        if self.downloads >= self.settings.subtitle_candidates_per_file:
+            return  # the downloads are used up: a second search could not be acted on
+        if not target.is_episode and normalise_title(target.title):
+            _log.info("%s: searching OpenSubtitles by title", self.label)
+            for item in self._call(
+                lambda: client.search(moviehash=None, title=target.title, year=target.year)
+            ):
+                yield item, False
+
+    def _drop_reason(self, item: SubtitleResult, from_hash: bool, seen: set[int]) -> str:
+        """Why *item* is not downloaded (it costs nothing and is not remembered), or ""."""
+        if not 0 <= item.file_id <= _MAX_FILE_ID:
+            return "unusable id"
+        if item.file_id in seen:
+            return "already tried"
+        if item.foreign_parts_only:
+            return "foreign parts only"
+        if not (from_hash and item.hash_match):
+            as_found = TitleYear(item.title, item.year, False, ())
+            if title_year_confidence(as_found, self.target) is None:
+                return "title or year does not match the file"
+        return ""
+
+    def _online(self, client: SubtitleClient) -> SubtitleRecord:
+        seen = set(self.tried)
+        limit = self.settings.subtitle_candidates_per_file
+        for item, from_hash in self._candidates(client):
+            if self.downloads >= limit:
+                break
+            problem = self._drop_reason(item, from_hash, seen)
+            if problem:
+                _log.debug(
+                    "%s: skipped OpenSubtitles file %d (%s): release %r",
+                    self.label,
+                    item.file_id,
+                    problem,
+                    _safe(item.release, 100),
+                )
+                continue
+            seen.add(item.file_id)
+            self.online_tried += 1
+            try:
+                found = self._online_candidate(client, item, from_hash and item.hash_match)
+            except OSError as exc:
+                _log.warning("%s: a file error stopped one candidate: %s", self.label, _safe(exc))
+                self._note("online", f"file error ({type(exc).__name__})")
+                continue
+            if found is not None:
+                return found
+        return self._record(SubtitleStatus.UNAVAILABLE, self._unavailable_reason())
+
+    def _download(self, client: SubtitleClient, item: SubtitleResult) -> bytes:
+        quota = client.last_quota()
+        if quota is not None and not quota_usable(quota, self.ctx.now()):
+            raise QuotaStop(
+                self._record(SubtitleStatus.WANTED, "OpenSubtitles quota used up"), quota.reset_at
+            )
+        self.downloads += 1
+        return self._call(lambda: client.download(item, max_bytes=self.settings.subtitle_max_bytes))
+
+    def _online_candidate(
+        self, client: SubtitleClient, item: SubtitleResult, hash_exact: bool
+    ) -> SubtitleRecord | None:
+        names = self._names("opensubtitles", str(item.file_id))
+        _log.info(
+            "%s: OpenSubtitles file %d (%s)",
+            self.label,
+            item.file_id,
+            "hash match" if hash_exact else "title match",
+        )
+        self.ctx.reporter.stage(f"subtitle: trying OpenSubtitles file {item.file_id}")
+        adopted = self._adopt_final("opensubtitles", names, hash_exact)
+        if adopted is not None:
+            return adopted
+        raw: bytes | None
+        try:
+            raw = read_bytes_capped(names.staged, self.settings.subtitle_max_bytes)
+        except FileNotFoundError:
+            raw = None
+        else:
+            if raw is None:
+                self._reject_online(item.file_id, names, "kept download is too large")
+                return None
+            _log.info("%s: reusing the download a stopped run kept (no request)", self.label)
+        downloaded = raw is None
+        if raw is None:
+            raw = self._download(client, item)
+        try:
+            norm = self._normalise(raw)
+        except SubtitleRejected as exc:
+            self._reject_online(item.file_id, names, str(exc))
+            return None
+        if downloaded:
+            try:
+                write_text_atomic(names.staged, norm.srt)
+            except OSError as exc:
+                # The download is spent and cannot be resumed, so it must not be spent again.
+                _log.warning("%s: could not keep the download: %s", self.label, _safe(exc))
+                self._reject_online(item.file_id, names, "could not keep the download")
+                return None
+        try:
+            final, detail = self._vet(norm, names, hash_exact)
+            if final is None:
+                self._reject_online(item.file_id, names, detail)
+                return None
+            record = self._accept("opensubtitles", names, final, hash_exact, detail)
+        finally:
+            _discard(names.aligned)
+        _discard(names.staged)
+        return record
+
+    def _reject_online(self, file_id: int, names: _Names, reason: str) -> None:
+        self.tried = _bounded_ids([*self.tried, file_id])
+        self.attempts += 1
+        self._note("online", reason)
+        _discard(names.staged, names.aligned)
+        _log.info("%s: rejected OpenSubtitles file %d: %s", self.label, file_id, _safe(reason))
+
+    def _unavailable_reason(self) -> str:
+        def part(name: str) -> str:
+            reasons = self.notes[name]
+            return f"{name} rejected ({'; '.join(reasons)})" if reasons else f"{name} none"
+
+        online = f"OpenSubtitles tried {self.online_tried}"
+        if self.notes["online"]:
+            online += f" (rejected: {'; '.join(self.notes['online'])})"
+        text = f"no English subtitle found: {part('sidecar')}, {part('local')}, {online}"
+        if len(text) > MAX_REASON_CHARS:
+            text = text[: MAX_REASON_CHARS - 3] + "..."
+        _log.info("%s: %s", self.label, text)
+        return text
+
+
+def resolve_subtitle(
+    rec: FileRecord,
+    info: MediaInfo,
+    movie_hash: str | None,
+    sub: SubtitleRecord,
+    ctx: ResolveContext,
+) -> SubtitleRecord:
+    """The new subtitle record for *rec*, found in the order sidecar, local, OpenSubtitles.
+
+    A record that is not WANTED is returned unchanged; a FOUND one whose cache file is still
+    there and unchanged too (a missing or changed file makes it WANTED again, keeping its
+    `tried_ids`). Nothing accepted gives UNAVAILABLE with the reasons, except without a client
+    (no credentials), which leaves it WANTED so that adding credentials later retries. A
+    multi-part film is UNCLEAR. See the module docstring for the exceptions.
+    """
+    if sub.status not in (SubtitleStatus.WANTED, SubtitleStatus.FOUND):
+        return sub
+    cache_dir = _check_cache_dir(ctx.settings)
+    if sub.status is SubtitleStatus.FOUND:
+        if _cached_result_is_valid(sub, cache_dir, ctx.settings.subtitle_max_bytes):
+            return sub
+        _log.warning(
+            "%s: the cached subtitle is gone or changed; resolving again", _safe(rec.path.name)
+        )
+    return _Resolution(rec, info, movie_hash, sub, ctx, cache_dir).run()

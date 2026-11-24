@@ -59,7 +59,7 @@ class LocalCandidate:
     confidence: float
 
 
-def _is_link_like(entry: os.DirEntry[str]) -> bool:
+def is_link_like(entry: os.DirEntry[str]) -> bool:
     """A symlink, or on Windows any reparse point (a junction is not reported as a symlink)."""
     if entry.is_symlink():
         return True
@@ -89,7 +89,7 @@ def _walk(roots: Sequence[str]) -> Iterator[os.DirEntry[str]]:
                         _log.warning("stopping the listing after %d entries", examined - 1)
                         return
                     try:
-                        if _is_link_like(entry):
+                        if is_link_like(entry):
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             if depth < MAX_DEPTH:
