@@ -600,3 +600,81 @@ def test_the_default_density_function_is_the_embedded_measurement() -> None:
     from video_cleaner.subtitles.embedded import measure_cue_density
 
     assert survey_module.DEFAULT_DENSITY_FN is measure_cue_density
+
+
+# --- re-deciding a file whose subtitle was just found --------------------------------------------
+
+
+def _hevc(path: Path) -> MediaInfo:
+    return _info(path, codec="hevc")
+
+
+def test_redecide_found_turns_a_left_alone_file_into_a_pending_remux(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Done.mkv")
+    _result, state = _survey(settings, {"Done.mkv": _hevc})
+    try:
+        rec = state.get(film)
+        assert rec is not None and (rec.decision, rec.status) == ("leave_alone", Status.LEFT_ALONE)
+
+        decision = survey_module.redecide_found(
+            _hevc(film), settings, state, movie_hash="0123456789abcdef"
+        )
+
+        assert decision.action is Action.REMUX
+        again = state.get(film)
+        assert again is not None
+        assert (again.decision, again.status) == ("remux", Status.PENDING)
+        assert "new subtitles to mux in" in again.reasons
+        assert again.movie_hash == "0123456789abcdef"
+    finally:
+        state.close()
+
+
+def test_redecide_found_turns_a_flagged_hdr_file_into_a_remux(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Hdr.mkv")
+    rules = {"Hdr.mkv": lambda p: _with(p, hdr=True)}
+    _result, state = _survey(settings, rules)
+    try:
+        survey_module.redecide_found(_with(film, hdr=True), settings, state, movie_hash=None)
+        again = state.get(film)
+        assert again is not None
+        assert (again.decision, again.status) == ("remux", Status.PENDING)
+        assert again.reasons == FOUND_REASONS
+    finally:
+        state.close()
+
+
+def test_redecide_found_keeps_an_encode_an_encode(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Big.mkv")
+    _result, state = _survey(settings, {})
+    try:
+        decision = survey_module.redecide_found(_info(film), settings, state, movie_hash=None)
+        assert decision.action is Action.ENCODE
+        again = state.get(film)
+        assert again is not None
+        assert (again.decision, again.status) == ("encode", Status.PENDING)
+        assert again.reasons[-1] == "new subtitles to mux in"
+        assert again.est_saving_bytes > 0
+    finally:
+        state.close()
+
+
+def test_redecide_found_leaves_a_record_a_run_has_decided_on(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Done.mkv")
+    _result, state = _survey(settings, {"Done.mkv": _hevc})
+    try:
+        state.set_status(film, Status.LEFT_ALONE, "output not smaller")
+        survey_module.redecide_found(_hevc(film), settings, state, movie_hash=None)
+        again = state.get(film)
+        assert again is not None
+        assert (again.decision, again.status, again.note) == (
+            "leave_alone",
+            Status.LEFT_ALONE,
+            "output not smaller",
+        )
+    finally:
+        state.close()

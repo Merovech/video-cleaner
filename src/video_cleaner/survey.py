@@ -354,6 +354,31 @@ def _decide(
     return Decision(Action.FLAG, reasons, encode=False, remux=False)
 
 
+def redecide_found(
+    info: MediaInfo, settings: Settings, state: State, *, movie_hash: str | None
+) -> Decision:
+    """Decide *info* again now that its subtitle is FOUND, and store the result like survey does.
+
+    The same decision a re-survey would reach (`_decide` with ``needs_subs``): a left-alone file
+    becomes a remux, a file flagged for HDR, Dolby Vision or interlacing becomes a remux that
+    keeps its video, an encode stays an encode. `State.upsert_file` applies it only to a record
+    that is still as survey left it (never to one a run has decided on). For a single file only:
+    a multi-part group keeps the decision made for it. The subtitle record is not touched.
+    """
+    decision = _decide(info, settings, _Subtitles(english=NONE_EMBEDDED, needs_subs=True))
+    row = _Row(
+        info.path,
+        info.size,
+        info,
+        decision.action,
+        decision.reasons,
+        _encode_saving(decision.action, info.size),
+        movie_hash=movie_hash,
+    )
+    _record(row, state)
+    return decision
+
+
 def _plan_group(
     group: PartGroup,
     infos: dict[Path, MediaInfo],
