@@ -249,7 +249,7 @@ def test_a_second_resolve_exits_2_with_the_already_running_message(
     with instance_lock(subs_lock_path_for(tmp_path / "appdata" / "state.db")):
         result = _invoke("subs", "resolve", "--config", str(cfg), "-q")
     assert result.exit_code == 2
-    assert "another video-cleaner run or calibration is active" in " ".join(result.output.split())
+    assert "another `subs resolve` is running" in " ".join(result.output.split())
     assert fake.calls == []
     # Released again once the holder is gone.
     assert _invoke("subs", "resolve", "--config", str(cfg), "-q").exit_code == 0
@@ -473,3 +473,58 @@ def test_retry_without_a_database_exits_2(tmp_path: Path) -> None:
     result = _invoke("subs", "retry", "--path", "x.mkv", "--config", str(cfg))
     assert result.exit_code == 2
     assert "survey" in result.output
+
+
+# --- wanted subtitles a run has already dealt with -------------------------------------------
+
+HINT = "put a run-decided file back with `plan --retry` to look up its subtitle"
+
+
+def _held_back(tmp_path: Path) -> None:
+    """Three wanted rows that `subs resolve` will not touch, and one that it will."""
+    from video_cleaner.state import Status
+
+    with State.open(tmp_path / "appdata" / "state.db") as state:
+        for name, status, note in (
+            ("decided.mkv", Status.LEFT_ALONE, "output not smaller"),
+            ("also-decided.mkv", Status.FLAGGED, "verify failed"),
+            ("done.mkv", Status.COMPLETED, "delivered"),
+            ("busy.mkv", Status.ENCODING, ""),
+            ("open.mkv", None, ""),
+        ):
+            path = tmp_path / "library" / name
+            add_record(state, path, "encode", ("h264",))
+            state.ensure_wanted(path, 1000, MTIME, english_audio=False)
+            if status is not None:
+                state.set_status(path, status, note)
+
+
+def test_resolve_says_how_many_wanted_files_a_run_already_dealt_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _setup(tmp_path)
+    _held_back(tmp_path)
+    monkeypatch.setattr(job_module, "run_resolve_job", FakeJob())
+    result = _invoke("subs", "resolve", "--config", str(cfg), "-q")
+    text = " ".join(result.output.split())
+    assert "2 already decided by a run, 1 already delivered, 1 being processed" in text
+    assert HINT in text
+
+
+def test_status_says_it_too(tmp_path: Path) -> None:
+    cfg = _setup(tmp_path)
+    _held_back(tmp_path)
+    text = " ".join(_invoke("subs", "status", "--config", str(cfg)).output.split())
+    assert "2 already decided by a run, 1 already delivered, 1 being processed" in text
+    assert HINT in text
+
+
+def test_nothing_is_said_when_no_wanted_file_is_held_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _setup(tmp_path)
+    _wanted(tmp_path, "a.mkv")
+    monkeypatch.setattr(job_module, "run_resolve_job", FakeJob())
+    for args in (["resolve", "-q"], ["status"]):
+        out = _invoke("subs", *args, "--config", str(cfg)).output
+        assert "already decided" not in out and "plan --retry" not in out

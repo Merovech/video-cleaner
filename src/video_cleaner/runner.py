@@ -284,6 +284,9 @@ class RunSummary:
     stop_reason: str = ""
     # Queued files skipped because their subtitle is still WANTED (see `include_unresolved`).
     waiting_on_subtitles: int = 0
+    # Queued files this run left alone because they changed after it started (a subtitle was
+    # found for them, or the plan was updated): the plan they were acknowledged under is gone.
+    changed_since_start: int = 0
 
 
 def deadline_from(until: str | None, max_hours: float | None, now: datetime) -> datetime | None:
@@ -452,6 +455,14 @@ class _Runner:
             (Status.COMPLETED, Status.LEFT_ALONE, Status.FLAGGED, Status.RETRY), 0
         )
         self.bytes_saved = 0
+        # The files this run may process: the queued ones as they are now, that the plan hash
+        # has just been checked against, each with whether its subtitle was FOUND. A `subs
+        # resolve` beside the run may change files later; those changes were not acknowledged.
+        found = self._found()
+        self.start: dict[tuple[str, int, float], bool] = {
+            (name_key(r.path), r.size, r.mtime): (name_key(r.path), r.size, r.mtime) in found
+            for r in state.records(Status.PENDING, Status.RETRY)
+        }
 
     # -- selection ------------------------------------------------------------------------
 
@@ -481,14 +492,51 @@ class _Runner:
             (name_key(sub.path), sub.size, sub.mtime) for sub in self.state.wanted_subtitles()
         )
 
-    def _wanted(self, rec: FileRecord, waiting: frozenset[tuple[str, int, float]]) -> bool:
+    def _found(self) -> frozenset[tuple[str, int, float]]:
+        """Keys of the files whose subtitle is FOUND."""
+        return frozenset(
+            (name_key(sub.path), sub.size, sub.mtime)
+            for sub in self.state.subtitles_with_status(SubtitleStatus.FOUND)
+        )
+
+    def _changed(
+        self, key: tuple[str, int, float], found: frozenset[tuple[str, int, float]]
+    ) -> bool:
+        """Whether the file at *key* is not what the run started with: it was not queued then,
+        or its subtitle was not FOUND then and is now. A file that was FOUND at the start stays
+        as it is, whatever happens to its cache (the stale-cache path handles that)."""
+        was_found = self.start.get(key)
+        return was_found is None or (not was_found and key in found)
+
+    def _wanted(
+        self,
+        rec: FileRecord,
+        waiting: frozenset[tuple[str, int, float]],
+        found: frozenset[tuple[str, int, float]],
+    ) -> bool:
         key = (name_key(rec.path), rec.size, rec.mtime)
         return (
             rec.decision in _WORK_DECISIONS
             and key not in self.attempted
             and key not in waiting
+            and not self._changed(key, found)
             and self.in_scope(rec)
         )
+
+    def _count_changed(self) -> int:
+        """Queued files (in scope, not yet tried) this run skipped because they changed."""
+        found = self._found()
+        count = 0
+        for rec in self.state.records(Status.PENDING, Status.RETRY):
+            key = (name_key(rec.path), rec.size, rec.mtime)
+            if (
+                rec.decision in _WORK_DECISIONS
+                and key not in self.attempted
+                and self.in_scope(rec)
+                and self._changed(key, found)
+            ):
+                count += 1
+        return count
 
     def _count_waiting(self) -> int:
         """Queued files (pending or retry, in scope) this run skipped for their subtitle.
@@ -507,8 +555,9 @@ class _Runner:
 
     def _next(self) -> FileRecord | None:
         waiting = self._waiting()
+        found = self._found()
         for status in (Status.PENDING, Status.RETRY):
-            records = [r for r in self.state.records(status) if self._wanted(r, waiting)]
+            records = [r for r in self.state.records(status) if self._wanted(r, waiting, found)]
             if records:
                 # records() is ordered by path, so equal savings keep a stable order
                 return max(records, key=lambda r: r.est_saving_bytes)
@@ -1193,6 +1242,7 @@ class _Runner:
             stopped_by_deadline=stopped_by_deadline,
             stop_reason=stop_reason,
             waiting_on_subtitles=self._count_waiting(),
+            changed_since_start=self._count_changed(),
         )
 
     def records(self) -> Iterator[FileRecord]:

@@ -64,6 +64,7 @@ __all__ = [
     "LIMIT_REACHED",
     "NOT_ANSWERING",
     "JobSummary",
+    "held_back_line",
     "is_failure",
     "persist_subtitle",
     "retry_subtitle",
@@ -83,9 +84,9 @@ CANNOT_START_PREFIX = "cannot start: "
 
 #: This many failed OpenSubtitles calls in a row end the job.
 MAX_CONSECUTIVE_FAILURES = 3
-#: A reset time further away than this is not believed (a hostile or broken reply could lock the
-#: job out for good); the next midnight UTC is assumed instead.
-MAX_RESET_AHEAD = timedelta(hours=48)
+#: A reset time later than the next midnight UTC plus this is not believed (a hostile or broken
+#: reply could lock the job out for good); it is cut back to that limit.
+RESET_SLACK = timedelta(hours=1)
 _MAX_LINE_CHARS = 120
 _MOVIEHASH = re.compile(r"[0-9a-f]{16}")
 _SOURCES = {"sidecar": "sidecar", "local": "local", "opensubtitles": "OpenSubtitles"}
@@ -135,6 +136,40 @@ def persist_subtitle(
             reason or after.reason or "the cached subtitle is gone or changed",
         )
     state.set_subtitle(after)
+
+
+_DECIDED = "already decided by a run"
+_DELIVERED = "already delivered"
+_BUSY = "being processed by a run"
+PLAN_RETRY_HINT = "put a run-decided file back with `plan --retry` to look up its subtitle"
+
+
+def held_back_reason(rec: FileRecord) -> str:
+    """Why the wanted subtitle of the live file *rec* is not looked up ("" if it is): a run
+    has delivered it, is working on it, or has decided on it (a note on its LEFT_ALONE or
+    FLAGGED status), so a subtitle found now could not change its plan."""
+    if rec.status is Status.COMPLETED:
+        return _DELIVERED
+    if rec.status in IN_PROGRESS:
+        return _BUSY
+    if rec.status in (Status.LEFT_ALONE, Status.FLAGGED) and rec.note:
+        return _DECIDED
+    return ""
+
+
+def held_back_line(state: State) -> str:
+    """One line saying how many wanted subtitles are held back by a run, or "" for none."""
+    live = {(r.path, r.size, r.mtime): r for r in state.records()}
+    tally = dict.fromkeys((_DECIDED, _DELIVERED, _BUSY), 0)
+    for sub in state.wanted_subtitles():
+        rec = live.get((sub.path, sub.size, sub.mtime))
+        why = "" if rec is None else held_back_reason(rec)
+        if why:
+            tally[why] += 1
+    if not any(tally.values()):
+        return ""
+    parts = ", ".join(f"{n} {why}" for why, n in tally.items())
+    return f"Wanted subtitles not looked up: {parts}; {PLAN_RETRY_HINT}"
 
 
 def _record_for(records: list[FileRecord], path: Path) -> FileRecord | None:
@@ -286,15 +321,7 @@ class _Job:
     @staticmethod
     def _unsuitable(rec: FileRecord | None) -> str:
         """Why a wanted row is not worked on ("" if it is)."""
-        if rec is None:
-            return "no live file record"
-        if rec.status is Status.COMPLETED:
-            return "already delivered"
-        if rec.status in IN_PROGRESS:
-            return "being processed by a run"
-        if rec.status in (Status.LEFT_ALONE, Status.FLAGGED) and rec.note:
-            return "already decided by a run (`plan --retry` puts it back)"
-        return ""
+        return "no live file record" if rec is None else held_back_reason(rec)
 
     def _select(self) -> list[tuple[FileRecord, SubtitleRecord]]:
         live = {(r.path, r.size, r.mtime): r for r in self.state.records()}
@@ -475,9 +502,8 @@ class _Job:
         return self._near(reset_at)
 
     def _near(self, reset_at: datetime) -> datetime:
-        """*reset_at*, unless it is too far away to be believed (then the next midnight UTC)."""
-        now = self.ctx.now()
-        return next_reset(now) if reset_at > now + MAX_RESET_AHEAD else reset_at
+        """*reset_at*, cut back to an hour past the next midnight UTC when it is later."""
+        return min(reset_at, next_reset(self.ctx.now()) + RESET_SLACK)
 
     def _store_quota(self) -> None:
         """Store the allowance (a stop's, else the client's last report) unless it is unchanged."""

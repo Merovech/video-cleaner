@@ -10,7 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from video_cleaner.instancelock import LOCK_NAME, AlreadyRunning, instance_lock, lock_path_for
+from video_cleaner.instancelock import (
+    LOCK_NAME,
+    AlreadyRunning,
+    instance_lock,
+    lock_path_for,
+    subs_lock_path_for,
+)
 
 
 def test_lock_file_lives_beside_the_state_db(tmp_path: Path) -> None:
@@ -23,6 +29,30 @@ def test_second_acquire_in_same_process_is_refused_with_pid(tmp_path: Path) -> N
         pass  # pragma: no cover - never reached
     assert info.value.pid == os.getpid()
     assert str(os.getpid()) in str(info.value)
+
+
+def test_the_run_lock_message_is_unchanged_and_the_subs_lock_names_its_holder(
+    tmp_path: Path,
+) -> None:
+    run_lock = lock_path_for(tmp_path / "state.db")
+    with (
+        instance_lock(run_lock),
+        pytest.raises(AlreadyRunning) as run_info,
+        instance_lock(run_lock),
+    ):
+        pass  # pragma: no cover
+    assert "another video-cleaner run or calibration is active" in str(run_info.value)
+    subs_lock = subs_lock_path_for(tmp_path / "state.db")
+    with (
+        instance_lock(subs_lock),
+        pytest.raises(AlreadyRunning) as subs_info,
+        instance_lock(subs_lock),
+    ):
+        pass  # pragma: no cover
+    text = str(subs_info.value)
+    assert "another `subs resolve` is running" in text
+    assert "run or calibration" not in text
+    assert str(os.getpid()) in text and "only one may run at a time" in text
 
 
 def test_lock_is_released_on_exit_and_on_error(tmp_path: Path) -> None:

@@ -746,6 +746,16 @@ class State:
             ).fetchall()
         return [_subtitle_record(r) for r in rows]
 
+    def subtitles_with_status(self, status: SubtitleStatus) -> list[SubtitleRecord]:
+        """Every subtitle record with *status*, ordered by path (then size and mtime)."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subtitles WHERE status = ? "  # noqa: S608  # nosec B608
+                "ORDER BY path, size, mtime",
+                (status.value,),
+            ).fetchall()
+        return [_subtitle_record(r) for r in rows]
+
     def subtitle_counts(self) -> dict[SubtitleStatus, int]:
         """Number of subtitle records per status, with every status present (zero when none)."""
         with self._tx() as conn:

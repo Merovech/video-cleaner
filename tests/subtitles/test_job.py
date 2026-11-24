@@ -506,17 +506,26 @@ def test_quota_stop_without_a_reset_time_assumes_the_next_midnight_utc(rig: Rig)
 
 
 @pytest.mark.parametrize(
-    "reset",
-    [NOW - timedelta(days=1), NOW, datetime(2999, 1, 1, tzinfo=UTC)],
-    ids=["past", "now", "far"],
+    ("reset", "expected"),
+    [
+        (NOW - timedelta(days=1), MIDNIGHT),  # not in the future: the next midnight
+        (NOW, MIDNIGHT),
+        (MIDNIGHT + timedelta(minutes=30), MIDNIGHT + timedelta(minutes=30)),  # believable
+        (MIDNIGHT + timedelta(hours=1), MIDNIGHT + timedelta(hours=1)),  # the limit itself
+        (MIDNIGHT + timedelta(hours=1, minutes=1), MIDNIGHT + timedelta(hours=1)),
+        (datetime(2999, 1, 1, tzinfo=UTC), MIDNIGHT + timedelta(hours=1)),
+    ],
+    ids=["past", "now", "soon", "limit", "just-over", "far"],
 )
-def test_a_reset_time_in_the_past_or_far_away_is_not_trusted(rig: Rig, reset: datetime) -> None:
+def test_a_reset_time_is_clamped_to_an_hour_past_the_next_midnight(
+    rig: Rig, reset: datetime, expected: datetime
+) -> None:
     rig.add("a.mkv")
     a = rig.library / "a.mkv"
     rig.resolver.script["a.mkv"] = QuotaStop(still_wanted(rig.sub(a), "q"), reset)
     summary = rig.run()
-    assert rig.state.quota() == QuotaInfo(0, MIDNIGHT)
-    assert summary.stopped_reason == "quota exhausted until 2030-01-02 00:00 UTC"
+    assert rig.state.quota() == QuotaInfo(0, expected)
+    assert summary.stopped_reason == f"quota exhausted until {expected:%Y-%m-%d %H:%M} UTC"
 
 
 def test_the_clients_allowance_is_stored_after_each_file_and_clamped(rig: Rig) -> None:
@@ -537,7 +546,23 @@ def test_the_clients_allowance_is_stored_after_each_file_and_clamped(rig: Rig) -
     rig.resolver.script["a.mkv"] = downloaded(7, MIDNIGHT)
     rig.resolver.script["b.mkv"] = downloaded(6, datetime(2999, 1, 1, tzinfo=UTC))
     rig.run()
-    assert rig.state.quota() == QuotaInfo(6, MIDNIGHT)  # a far-away reset is not kept
+    # A far-away reset is not kept: at most an hour past the next midnight.
+    assert rig.state.quota() == QuotaInfo(6, MIDNIGHT + timedelta(hours=1))
+
+
+def test_a_stops_allowance_wins_over_the_clients_older_report(rig: Rig) -> None:
+    assert rig.client is not None
+    rig.add("a.mkv")
+    a = rig.library / "a.mkv"
+    client = rig.client
+
+    def downloaded_then_refused(rec: FileRecord, sub: SubtitleRecord) -> SubtitleRecord:
+        client.quota = QuotaInfo(5, MIDNIGHT)  # a download reported 5 left ...
+        raise QuotaStop(still_wanted(rig.sub(a), "q", (3,)), MIDNIGHT)  # ... then the refusal
+
+    rig.resolver.script["a.mkv"] = downloaded_then_refused
+    rig.run()
+    assert rig.state.quota() == QuotaInfo(0, MIDNIGHT)
 
 
 def test_the_subtitle_row_is_written_before_the_allowance(rig: Rig) -> None:

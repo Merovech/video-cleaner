@@ -32,6 +32,7 @@ from video_cleaner import probe as probe_module
 from video_cleaner import quality as quality_module
 from video_cleaner import runner as runner_module
 from video_cleaner import scratch as scratch_module
+from video_cleaner import survey as survey_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.consolefmt import Level
@@ -2982,6 +2983,150 @@ def test_cli_run_summary_says_how_many_files_wait_on_subtitles(
     assert "--include-unresolved" in result.output
     result, _ = _invoke_run(tmp_path, monkeypatch, _summary())
     assert "waiting on subtitles" not in result.output
+
+
+# --- a run ignores what changed after it started (a `subs resolve` beside it) --------------
+
+
+def _mid_run(fakes: Fakes, trigger: Path, change: Callable[[], object]) -> list[int]:
+    """Run *change* once, right after the copy of *trigger* (between two files of a run)."""
+    done: list[int] = []
+
+    def after_copy(src: Path) -> None:
+        if src == trigger and not done:
+            done.append(1)
+            change()
+
+    fakes.after_copy = after_copy
+    return done
+
+
+def test_a_file_that_turns_found_after_the_run_started_is_not_processed(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    later = _source(settings, "later.avi")
+    _plan(state, first, est=900)
+    later_rec = _plan(state, later, decision="remux", est=100)
+    fakes = Fakes()
+    done = _mid_run(fakes, first, lambda: _found_subtitle(settings, state, later_rec))
+    summary = _run(settings, state, fakes)
+    assert done and summary.completed == 1
+    assert summary.changed_since_start == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+    assert _status(state, later).status is Status.PENDING
+    assert not (settings.completed_dir / "later.mkv").exists()
+
+
+def test_a_left_alone_file_the_job_decides_again_mid_run_is_not_processed(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    later = _source(settings, "later.avi")
+    _plan(state, first, est=900)
+    later_rec = _plan(state, later, decision="leave_alone", est=0)
+    assert later_rec.status is Status.LEFT_ALONE
+
+    def job_turns_it_into_a_remux() -> None:
+        _found_subtitle(settings, state, later_rec)
+        survey_module.redecide_found(
+            _info(later, later_rec.size, later_rec.mtime, codec="hevc"),
+            settings,
+            state,
+            movie_hash=None,
+        )
+
+    fakes = Fakes()
+    _mid_run(fakes, first, job_turns_it_into_a_remux)
+    summary = _run(settings, state, fakes)
+    assert _status(state, later).decision == "remux"  # the change really happened
+    assert summary.completed == 1 and summary.changed_since_start == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+    assert _status(state, later).status is Status.PENDING
+
+
+def test_a_file_that_was_found_at_the_start_is_processed_as_before(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    found = _source(settings, "found.avi", size=3000)
+    other = _source(settings, "other.avi")
+    _plan(state, first, est=900)
+    found_rec = _plan(state, found, decision="remux", est=0)
+    other_rec = _plan(state, other, est=100)
+    _found_subtitle(settings, state, found_rec)
+    fakes = Fakes()
+    # An unrelated change mid-run (another file's subtitle row) does not touch the found one.
+    _mid_run(fakes, first, lambda: _want_subtitle(state, other_rec))
+    summary = _run(settings, state, fakes)
+    assert summary.changed_since_start == 0
+    assert summary.completed == 2  # `other` waits for its (new) subtitle lookup
+    assert (settings.completed_dir / "found.mkv").is_file()
+    assert _subtitle_of(state, _status(state, found)).status is SubtitleStatus.FOUND
+    (entry,) = [e for e in read_manifest(settings.completed_dir / "manifest.csv") if e.subtitle]
+    assert entry.original == (found,)
+
+
+def test_a_file_that_was_waiting_at_the_start_stays_deferred_when_it_turns_found(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    waiting = _source(settings, "wait.avi")
+    _plan(state, first, est=900)
+    waiting_rec = _plan(state, waiting, est=100)
+    _want_subtitle(state, waiting_rec)
+    fakes = Fakes()
+    _mid_run(fakes, first, lambda: _found_subtitle(settings, state, waiting_rec))
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1 and summary.changed_since_start == 1
+    assert summary.waiting_on_subtitles == 0  # it is no longer WANTED, only unreviewed
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+    assert _status(state, waiting).status is Status.PENDING
+
+
+def test_a_new_record_for_a_changed_file_is_not_picked_up_mid_run(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    other = _source(settings, "other.avi")
+    _plan(state, first, est=900)
+    _plan(state, other, est=100)
+
+    def resurvey() -> None:
+        other.write_bytes(b"y" * 2000)  # the file changed and a survey recorded the new one
+        _plan(state, other, est=100)
+
+    fakes = Fakes()
+    _mid_run(fakes, first, resurvey)
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1 and summary.changed_since_start == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+
+
+def test_a_retry_inside_the_same_run_is_still_not_repeated(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    fakes = Fakes()
+    fakes.fail["search_crf"] = lambda p: OSError("disk")
+    summary = _run(settings, state, fakes)
+    assert summary.retry == 1 and summary.changed_since_start == 0
+    assert len([c for c in fakes.calls if c[0] == "copy"]) == 1
+
+
+def test_cli_run_summary_says_how_many_files_changed_after_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary(changed_since_start=2))
+    text = " ".join(result.output.split())
+    assert "2 files changed after the run started" in text
+    assert "a subtitle was found or the plan was updated" in text
+    assert "run `plan`, review it, then `plan --ack`" in text
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary(changed_since_start=1))
+    assert "1 file changed after the run started" in " ".join(result.output.split())
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary())
+    assert "changed after the run started" not in result.output
 
 
 # --- integration: the real pipeline on a tiny clip -----------------------------------------

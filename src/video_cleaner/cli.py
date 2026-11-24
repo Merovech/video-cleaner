@@ -453,6 +453,13 @@ def _print_run_summary(summary: _runner.RunSummary) -> None:
         print_tagged(Level.INFO, "Run ended: deadline reached (the file in progress was finished)")
     else:
         print_tagged(Level.OK, "Run ended: queue finished")
+    if summary.changed_since_start:
+        n = summary.changed_since_start
+        print_tagged(
+            Level.WARN,
+            f"{n} {'file' if n == 1 else 'files'} changed after the run started (a subtitle was "
+            "found or the plan was updated): run `plan`, review it, then `plan --ack`",
+        )
     if summary.waiting_on_subtitles:
         n = summary.waiting_on_subtitles
         print_tagged(
@@ -749,8 +756,9 @@ def _resolve_subtitles(
     limit: int | None,
     deadline: datetime | None,
     only: Path | None,
-) -> _job.JobSummary:
-    """Run the subtitle job under its own lock (a `run` may be active beside it)."""
+) -> tuple[_job.JobSummary, str]:
+    """Run the subtitle job under its own lock (a `run` may be active beside it); the summary
+    and the line about the wanted subtitles a run has already dealt with ("" for none)."""
     with (
         instance_lock(subs_lock_path_for(settings.state_db)),
         State.open(settings.state_db) as state,
@@ -768,10 +776,13 @@ def _resolve_subtitles(
             local_index=local_index,
             client=client,
         )
-        return _job.run_resolve_job(settings, state, ctx, limit=limit, deadline=deadline, only=only)
+        summary = _job.run_resolve_job(
+            settings, state, ctx, limit=limit, deadline=deadline, only=only
+        )
+        return summary, _job.held_back_line(state)
 
 
-def _print_subs_summary(summary: _job.JobSummary) -> None:
+def _print_subs_summary(summary: _job.JobSummary, held_back: str = "") -> None:
     print_tagged(
         Level.INFO,
         f"Subtitles: found {summary.resolved_found}, unavailable {summary.unavailable}, "
@@ -784,6 +795,8 @@ def _print_subs_summary(summary: _job.JobSummary) -> None:
         print_tagged(Level.WARN, f"Stopped: {reason}")
     else:
         print_tagged(Level.INFO, f"Stopped: {reason}")
+    if held_back:
+        print_tagged(Level.INFO, held_back)
     if summary.resolved_found:
         print_tagged(
             Level.INFO,
@@ -820,7 +833,7 @@ def subs_resolve(
     tools = _tools()
     with _open_reporter(settings, progress) as reporter, power.keep_awake():
         try:
-            summary = _resolve_subtitles(
+            summary, held_back = _resolve_subtitles(
                 settings, tools, reporter, limit=limit, deadline=deadline, only=path
             )
         except (AlreadyRunning, StateError, ToolNotFound, sqlite3.Error) as exc:
@@ -830,7 +843,7 @@ def subs_resolve(
                 Level.WARN, "subtitle lookup interrupted; what was stored stays", stderr=True
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
-    _print_subs_summary(summary)
+    _print_subs_summary(summary, held_back)
     if summary.stopped_reason == _job.INTERRUPTED:
         raise typer.Exit(code=EXIT_INTERRUPTED)
     if _job.is_failure(summary.stopped_reason):
@@ -863,6 +876,7 @@ def subs_status(config: ConfigOption = None) -> None:
             counts = state.subtitle_counts()
             quota = state.quota()
             waiting = planning.build_plan(state).waiting_on_subtitles
+            held_back = _job.held_back_line(state)
     except StateError as exc:
         _fail(str(exc))
     _say(f"Subtitle records: {sum(counts.values())}")
@@ -870,6 +884,8 @@ def subs_status(config: ConfigOption = None) -> None:
         _say(f"  {st.value:<12} {counts[st]}")
     _say(_quota_line(quota, datetime.now(UTC)))
     _say(f"Files waiting on subtitles: {waiting}")
+    if held_back:
+        _say(held_back)
 
 
 @subs_app.command("retry")
