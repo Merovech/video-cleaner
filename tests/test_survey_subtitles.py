@@ -770,7 +770,7 @@ def test_an_hevc_file_without_english_subtitles_is_wanted_and_becomes_a_remux_on
 ) -> None:
     settings = _settings(tmp_path)
     film = _touch(settings.library_root / "Efficient.mkv")
-    rules = {"Efficient.mkv": _hevc}
+    rules: dict[str, MediaInfoRule] = {"Efficient.mkv": _hevc}
     result, state = _survey(settings, rules)
     try:
         sub = _sub_row(state, film)

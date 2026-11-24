@@ -228,15 +228,19 @@ def survey(
     tools = _tools()
     with _open_reporter(settings, progress) as reporter:
         try:
-            with State.open(settings.state_db) as state:
+            # Under the lock of `subs resolve`: a survey replaces rows a lookup is working on.
+            with (
+                instance_lock(subs_lock_path_for(settings.state_db)),
+                State.open(settings.state_db) as state,
+            ):
                 result = _survey.run_survey(settings, tools, state, reporter, root=root)
-        except (_survey.SurveyError, ToolNotFound) as exc:
+        except (_survey.SurveyError, ToolNotFound, AlreadyRunning) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
             print_tagged(
                 Level.WARN,
-                "survey interrupted; files already surveyed are recorded, and the survey can "
-                "simply be run again",
+                "survey interrupted; probing changes no records until the recording step, and "
+                "running the survey again is always safe",
                 stderr=True,
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None

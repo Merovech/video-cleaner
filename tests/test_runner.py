@@ -2002,6 +2002,15 @@ def test_a_change_between_the_plan_check_and_the_snapshot_is_refused(
     assert _status(state, a).status is Status.PENDING
 
 
+def test_a_run_is_not_blocked_by_a_subs_resolve(settings: Settings, state: State) -> None:
+    from video_cleaner.instancelock import instance_lock, subs_lock_path_for
+
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    with instance_lock(subs_lock_path_for(settings.state_db)):
+        assert _run(settings, state, Fakes()).completed == 1
+
+
 def test_an_unchanged_plan_passes_the_second_check(settings: Settings, state: State) -> None:
     a = _source(settings, "a.avi")
     _plan(state, a)
