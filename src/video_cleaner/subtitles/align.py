@@ -29,7 +29,11 @@ from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
 from video_cleaner.logging_setup import redact
 from video_cleaner.progress import Reporter
-from video_cleaner.subtitles.textfmt import SubtitleRejected, normalise_subtitle
+from video_cleaner.subtitles.textfmt import (
+    SubtitleRejected,
+    normalise_newlines,
+    normalise_subtitle,
+)
 from video_cleaner.tools import (
     ToolFailed,
     ToolOutputError,
@@ -126,7 +130,7 @@ def parse_ffsubsync_log(text: str) -> tuple[float | None, float | None, float | 
     ``framerate scale factor: 1.000`` as INFO messages on stderr. Each is None when it is not
     there or not a finite number; when a number is reported more than once the last one wins.
     """
-    lines = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalise_newlines(text)
     return (
         _last_number(_OFFSET_RE, lines),
         _last_number(_SCALE_RE, lines),
@@ -139,7 +143,7 @@ def parse_reference_speech_s(text: str) -> float | None:
 
     It logs ``total of speech segments: 3022.0``, the number of 10 ms frames with speech.
     """
-    frames = _last_number(_SPEECH_RE, text.replace("\r\n", "\n").replace("\r", "\n"))
+    frames = _last_number(_SPEECH_RE, normalise_newlines(text))
     return None if frames is None else frames / _SPEECH_FRAMES_PER_S
 
 
@@ -277,7 +281,7 @@ def _log_excerpt(label: str, text: str) -> None:
     The work folder and the log in it are removed when the run ends, so this is the only place
     the cause (a traceback, a missing module) is kept.
     """
-    lines = [line.rstrip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+    lines = [line.rstrip() for line in normalise_newlines(text).split("\n") if line.strip()]
     kept = [redact(line)[:_EXCERPT_LINE_CHARS] for line in lines[-_EXCERPT_LINES:]]
     if kept:
         _log.warning("%s: the end of ffsubsync's output:\n%s", label, "\n".join(kept))

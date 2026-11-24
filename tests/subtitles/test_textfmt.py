@@ -10,6 +10,7 @@ from video_cleaner.subtitles.textfmt import (
     SubtitleRejected,
     cues_per_hour,
     decode_subtitle_bytes,
+    normalise_newlines,
     normalise_subtitle,
     to_srt,
 )
@@ -650,3 +651,21 @@ def test_a_digit_run_longer_than_the_int_limit_is_handled_by_the_line_guard() ->
     raw = SRT_HEAD.replace(b"00:00:02,000", b"1" * 5_000 + b":00:02,000") + b"x\n"
     with pytest.raises(SubtitleRejected, match="100 hours"):
         normalise_subtitle(raw, max_bytes=BIG, min_cues=1)
+
+
+# --- normalise_newlines -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("a\r\nb\rc\n", "a\nb\nc\n"),
+        ("", ""),
+        ("no newline at all", "no newline at all"),
+        ("already\nclean\n", "already\nclean\n"),
+        ("\r\r\n\n\r", "\n\n\n\n"),
+        ("\n\r", "\n\n"),
+    ],
+)
+def test_normalise_newlines_turns_crlf_and_lone_cr_into_lf(text: str, expected: str) -> None:
+    assert normalise_newlines(text) == expected

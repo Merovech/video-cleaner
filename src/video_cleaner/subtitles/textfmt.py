@@ -150,6 +150,11 @@ def decode_subtitle_bytes(raw: bytes) -> str:
                 text = body.decode("cp1252")
             except UnicodeDecodeError:
                 text = body.decode("latin-1")
+    return normalise_newlines(text)
+
+
+def normalise_newlines(text: str) -> str:
+    """*text* with every CRLF and every lone CR turned into LF."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
@@ -219,7 +224,7 @@ def to_srt(cues: Sequence[Cue]) -> str:
 
 def _text_lines(text: str) -> list[str]:
     """The lines of a cue's text, stripped, without blank lines or timing-looking lines."""
-    lines = (line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    lines = (line.strip() for line in normalise_newlines(text).split("\n"))
     return [line for line in lines if line and not _looks_like_timing(line)]
 
 
