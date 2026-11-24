@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +82,7 @@ class Call:
     name: str
     status: SubtitleStatus
     has_client: bool
+    offline_reason: str = ""
 
 
 class FakeResolver:
@@ -111,7 +112,9 @@ class FakeResolver:
         sub: SubtitleRecord,
         ctx: ResolveContext,
     ) -> SubtitleRecord:
-        self.calls.append(Call(rec.path.name, sub.status, ctx.client is not None))
+        self.calls.append(
+            Call(rec.path.name, sub.status, ctx.client is not None, ctx.offline_reason)
+        )
         item = self.script.get(rec.path.name)
         if item is None:
             return self.found(sub)
@@ -636,6 +639,46 @@ def test_a_refused_login_turns_the_online_step_off_for_the_rest_of_the_job(rig: 
     assert len(warned) == 1 and warned[0].startswith("WARNING")
 
 
+def test_after_a_refused_login_later_files_are_not_told_there_are_no_credentials(
+    rig: Rig,
+) -> None:
+    from video_cleaner.subtitles.resolve import LOGIN_REFUSED, NO_CREDENTIALS
+
+    rig.add("a.mkv", est=3)
+    rig.add("b.mkv", est=2)
+    a = rig.library / "a.mkv"
+    reason = "OpenSubtitles refused the login: bad key"
+    rig.resolver.script["a.mkv"] = OnlineFailure(still_wanted(rig.sub(a), reason), reason, True)
+    rig.run()
+    assert [c.has_client for c in rig.resolver.calls] == [True, False]
+    assert rig.resolver.calls[0].offline_reason == NO_CREDENTIALS  # the default, never used
+    assert rig.resolver.calls[1].offline_reason == LOGIN_REFUSED
+    assert "refused" in LOGIN_REFUSED and "credentials" not in LOGIN_REFUSED
+
+
+def test_the_real_resolver_stores_the_refused_login_reason_and_keeps_the_row_wanted(
+    rig: Rig,
+) -> None:
+    from video_cleaner.subtitles.resolve import LOGIN_REFUSED
+
+    rig.add("a.mkv", est=3)
+    rig.add("b.mkv", est=2)
+    a = rig.library / "a.mkv"
+    reason = "OpenSubtitles refused the login: bad key"
+    first = OnlineFailure(still_wanted(rig.sub(a), reason), reason, True)
+
+    def resolve(
+        rec: FileRecord, info: MediaInfo, h: str | None, sub: SubtitleRecord, ctx: Any
+    ) -> Any:
+        if rec.path.name == "a.mkv":
+            raise first
+        return resolve_subtitle(rec, info, h, sub, ctx)
+
+    rig.run(resolve=resolve)
+    b = rig.sub(rig.library / "b.mkv")
+    assert (b.status, b.reason) == (SubtitleStatus.WANTED, LOGIN_REFUSED)
+
+
 def failure(rig: Rig, name: str, fatal: bool = False) -> OnlineFailure:
     sub = rig.sub(rig.library / name)
     return OnlineFailure(still_wanted(sub, "OpenSubtitles failed: HTTP 503"), "503", fatal)
@@ -956,3 +999,75 @@ def test_without_credentials_a_sidecar_is_still_found_and_the_file_is_re_decided
     assert sub.cache_path is not None and sub.cache_path.is_file()
     assert rig.file(video).decision == "remux"
     assert any("sidecar" in line for line in rig.reporter.done)
+
+
+# --- a cached subtitle that went missing or changed is looked up again -----------------------
+
+
+def _found_row(rig: Rig, name: str, data: bytes, *, on_disk: bytes | None) -> Path:
+    """A FOUND row for *name* whose cache file holds *on_disk* (None: no file) and whose
+    stored hash is that of *data*."""
+    import hashlib
+
+    path = rig.add(name, subtitle=None, est=10)
+    rec = rig.file(path)
+    cache = rig.settings.subtitle_cache_dir / f"{path.stem}.srt"
+    if on_disk is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_bytes(on_disk)
+    rig.state.set_subtitle(
+        SubtitleRecord(
+            path=path,
+            size=rec.size,
+            mtime=rec.mtime,
+            status=SubtitleStatus.FOUND,
+            provider="opensubtitles",
+            cache_path=cache,
+            sha256=hashlib.sha256(data).hexdigest(),
+            provenance="English (OpenSubtitles)",
+            tried_ids=(7,),
+            attempts=1,
+        )
+    )
+    return path
+
+
+def test_found_rows_whose_cache_file_is_missing_or_changed_are_looked_up_again(rig: Rig) -> None:
+    good = _found_row(rig, "good.mkv", b"one", on_disk=b"one")
+    gone = _found_row(rig, "gone.mkv", b"two", on_disk=None)
+    changed = _found_row(rig, "changed.mkv", b"three", on_disk=b"tampered")
+    kept = rig.sub(good)
+    summary = rig.run()
+    assert sorted(rig.resolver.names) == ["changed.mkv", "gone.mkv"]
+    assert [c.status for c in rig.resolver.calls] == [SubtitleStatus.WANTED] * 2
+    assert summary.resolved_found == 2
+    assert rig.sub(good) == kept  # untouched
+    lines = [line for line in rig.reporter.done if "cached subtitle" in line]
+    assert lines == ["2 cached subtitle(s) missing or changed: looking them up again"]
+    assert rig.state.log.count(f"downgrade {gone.name}") == 1
+    assert rig.state.log.count(f"downgrade {changed.name}") == 1
+
+
+def test_no_line_is_printed_when_every_cached_subtitle_is_intact(rig: Rig) -> None:
+    _found_row(rig, "good.mkv", b"one", on_disk=b"one")
+    rig.run()
+    assert rig.resolver.names == []
+    assert not [line for line in rig.reporter.done if "cached subtitle" in line]
+
+
+def test_the_cache_check_stays_within_the_path_scope_and_skips_delivered_files(rig: Rig) -> None:
+    inside = _found_row(rig, "in.mkv", b"x", on_disk=None)
+    outside = _found_row(rig, "out.mkv", b"y", on_disk=None)
+    delivered = _found_row(rig, "done.mkv", b"z", on_disk=None)
+    rig.state.set_status(delivered, Status.COMPLETED, "delivered")
+    rig.run(only=inside)
+    assert rig.resolver.names == ["in.mkv"]
+    assert rig.sub(outside).status is SubtitleStatus.FOUND
+    assert rig.sub(delivered).status is SubtitleStatus.FOUND
+
+
+def test_a_reset_time_is_shown_in_utc() -> None:
+    plus_two = timezone(timedelta(hours=2))
+    assert job_module._format_reset(datetime(2030, 1, 2, 1, 30, tzinfo=plus_two)) == (
+        "2030-01-01 23:30 UTC"
+    )

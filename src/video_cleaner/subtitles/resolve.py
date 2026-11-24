@@ -86,7 +86,7 @@ from video_cleaner.subtitles.opensubtitles import (
     QuotaExhausted,
     SubtitleResult,
 )
-from video_cleaner.subtitles.quota import quota_usable
+from video_cleaner.subtitles.quota import format_utc, quota_usable
 from video_cleaner.subtitles.textfmt import NormalisedSubtitle, SubtitleRejected, normalise_subtitle
 from video_cleaner.tools import Tools
 
@@ -123,6 +123,9 @@ _PROVENANCE = {
     "opensubtitles": "English (OpenSubtitles)",
 }
 NO_CREDENTIALS = "unavailable: no OpenSubtitles credentials"
+#: The reason of a WANTED row when the login was refused earlier in the same job (there are
+#: credentials, they were not accepted).
+LOGIN_REFUSED = "unavailable: OpenSubtitles login was refused this run"
 #: What every reason the resolver gives a multi-part film starts with; a survey never resets such
 #: a row (it tells it from its own UNCLEAR rows by this).
 MULTI_PART_PREFIX = "multi-part film"
@@ -149,13 +152,15 @@ def _utc_now() -> datetime:
 class ResolveContext:
     """Everything `resolve_subtitle` needs besides the file: settings, tools, the console,
     the indexed local subtitle folders, the OpenSubtitles client (None when there are no
-    credentials: the online step is skipped), the aligner and the clock (both replaceable)."""
+    credentials, or the login was refused: the online step is skipped and *offline_reason* is
+    what the WANTED record says), the aligner and the clock (both replaceable)."""
 
     settings: Settings
     tools: Tools
     reporter: Reporter
     local_index: Sequence[LocalSubtitle]
     client: SubtitleClient | None
+    offline_reason: str = NO_CREDENTIALS
     align: Callable[..., AlignResult] = align_subtitle
     now: Callable[[], datetime] = field(default=_utc_now)
 
@@ -174,7 +179,7 @@ class QuotaStop(ResolveStop):
     """The OpenSubtitles download allowance is spent; *reset_at* is when it renews, if known."""
 
     def __init__(self, record: SubtitleRecord, reset_at: datetime | None) -> None:
-        when = f"; it renews at {reset_at:%Y-%m-%d %H:%M} UTC" if reset_at else ""
+        when = f"; it renews at {format_utc(reset_at)}" if reset_at else ""
         super().__init__(record, f"the OpenSubtitles download allowance is used up{when}")
         self.reset_at = reset_at
 
@@ -277,7 +282,7 @@ class _Resolution:
         client = self.ctx.client
         if client is None:
             _log.info("%s: no OpenSubtitles client; the online step is skipped", self.label)
-            return self._record(SubtitleStatus.WANTED, NO_CREDENTIALS)
+            return self._record(SubtitleStatus.WANTED, self.ctx.offline_reason)
         return self._online(client)
 
     @property

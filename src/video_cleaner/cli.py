@@ -42,6 +42,7 @@ from video_cleaner.subtitles.opensubtitles import (
     OpenSubtitlesClient,
     UrllibTransport,
 )
+from video_cleaner.subtitles.quota import format_utc
 from video_cleaner.subtitles.resolve import ResolveContext
 from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
@@ -760,9 +761,10 @@ def _resolve_subtitles(
     limit: int | None,
     deadline: datetime | None,
     only: Path | None,
-) -> tuple[_job.JobSummary, str]:
-    """Run the subtitle job under its own lock (a `run` may be active beside it); the summary
-    and the line about the wanted subtitles a run has already dealt with ("" for none)."""
+) -> tuple[_job.JobSummary, str, bool]:
+    """Run the subtitle job under its own lock (a `run` may be active beside it); the summary,
+    the line about the wanted subtitles a run has already dealt with ("" for none) and whether
+    the plan (`planning.plan_hash`) differs from what it was before the job."""
     with (
         instance_lock(subs_lock_path_for(settings.state_db)),
         State.open(settings.state_db) as state,
@@ -780,13 +782,17 @@ def _resolve_subtitles(
             local_index=local_index,
             client=client,
         )
+        before = planning.plan_hash(planning.build_plan(state))
         summary = _job.run_resolve_job(
             settings, state, ctx, limit=limit, deadline=deadline, only=only
         )
-        return summary, _job.held_back_line(state)
+        changed = planning.plan_hash(planning.build_plan(state)) != before
+        return summary, _job.held_back_line(state), changed
 
 
-def _print_subs_summary(summary: _job.JobSummary, held_back: str = "") -> None:
+def _print_subs_summary(
+    summary: _job.JobSummary, held_back: str = "", plan_changed: bool = False
+) -> None:
     print_tagged(
         Level.INFO,
         f"Subtitles: found {summary.resolved_found}, unavailable {summary.unavailable}, "
@@ -801,7 +807,7 @@ def _print_subs_summary(summary: _job.JobSummary, held_back: str = "") -> None:
         print_tagged(Level.INFO, f"Stopped: {reason}")
     if held_back:
         print_tagged(Level.INFO, held_back)
-    if summary.resolved_found:
+    if plan_changed:
         print_tagged(
             Level.INFO,
             "The plan changed: run `plan`, review it, then `plan --ack` before the next `run`",
@@ -837,7 +843,7 @@ def subs_resolve(
     tools = _tools()
     with _open_reporter(settings, progress) as reporter, power.keep_awake():
         try:
-            summary, held_back = _resolve_subtitles(
+            summary, held_back, plan_changed = _resolve_subtitles(
                 settings, tools, reporter, limit=limit, deadline=deadline, only=path
             )
         except (AlreadyRunning, StateError, ToolNotFound, sqlite3.Error) as exc:
@@ -847,7 +853,7 @@ def subs_resolve(
                 Level.WARN, "subtitle lookup interrupted; what was stored stays", stderr=True
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
-    _print_subs_summary(summary, held_back)
+    _print_subs_summary(summary, held_back, plan_changed)
     if summary.stopped_reason == _job.INTERRUPTED:
         raise typer.Exit(code=EXIT_INTERRUPTED)
     if _job.is_failure(summary.stopped_reason):
@@ -860,11 +866,10 @@ def _quota_line(quota: QuotaInfo | None, now: datetime) -> str:
     if now >= quota.reset_at:
         return (
             "OpenSubtitles downloads left: unknown (the stored allowance renewed at "
-            f"{quota.reset_at:%Y-%m-%d %H:%M} UTC; the next download shows the new one)"
+            f"{format_utc(quota.reset_at)}; the next download shows the new one)"
         )
     return (
-        f"OpenSubtitles downloads left: {quota.remaining} "
-        f"(renews at {quota.reset_at:%Y-%m-%d %H:%M} UTC)"
+        f"OpenSubtitles downloads left: {quota.remaining} (renews at {format_utc(quota.reset_at)})"
     )
 
 
@@ -905,7 +910,7 @@ def subs_retry(
     _require_state(settings)
     try:
         with State.open(settings.state_db) as state:
-            changed, message = _job.retry_subtitle(state, path)
+            changed, message = _job.retry_subtitle(state, path, settings.subtitle_cache_dir)
     except StateError as exc:
         _fail(str(exc))
     if not changed:

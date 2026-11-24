@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -51,14 +52,21 @@ class EmptyStore:
 class FakeJob:
     """Replaces `run_resolve_job`; remembers how it was called."""
 
-    def __init__(self, outcome: JobSummary | BaseException = DONE) -> None:
+    def __init__(
+        self,
+        outcome: JobSummary | BaseException = DONE,
+        effect: Callable[[State], None] | None = None,
+    ) -> None:
         self.outcome = outcome
+        self.effect = effect  # what the job did to the state (it changes the plan hash)
         self.calls: list[dict[str, Any]] = []
 
     def __call__(
         self, settings: Any, state: State, ctx: ResolveContext, **kwargs: Any
     ) -> JobSummary:
         self.calls.append({"settings": settings, "state": state, "ctx": ctx, **kwargs})
+        if self.effect is not None:
+            self.effect(state)
         if isinstance(self.outcome, BaseException):
             raise self.outcome
         return self.outcome
@@ -290,13 +298,56 @@ def test_exit_codes_follow_why_the_job_stopped(
         assert reason in text
 
 
-def test_a_found_subtitle_reminds_the_user_that_the_plan_changed(
+def _changes_the_plan(tmp_path: Path, status: SubtitleStatus) -> Callable[[State], None]:
+    """What a job did: it set the subtitle row of a.mkv to *status* (a plan-visible change)."""
+    path = _wanted(tmp_path, "a.mkv")
+
+    def effect(state: State) -> None:
+        state.set_subtitle(SubtitleRecord(path, 1000, MTIME, status, reason="x", sha256="ab" * 32))
+
+    return effect
+
+
+HINT_PLAN = "plan --ack"
+
+
+@pytest.mark.parametrize(
+    ("status", "summary"),
+    [
+        (SubtitleStatus.FOUND, JobSummary(1, 0, 0, 0, "")),
+        (SubtitleStatus.UNAVAILABLE, JobSummary(0, 1, 0, 0, "")),
+        (SubtitleStatus.UNCLEAR, JobSummary(0, 1, 0, 0, "")),
+    ],
+)
+def test_the_plan_hint_follows_the_plan_not_the_found_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: SubtitleStatus, summary: JobSummary
+) -> None:
+    cfg = _setup(tmp_path)
+    fake = FakeJob(summary, _changes_the_plan(tmp_path, status))
+    monkeypatch.setattr(job_module, "run_resolve_job", fake)
+    result = _invoke("subs", "resolve", "--config", str(cfg), "-q")
+    assert result.exit_code == 0, result.output
+    assert HINT_PLAN in result.output and "The plan changed" in result.output
+
+
+def test_no_plan_hint_when_the_job_left_the_plan_as_it_was(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    result, _ = _resolve(tmp_path, monkeypatch, JobSummary(2, 0, 0, 0, ""))
-    assert "plan --ack" in result.output
-    quiet, _ = _resolve(tmp_path, monkeypatch, JobSummary(0, 1, 0, 0, ""))
-    assert "plan --ack" not in quiet.output
+    cfg = _setup(tmp_path)
+    _wanted(tmp_path, "a.mkv")
+    monkeypatch.setattr(job_module, "run_resolve_job", FakeJob(JobSummary(2, 1, 0, 0, "")))
+    result = _invoke("subs", "resolve", "--config", str(cfg), "-q")
+    assert HINT_PLAN not in result.output  # the fake job changed nothing, whatever it reports
+
+
+def test_a_reset_time_is_shown_in_utc_by_status() -> None:
+    from video_cleaner.cli import _quota_line
+
+    moment = datetime(2030, 1, 2, 1, 30, tzinfo=timezone(timedelta(hours=2)))
+    line = _quota_line(QuotaInfo(4, moment), datetime(2030, 1, 1, 0, 0, tzinfo=UTC))
+    assert "2030-01-01 23:30 UTC" in line
+    renewed = _quota_line(QuotaInfo(0, moment), datetime(2030, 1, 5, 0, 0, tzinfo=UTC))
+    assert "2030-01-01 23:30 UTC" in renewed
 
 
 def test_a_missing_tool_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -528,3 +579,38 @@ def test_nothing_is_said_when_no_wanted_file_is_held_back(
     for args in (["resolve", "-q"], ["status"]):
         out = _invoke("subs", *args, "--config", str(cfg)).output
         assert "already decided" not in out and "plan --retry" not in out
+
+
+def _kept_download(cache: Path, path: Path, file_id: int, size: int = 1000) -> None:
+    from video_cleaner.subtitles.cache import cache_key, cache_names
+
+    key = cache_key(SubtitleRecord(path, size, MTIME, SubtitleStatus.WANTED))
+    cache.mkdir(parents=True, exist_ok=True)
+    cache_names(cache, key, "opensubtitles", str(file_id)).staged.write_text("kept")
+
+
+def test_retry_says_how_many_remembered_candidates_are_kept_and_free_to_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "appdata" / "subs"
+    monkeypatch.setenv("VC_SUBTITLE_CACHE_DIR", str(cache))
+    cfg = write_config(tmp_path)
+    path = _wanted(tmp_path, "a.mkv")
+    _stored(tmp_path, path, SubtitleStatus.UNAVAILABLE)  # tried ids 4 and 5
+    _kept_download(cache, path, 4)
+    result = _invoke("subs", "retry", "--path", str(path), "--config", str(cfg))
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.output.split())
+    assert "1 of 2 remembered candidate(s) are kept" in text
+    assert "re-checked without a download" in text
+    assert "anything else may cost downloads" in text
+
+
+def test_retry_with_nothing_remembered_says_a_lookup_may_cost_downloads(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    path = _wanted(tmp_path, "a.mkv")
+    with State.open(tmp_path / "appdata" / "state.db") as state:
+        state.set_subtitle(SubtitleRecord(path, 1000, MTIME, SubtitleStatus.UNCLEAR, reason="x"))
+    result = _invoke("subs", "retry", "--path", str(path), "--config", str(cfg))
+    text = " ".join(result.output.split())
+    assert "no candidate is remembered" in text and "may cost downloads" in text

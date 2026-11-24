@@ -12,9 +12,13 @@ a free OpenSubtitles account (20 downloads a day) and for hostile input, so:
   tried ids and attempts), before the job acts on the stop.
 - A FOUND row is never replaced by a weaker one without `downgrade_stale_subtitle` first
   (`persist_subtitle`), because `State.set_subtitle` silently drops such a write.
-- One bad file (a probe that fails, a bug on a hostile subtitle) is logged and skipped; only a
-  missing tool, an unwritable cache, a login or service that keeps failing, a spent allowance,
-  the deadline, the limit and Ctrl+C end the job.
+- One bad file (a probe that fails, a bug on a hostile subtitle) is logged and skipped. A refused
+  login does not end the job: the client is dropped for the rest of it (sidecar and local files
+  are still used) and later files say the login was refused. Only a missing tool, an unwritable
+  cache, a service that keeps failing, a spent allowance, the deadline, the limit and Ctrl+C end
+  the job.
+- Before the first file, every FOUND row's cache file is checked (as a run does before it muxes);
+  a missing or changed one is sent back to WANTED and looked up again in the same pass.
 - Only the files that turned FOUND are decided again (`survey.redecide_found`); the video is
   already probed for the resolver, so nothing else is probed twice.
 """
@@ -44,10 +48,16 @@ from video_cleaner.state import (
     SubtitleRecord,
     SubtitleStatus,
 )
-from video_cleaner.subtitles.cache import check_cache_dir, sweep_align_workdirs
+from video_cleaner.subtitles.cache import (
+    cache_key,
+    check_cache_dir,
+    reusable_ids,
+    sweep_align_workdirs,
+)
 from video_cleaner.subtitles.models import QuotaInfo
-from video_cleaner.subtitles.quota import next_reset, quota_usable
+from video_cleaner.subtitles.quota import format_utc, next_reset, quota_usable
 from video_cleaner.subtitles.resolve import (
+    LOGIN_REFUSED,
     CacheUnwritable,
     OnlineFailure,
     QuotaStop,
@@ -55,6 +65,7 @@ from video_cleaner.subtitles.resolve import (
     ResolveStop,
     resolve_subtitle,
 )
+from video_cleaner.subtitles.stage import SubtitleCacheStale, check_cached_subtitle
 from video_cleaner.survey import redecide_found
 from video_cleaner.tools import ToolNotFound, Tools
 
@@ -81,6 +92,7 @@ NOT_ANSWERING = "OpenSubtitles is not answering"
 QUOTA_PREFIX = "quota exhausted until "
 CACHE_PREFIX = "cache folder is not writable: "
 CANNOT_START_PREFIX = "cannot start: "
+CACHE_STALE_REASON = "the cached subtitle is missing or changed"
 
 #: This many failed OpenSubtitles calls in a row end the job.
 MAX_CONSECUTIVE_FAILURES = 3
@@ -182,9 +194,23 @@ def _record_for(records: list[FileRecord], path: Path) -> FileRecord | None:
     return next((rec for rec in records if name_key(rec.path) == key), None)
 
 
-def retry_subtitle(state: State, path: Path) -> tuple[bool, str]:
+def _remembered(sub: SubtitleRecord, cache_dir: Path) -> str:
+    """What a retry of *sub* costs: how many of the candidates it remembers still have their
+    download (or finished file) in the cache, which a new lookup checks again without a request."""
+    if not sub.tried_ids:
+        return "no candidate is remembered, so a lookup may cost downloads"
+    kept = len(set(sub.tried_ids) & reusable_ids(cache_dir, cache_key(sub), "opensubtitles"))
+    return (
+        f"{kept} of {len(sub.tried_ids)} remembered candidate(s) are kept and re-checked without "
+        "a download; anything else may cost downloads"
+    )
+
+
+def retry_subtitle(state: State, path: Path, cache_dir: Path) -> tuple[bool, str]:
     """Make the UNAVAILABLE or UNCLEAR subtitle of *path* WANTED again (forgetting what was
-    tried); *path* may be a part of a multi-part film. Returns (changed, a line to show)."""
+    tried); *path* may be a part of a multi-part film. Returns (changed, a line to show), which
+    says how many of the remembered candidates are still kept in *cache_dir* (free to check
+    again)."""
     shown = _printable(path, 300)
     rec = _record_for(state.records(), path)
     if rec is None:
@@ -197,10 +223,11 @@ def retry_subtitle(state: State, path: Path) -> tuple[bool, str]:
             f"{shown}: the subtitle is {sub.status.value}; only unavailable or unclear ones "
             "are retried"
         )
+    cost = _remembered(sub, cache_dir)
     state.reset_subtitle(rec.path, rec.size, rec.mtime)
     return True, (
         f"{shown}: subtitle {sub.status.value} -> wanted; `subs resolve` looks it up again "
-        "(a file waiting for a subtitle is skipped by `run`)"
+        f"({cost}; a file waiting for a subtitle is skipped by `run`)"
     )
 
 
@@ -216,7 +243,7 @@ def _printable(text: object, limit: int = _MAX_LINE_CHARS) -> str:
 
 
 def _format_reset(moment: datetime) -> str:
-    return f"{moment:%Y-%m-%d %H:%M} UTC"
+    return format_utc(moment)
 
 
 class _Job:
@@ -268,6 +295,7 @@ class _Job:
         swept = sweep_align_workdirs(self.settings.subtitle_cache_dir)
         if swept:
             _log.info("removed %d align work folder(s) left by a stopped run", swept)
+        self._recheck_cached()
         queue = self._select()
         try:
             reason = self._loop(queue)
@@ -312,6 +340,31 @@ class _Job:
             self.deferred += remaining
             return QUOTA_PREFIX + _format_reset(quota.reset_at)
         return ""
+
+    def _recheck_cached(self) -> None:
+        """Send every FOUND row whose cache file is missing or changed back to WANTED.
+
+        The same check a run makes before it muxes (`check_cached_subtitle`), made here so that
+        the lookup happens in this pass instead of after a failed run. Only files a lookup could
+        still change count: not delivered, running or decided ones, and only inside the scope.
+        """
+        live = {record_key(r): r for r in self.state.records()}
+        stale = 0
+        for sub in self.state.subtitles_with_status(SubtitleStatus.FOUND):
+            rec = live.get(record_key(sub))
+            if rec is None or held_back_reason(rec) or not self._in_scope(rec.path, *rec.parts):
+                continue
+            try:
+                check_cached_subtitle(sub, self.settings)
+            except SubtitleCacheStale as exc:
+                why = f"{CACHE_STALE_REASON}: {exc}"
+                if self.state.downgrade_stale_subtitle(sub.path, sub.size, sub.mtime, why):
+                    stale += 1
+                    _log.warning("%s: %s; looking it up again", _printable(sub.path.name), exc)
+        if stale:
+            line = f"{stale} cached subtitle(s) missing or changed: looking them up again"
+            _log.warning("%s", line)
+            self.reporter.file_done(line, Level.WARN)
 
     # -- selection --------------------------------------------------------------------------
 
@@ -478,7 +531,7 @@ class _Job:
 
     def _online_failure(self, tag: str, rec: FileRecord, stop: OnlineFailure) -> str:
         if stop.fatal:
-            self.ctx = replace(self.ctx, client=None)
+            self.ctx = replace(self.ctx, client=None, offline_reason=LOGIN_REFUSED)
             _log.warning(
                 "OpenSubtitles refused the login: online lookups are off for the rest of this "
                 "job (sidecar and local files are still used)"

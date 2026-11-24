@@ -1060,3 +1060,26 @@ def test_an_os_error_reading_the_aligned_output_stops(
     with pytest.raises(CacheUnwritable):
         case.resolve()
     assert client.download_calls == [1]
+
+
+def test_a_reset_time_in_another_zone_is_printed_in_utc(tmp_path: Path) -> None:
+    from datetime import datetime, timezone
+
+    reset = datetime(2030, 1, 2, 1, 30, tzinfo=timezone(timedelta(hours=2)))
+    client = FakeClient(title_results=[result(1)], downloads={1: QuotaExhausted("used up", reset)})
+    case = online(tmp_path, client, movie_hash=None)
+    with pytest.raises(QuotaStop) as caught:
+        case.resolve()
+    assert "renews at 2030-01-01 23:30 UTC" in caught.value.reason
+
+
+def test_without_a_client_the_record_says_why_in_the_contexts_words(tmp_path: Path) -> None:
+    from video_cleaner.subtitles.resolve import NO_CREDENTIALS
+
+    case = online(tmp_path, FakeClient(), movie_hash=None)
+    case.ctx = replace(case.ctx, client=None)
+    assert case.resolve().reason == NO_CREDENTIALS
+    case.ctx = replace(case.ctx, offline_reason="unavailable: the login was refused")
+    out = case.resolve()
+    assert out.status is SubtitleStatus.WANTED
+    assert out.reason == "unavailable: the login was refused"

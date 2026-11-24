@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from video_cleaner.subtitles.models import QuotaInfo
-from video_cleaner.subtitles.quota import next_reset, quota_usable
+from video_cleaner.subtitles.quota import format_utc, next_reset, quota_usable
 
 
 def utc(
@@ -87,3 +87,10 @@ def test_usable_refuses_a_naive_now() -> None:
         quota_usable(q, datetime(2026, 11, 23, 12))
     with pytest.raises(ValueError, match="timezone"):
         quota_usable(None, datetime(2026, 11, 23, 12))
+
+
+def test_format_utc_converts_before_it_says_utc() -> None:
+    plus_two = timezone(timedelta(hours=2))
+    assert format_utc(datetime(2030, 1, 2, 1, 30, tzinfo=plus_two)) == "2030-01-01 23:30 UTC"
+    assert format_utc(datetime(2030, 1, 2, 0, 0, tzinfo=UTC)) == "2030-01-02 00:00 UTC"
+    assert format_utc(datetime(2030, 1, 2, 0, 0)) == "2030-01-02 00:00 UTC"  # naive: taken as UTC
