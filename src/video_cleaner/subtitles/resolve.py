@@ -102,7 +102,10 @@ _PROVENANCE = {
     "opensubtitles": "English (OpenSubtitles)",
 }
 NO_CREDENTIALS = "unavailable: no OpenSubtitles credentials"
-MULTI_PART = "multi-part film: subtitle lookup needs the parts combined (not supported yet)"
+#: What every reason the resolver gives a multi-part film starts with; a survey never resets such
+#: a row (it tells it from its own UNCLEAR rows by this).
+MULTI_PART_PREFIX = "multi-part film"
+MULTI_PART = f"{MULTI_PART_PREFIX}: subtitle lookup needs the parts combined (not supported yet)"
 
 
 class SubtitleClient(Protocol):

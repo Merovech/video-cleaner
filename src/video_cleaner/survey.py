@@ -42,6 +42,7 @@ from video_cleaner.subtitles.embedded import (
     is_english,
     measure_cue_density,
 )
+from video_cleaner.subtitles.resolve import MULTI_PART_PREFIX
 from video_cleaner.tools import ToolNotFound, Tools
 
 _log = logging.getLogger("video_cleaner.survey")
@@ -424,15 +425,53 @@ def _plan_group(
     return rows
 
 
+def _survey_unclear(existing: SubtitleRecord) -> bool:
+    """Whether *existing* is an UNCLEAR row survey wrote (a track with no language tag, English
+    only as closed captions), as opposed to the resolver's multi-part one."""
+    return existing.status is SubtitleStatus.UNCLEAR and not existing.reason.startswith(
+        MULTI_PART_PREFIX
+    )
+
+
+def _store_wanted(info: MediaInfo, state: State, *, english_audio: bool) -> SubtitleRecord:
+    """The WANTED record for *info*: a new one, or the stored one.
+
+    A stored NOT_NEEDED row, or UNCLEAR one that survey itself wrote, no longer matches what
+    the file's own tracks say (the threshold for a full forced track was calibrated, or a
+    track was retagged), so it is replaced by a fresh WANTED row; the drift is logged. A
+    WANTED, UNAVAILABLE or FOUND row, and the resolver's UNCLEAR one for a multi-part film, are
+    kept as they are (`State.ensure_wanted`).
+    """
+    existing = state.subtitle(info.path, info.size, info.mtime)
+    if existing is not None and (
+        existing.status is SubtitleStatus.NOT_NEEDED or _survey_unclear(existing)
+    ):
+        _log.info(
+            "%s: the subtitle was %s but the file's own tracks now need an English one; "
+            "looking it up again",
+            info.path.name,
+            existing.status.value,
+        )
+        wanted = SubtitleRecord(
+            info.path,
+            info.size,
+            info.mtime,
+            SubtitleStatus.WANTED,
+            english_audio=english_audio,
+        )
+        state.set_subtitle(wanted)
+        return wanted
+    return state.ensure_wanted(info.path, info.size, info.mtime, english_audio=english_audio)
+
+
 def _store_subtitles(subtitles: _Subtitles, info: MediaInfo, state: State) -> str:
     """Write the subtitle record *subtitles* calls for; the status now stored, for the CSV."""
     if subtitles.store is not None:
         state.set_subtitle(subtitles.store)
-        return subtitles.store.status.value
+        stored = state.subtitle(info.path, info.size, info.mtime)
+        return (stored or subtitles.store).status.value  # a FOUND row is never replaced
     if subtitles.want_english_audio is not None:
-        wanted = state.ensure_wanted(
-            info.path, info.size, info.mtime, english_audio=subtitles.want_english_audio
-        )
+        wanted = _store_wanted(info, state, english_audio=subtitles.want_english_audio)
         return wanted.status.value
     return SubtitleStatus.FOUND.value if subtitles.needs_subs else ""
 
@@ -464,7 +503,13 @@ def _record(row: _Row, state: State) -> _Row:
         )
     if row.subtitles is None:
         return row
-    return replace(row, subtitle_status=_store_subtitles(row.subtitles, row.info, state))
+    status = _store_subtitles(row.subtitles, row.info, state)
+    subtitles = row.subtitles
+    if subtitles.store is not None and status != subtitles.store.status.value:
+        # The stored row differs from what the tracks say (a FOUND one was kept): the two CSV
+        # columns must not contradict each other.
+        subtitles = replace(subtitles, english=NONE_EMBEDDED)
+    return replace(row, subtitles=subtitles, subtitle_status=status)
 
 
 def _size_or_none(path: Path) -> int | None:

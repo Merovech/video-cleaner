@@ -403,6 +403,130 @@ def test_resurvey_keeps_what_the_resolver_decided(tmp_path: Path) -> None:
         state.close()
 
 
+def test_a_threshold_calibrated_up_sends_not_needed_back_to_wanted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Forced.mkv")
+    rules = {"Forced.mkv": lambda p: _with(p, _sub(3, forced=True))}
+    first, state = _survey(settings, rules, FakeDensity({3: 300.0}))
+    try:
+        before = _sub_row(state, film)
+        assert before is not None and before.status is SubtitleStatus.NOT_NEEDED
+        row = _by_name(_csv_rows(first.csv_path))["Forced.mkv"]
+        assert (row["english_subtitle"], row["subtitle_status"]) == ("reclassified", "not_needed")
+
+        calibrated = dataclasses.replace(settings, forced_full_cues_per_hour=600.0)
+        with caplog.at_level(logging.INFO, logger="video_cleaner.survey"):
+            result, _ = _survey(calibrated, rules, FakeDensity({3: 300.0}), state=state)
+
+        after = _sub_row(state, film)
+        assert after is not None and after.status is SubtitleStatus.WANTED
+        assert after.provider == "" and after.reason == "" and after.english_audio is True
+    finally:
+        state.close()
+    row = _by_name(_csv_rows(result.csv_path))["Forced.mkv"]
+    assert (row["english_subtitle"], row["subtitle_status"]) == ("none", "wanted")
+    assert any("Forced.mkv" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+
+
+def test_an_unclear_survey_row_goes_back_to_wanted_when_the_track_no_longer_classifies_so(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Und.mkv")
+    _result, state = _survey(settings, {"Und.mkv": lambda p: _with(p, _sub(2, "und"))})
+    try:
+        unclear = _sub_row(state, film)
+        assert unclear is not None and unclear.status is SubtitleStatus.UNCLEAR
+        result, _ = _survey(settings, {"Und.mkv": lambda p: _with(p, _sub(2, "fra"))}, state=state)
+        again = _sub_row(state, film)
+        assert again is not None and again.status is SubtitleStatus.WANTED
+    finally:
+        state.close()
+    row = _by_name(_csv_rows(result.csv_path))["Und.mkv"]
+    assert (row["english_subtitle"], row["subtitle_status"]) == ("none", "wanted")
+
+
+def test_the_resolvers_multipart_unclear_row_is_not_reset_by_a_survey(tmp_path: Path) -> None:
+    from video_cleaner.subtitles.resolve import MULTI_PART
+
+    settings = _settings(tmp_path)
+    pt1 = _touch(settings.library_root / "Mabuse pt1.mkv")
+    _touch(settings.library_root / "Mabuse pt2.mkv")
+    _result, state = _survey(settings, {})
+    try:
+        rec = state.get(pt1)
+        assert rec is not None
+        resolver_row = SubtitleRecord(
+            pt1, rec.size, rec.mtime, SubtitleStatus.UNCLEAR, reason=MULTI_PART
+        )
+        state.set_subtitle(resolver_row)
+        result, _ = _survey(settings, {}, state=state)
+        assert _sub_row(state, pt1) == resolver_row
+    finally:
+        state.close()
+    row = _by_name(_csv_rows(result.csv_path))["Mabuse pt1.mkv"]
+    assert row["subtitle_status"] == "unclear"
+
+
+def test_a_wanted_row_keeps_its_tried_ids_and_a_found_row_stays_found_on_resurvey(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    wanted = _touch(settings.library_root / "Wanted.mkv")
+    found = _touch(settings.library_root / "Found.mkv")
+    unavailable = _touch(settings.library_root / "Unavailable.mkv")
+    _result, state = _survey(settings, {})
+    try:
+        stored = {}
+        for path, status in (
+            (wanted, SubtitleStatus.WANTED),
+            (found, SubtitleStatus.FOUND),
+            (unavailable, SubtitleStatus.UNAVAILABLE),
+        ):
+            rec = state.get(path)
+            assert rec is not None
+            row = SubtitleRecord(
+                path,
+                rec.size,
+                rec.mtime,
+                status,
+                english_audio=True,
+                tried_ids=(5, 6),
+                attempts=2,
+                reason="x",
+            )
+            state.set_subtitle(row)
+            stored[path] = _sub_row(state, path)
+        result, _ = _survey(settings, {}, state=state)
+        assert {p: _sub_row(state, p) for p in stored} == stored
+    finally:
+        state.close()
+    rows = _by_name(_csv_rows(result.csv_path))
+    assert rows["Found.mkv"]["subtitle_status"] == "found"
+    assert rows["Wanted.mkv"]["subtitle_status"] == "wanted"
+    assert rows["Unavailable.mkv"]["subtitle_status"] == "unavailable"
+
+
+def test_the_csv_never_contradicts_a_kept_found_row(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Und.mkv")
+    rules = {"Und.mkv": lambda p: _with(p, _sub(2, "und"))}
+    _result, state = _survey(settings, {})
+    try:
+        rec = state.get(film)
+        assert rec is not None
+        state.set_subtitle(SubtitleRecord(film, rec.size, rec.mtime, SubtitleStatus.FOUND))
+        result, _ = _survey(settings, rules, state=state)  # no cache file: classified again
+        stored = _sub_row(state, film)
+        assert stored is not None and stored.status is SubtitleStatus.FOUND
+    finally:
+        state.close()
+    row = _by_name(_csv_rows(result.csv_path))["Und.mkv"]
+    assert (row["english_subtitle"], row["subtitle_status"]) == ("none", "found")
+
+
 def test_a_changed_file_gets_a_new_subtitle_row(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     film = _touch(settings.library_root / "Film.mkv")
