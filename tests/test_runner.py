@@ -3035,6 +3035,39 @@ def test_an_abandoned_encode_whose_remux_fails_verify_is_flagged_and_delivers_no
     assert _scratch_files(settings) == []
 
 
+def test_a_too_large_encode_whose_fallback_remux_fails_verify_is_flagged_and_delivers_nothing(
+    settings: Settings, state: State
+) -> None:
+    """The size gate rejects the encode (its subtitle is fine), then the subtitle-only remux
+    that replaces it loses the subtitle: nothing may be delivered."""
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    _abandon_by_size(fakes)
+    real_mux = fakes.mux
+    muxes: list[int] = []
+
+    def mux_then_lose_the_subtitle(*args: Any, **kwargs: Any) -> None:
+        muxes.append(1)
+        fakes.drop_subtitle = len(muxes) > 1  # only the fallback remux is broken
+        fakes.subtitled.clear()  # the fallback writes the same output path as the encode did
+        real_mux(*args, **kwargs)
+
+    fakes.mux = mux_then_lose_the_subtitle  # type: ignore[method-assign]
+    summary = _run(settings, state, fakes)
+
+    assert len(muxes) == 2 and fakes.names().count("encode_full") == 1
+    verifies = [c for c in fakes.calls if c[0] == "verify"]
+    assert [v[3]["encoded"] for v in verifies] == [True, False]
+    assert (summary.flagged, summary.completed, summary.left_alone) == (1, 0, 0)
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED and "subtitle streams" in record.note
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert _scratch_files(settings) == []
+
+
 @pytest.mark.parametrize("path", list(ABANDONED))
 def test_an_abandoned_multi_part_encode_muxes_the_combined_file_with_the_subtitle(
     settings: Settings, state: State, path: str

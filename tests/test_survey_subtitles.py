@@ -765,6 +765,48 @@ def _hevc(path: Path) -> MediaInfo:
     return _info(path, codec="hevc")
 
 
+def test_an_hevc_file_without_english_subtitles_is_wanted_and_becomes_a_remux_once_found(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Efficient.mkv")
+    rules = {"Efficient.mkv": _hevc}
+    result, state = _survey(settings, rules)
+    try:
+        sub = _sub_row(state, film)
+        assert sub is not None and sub.status is SubtitleStatus.WANTED
+        rec = state.get(film)
+        assert rec is not None and (rec.decision, rec.status) == ("leave_alone", Status.LEFT_ALONE)
+        row = _by_name(_csv_rows(result.csv_path))["Efficient.mkv"]
+        assert (row["action"], row["english_subtitle"], row["subtitle_status"]) == (
+            "leave_alone",
+            "none",
+            "wanted",
+        )
+
+        found = SubtitleRecord(
+            film,
+            rec.size,
+            rec.mtime,
+            SubtitleStatus.FOUND,
+            provider="opensubtitles",
+            cache_path=tmp_path / "cache" / "Efficient.srt",
+            sha256="cd" * 32,
+            english_audio=True,
+        )
+        state.set_subtitle(found)
+        again, _ = _survey(settings, rules, state=state)
+
+        rec = state.get(film)
+        assert rec is not None and (rec.decision, rec.status) == ("remux", Status.PENDING)
+        assert "new subtitles to mux in" in rec.reasons
+        assert _sub_row(state, film) == found
+        row = _by_name(_csv_rows(again.csv_path))["Efficient.mkv"]
+        assert (row["action"], row["subtitle_status"]) == ("remux", "found")
+    finally:
+        state.close()
+
+
 def test_redecide_found_turns_a_left_alone_file_into_a_pending_remux(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     film = _touch(settings.library_root / "Done.mkv")
