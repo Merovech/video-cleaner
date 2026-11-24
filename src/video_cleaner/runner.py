@@ -18,6 +18,9 @@ mkvmerge as one last track on both the remux and the encode path; `verify_output
 exactly that one new English track. A cache file that is gone or changed sends the file to RETRY
 and the subtitle back to WANTED. A remux whose only change is the subtitle is delivered even
 though it is not smaller.
+A single file that was queued as a remux for its subtitle alone and has none by the time it runs
+(the cache went stale and the lookup found nothing, or ``include_unresolved``) is decided again
+without one: it is left alone or flagged, and nothing is delivered.
 
 A verified output is moved to the completed folder and recorded in ``manifest.csv``; scratch is
 released after every file, whatever happened. The library is never written: every output path
@@ -125,6 +128,8 @@ MANIFEST_NAME = "manifest.csv"
 DELIVERY_SUFFIX = ".part"
 _DELIVERY_GLOB = "*.mkv" + DELIVERY_SUFFIX
 RECOVERED_NOTE = "recovered after an interrupted delivery"
+# A single file queued as a remux only for its subtitle, whose subtitle is no longer there.
+SUBTITLE_GONE_NOTE = "subtitle no longer available; nothing left to do for this file"
 # mkvmerge exits 1 for warnings (the output is fine) and 2 for errors.
 MKVMERGE_ERROR_EXIT = 2
 
@@ -1055,6 +1060,23 @@ class _Runner:
             subtitle=subtitle,
         )
 
+    def _remux_without_subtitle(self, info: MediaInfo) -> _Outcome | None:
+        """The end of a single file that was queued as a remux and has no subtitle to mux.
+
+        Such a file was a remux only for its subtitle (a plain remux is never planned for a
+        single file), and it has none now: its cache went stale and the lookup found nothing,
+        or the run takes it without waiting (`--include-unresolved`). It is decided again
+        without a subtitle: a file that needs no remux is left alone, one the decision engine
+        flags keeps its reasons, and nothing is delivered. None when it is still a remux or
+        an encode (the plan stands). A multi-part join is not decided here.
+        """
+        again = decide(info, self.settings, needs_subs=False, multipart=False)
+        if again.action is Action.FLAG:
+            return _Outcome(Status.FLAGGED, "; ".join(again.reasons))
+        if again.action is Action.LEAVE_ALONE:
+            return _Outcome(Status.LEFT_ALONE, SUBTITLE_GONE_NOTE)
+        return None
+
     def _encode_abandoned(self, job: _FileJob, why: str, drop: tuple[Path, ...] = ()) -> _Outcome:
         """The encode is not worth keeping: leave the file alone, or, when a found subtitle is
         waiting to be delivered, deliver a subtitle-only remux of the original instead.
@@ -1112,6 +1134,10 @@ class _Runner:
             info = pipe.probe(copies[0], tools, rep)
             source = copies[0]
             action = Action(rec.decision)
+            if action is Action.REMUX and subtitle is None:
+                ended = self._remux_without_subtitle(info)
+                if ended is not None:
+                    return ended
 
         verify_args: dict[str, Any] = {
             "min_saving": s.min_saving,

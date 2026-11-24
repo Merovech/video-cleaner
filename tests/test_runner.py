@@ -245,6 +245,7 @@ class Fakes:
         self.encode_advances = timedelta(0)
         self.after_copy: Callable[[Path], None] | None = None
         self.codec = "h264"
+        self.transfer = "bt709"  # "smpte2084" makes every probed file HDR
         # output path -> title of the subtitle muxed into it (what its probe then shows)
         self.subtitled: dict[str, str] = {}
         # the subtitle path and bytes each mux call was given, read at the time of the call
@@ -272,6 +273,10 @@ class Fakes:
         st = path.stat()
         duration = self.durations.get(str(path), 100.0)
         info = _info(path, st.st_size, st.st_mtime, duration, self.codec)
+        if self.transfer != "bt709" and info.video is not None:
+            info = dataclasses.replace(
+                info, video=dataclasses.replace(info.video, transfer=self.transfer)
+            )
         title = self.subtitled.get(str(path))
         if title is None:
             return info
@@ -2802,6 +2807,106 @@ def test_ctrl_c_during_the_mux_leaves_no_staged_subtitle_behind(
     assert cache.read_bytes() == SRT_BYTES
     assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
     assert not (settings.completed_dir / "a.mkv").exists()
+
+
+# --- a remux that existed only for its subtitle ends when the subtitle is gone -----------------
+
+GONE_NOTE = "subtitle no longer available; nothing left to do for this file"
+
+
+def _delivered_nothing(settings: Settings, fakes: Fakes) -> None:
+    assert "mux" not in fakes.names() and "verify" not in fakes.names()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert (
+        not list(settings.completed_dir.rglob("*.mkv")) if settings.completed_dir.exists() else True
+    )
+    assert _scratch_files(settings) == []
+
+
+def test_a_remux_whose_subtitle_went_stale_and_ended_unavailable_delivers_nothing(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/clip.mp4", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    cache = _found_subtitle(settings, state, rec)
+    cache.unlink()  # the cache was cleared
+    first = Fakes()
+    first.codec = "hevc"
+    summary = _run(settings, state, first)
+    assert summary.retry == 1 and first.calls == []
+    assert _subtitle_of(state, rec).status is SubtitleStatus.WANTED
+
+    # `subs resolve` finds nothing, the user acknowledges the plan, and runs again.
+    state.set_subtitle(
+        dataclasses.replace(
+            _subtitle_of(state, rec), status=SubtitleStatus.UNAVAILABLE, reason="none found"
+        )
+    )
+    library_before = _tree(settings.library_root)
+    again = Fakes()
+    again.codec = "hevc"
+    summary = _run(settings, state, again)
+    assert (summary.completed, summary.left_alone, summary.flagged) == (0, 1, 0)
+    record = _status(state, src)
+    assert record.status is Status.LEFT_ALONE and record.note == GONE_NOTE
+    _delivered_nothing(settings, again)
+    assert _tree(settings.library_root) == library_before
+
+
+def test_include_unresolved_on_a_wanted_remux_delivers_nothing(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/clip.mp4", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    fakes.codec = "hevc"
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert (summary.completed, summary.left_alone) == (0, 1)
+    record = _status(state, src)
+    assert record.status is Status.LEFT_ALONE and record.note == GONE_NOTE
+    _delivered_nothing(settings, fakes)
+
+
+def test_an_hdr_remux_that_lost_its_subtitle_is_flagged_with_its_reasons(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/hdr.avi", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    fakes.transfer = "smpte2084"
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert (summary.completed, summary.flagged) == (0, 1)
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED
+    assert record.note == "HDR (transfer smpte2084)"
+    _delivered_nothing(settings, fakes)
+
+
+def test_a_single_remux_that_the_probe_still_wants_encoded_or_remuxed_goes_on(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Show/clip.mp4", size=3000)
+    _plan(state, src, decision="remux", est=0)  # no subtitle record; h264 would be encoded
+    fakes = Fakes()
+    assert _run(settings, state, fakes).completed == 1
+    assert fakes.names().count("mux") == 1
+
+
+def test_a_multi_part_join_without_a_subtitle_still_delivers(
+    settings: Settings, state: State
+) -> None:
+    pt1 = _source(settings, "Epic cd1.mkv", size=1000)
+    pt2 = _source(settings, "Epic cd2.mkv", size=1000)
+    rec = _plan(state, pt1, decision="remux", parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    fakes.codec = "hevc"
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert summary.completed == 1 and summary.left_alone == 0
+    assert (settings.completed_dir / "Epic.mkv").stat().st_size == 2000
 
 
 def _abandon_by_projection(fakes: Fakes) -> None:
