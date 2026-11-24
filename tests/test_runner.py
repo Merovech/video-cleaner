@@ -1958,6 +1958,56 @@ def test_run_refused_when_plan_changed_since_ack(
     assert not settings.completed_dir.exists()
 
 
+def test_a_change_between_the_plan_check_and_the_snapshot_is_refused(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `subs resolve` that finishes a file after the early plan check, before the run takes
+    its snapshot, must not smuggle an unacknowledged plan into the run."""
+    a = _source(settings, "a.avi")
+    b = _source(settings, "b.avi")
+    _plan(state, a, est=900)
+    rec_b = _plan(state, b, est=100)
+    _want_subtitle(state, rec_b)
+    _ack(state)
+    real = runner_module.refuse_outputs_in_library
+    fired: list[int] = []
+
+    def with_a_resolve_in_between(checked: Settings) -> None:
+        real(checked)  # the early plan check has passed by now
+        fired.append(1)
+        state.set_subtitle(
+            SubtitleRecord(
+                path=rec_b.path,
+                size=rec_b.size,
+                mtime=rec_b.mtime,
+                status=SubtitleStatus.UNAVAILABLE,
+                reason="none found",
+            )
+        )
+
+    monkeypatch.setattr(runner_module, "refuse_outputs_in_library", with_a_resolve_in_between)
+    fakes = Fakes()
+    with pytest.raises(PlanNotAcknowledged, match="plan changed since it was acknowledged"):
+        run_queue(
+            settings,
+            TOOLS,
+            state,
+            RecordingReporter(),
+            deadline=None,
+            now=Clock(),
+            pipeline=fakes.pipeline(),
+        )
+    assert fired and fakes.calls == []
+    assert not settings.completed_dir.exists()
+    assert _status(state, a).status is Status.PENDING
+
+
+def test_an_unchanged_plan_passes_the_second_check(settings: Settings, state: State) -> None:
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    assert _run(settings, state, Fakes()).completed == 1
+
+
 def test_stale_found_by_a_run_needs_a_new_ack(settings: Settings, state: State) -> None:
     """Deliberate: a run that marks a record STALE changes the plan (STALE drops out of it),
     so the next run is refused until `plan` is reviewed and acknowledged again."""

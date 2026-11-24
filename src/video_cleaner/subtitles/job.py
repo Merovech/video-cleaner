@@ -32,7 +32,7 @@ from pathlib import Path
 from video_cleaner.config import Settings
 from video_cleaner.consolefmt import Level
 from video_cleaner.logging_setup import redact
-from video_cleaner.paths import name_key, name_under
+from video_cleaner.paths import name_key, name_under, record_key
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Reporter
 from video_cleaner.state import (
@@ -159,10 +159,10 @@ def held_back_reason(rec: FileRecord) -> str:
 
 def held_back_line(state: State) -> str:
     """One line saying how many wanted subtitles are held back by a run, or "" for none."""
-    live = {(r.path, r.size, r.mtime): r for r in state.records()}
+    live = {record_key(r): r for r in state.records()}
     tally = dict.fromkeys((_DECIDED, _DELIVERED, _BUSY), 0)
     for sub in state.wanted_subtitles():
-        rec = live.get((sub.path, sub.size, sub.mtime))
+        rec = live.get(record_key(sub))
         why = "" if rec is None else held_back_reason(rec)
         if why:
             tally[why] += 1
@@ -324,10 +324,10 @@ class _Job:
         return "no live file record" if rec is None else held_back_reason(rec)
 
     def _select(self) -> list[tuple[FileRecord, SubtitleRecord]]:
-        live = {(r.path, r.size, r.mtime): r for r in self.state.records()}
+        live = {record_key(r): r for r in self.state.records()}
         queue: list[tuple[FileRecord, SubtitleRecord]] = []
         for sub in self.state.wanted_subtitles():
-            rec = live.get((sub.path, sub.size, sub.mtime))
+            rec = live.get(record_key(sub))
             if not self._in_scope(*((sub.path,) if rec is None else (rec.path, *rec.parts))):
                 continue
             why = self._unsuitable(rec)

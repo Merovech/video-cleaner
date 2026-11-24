@@ -156,3 +156,19 @@ def test_name_key_is_string_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 @windows_only
 def test_name_key_folds_case_on_windows(tmp_path: Path) -> None:
     assert name_key(tmp_path / "A.MKV") == name_key(Path(str(tmp_path).lower()) / "a.mkv")
+
+
+def test_file_key_is_the_name_key_with_size_and_mtime(tmp_path: Path) -> None:
+    path = tmp_path / "lib" / ".." / "a.mkv"
+    assert paths.file_key(path, 10, 2.5) == (name_key(tmp_path / "a.mkv"), 10, 2.5)
+
+
+def test_record_key_serves_file_and_subtitle_records(tmp_path: Path) -> None:
+    from video_cleaner.state import FileRecord, Status, SubtitleRecord, SubtitleStatus
+
+    path = tmp_path / "a.mkv"
+    rec = FileRecord(path, 7, 1.5, Status.PENDING, "encode", (), 0, (), "")
+    sub = SubtitleRecord(path, 7, 1.5, SubtitleStatus.WANTED)
+    assert paths.record_key(rec) == paths.record_key(sub) == paths.file_key(path, 7, 1.5)
+    other = dataclasses.replace(sub, mtime=2.0)
+    assert paths.record_key(other) != paths.record_key(sub)

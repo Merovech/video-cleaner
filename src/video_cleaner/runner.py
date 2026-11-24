@@ -71,6 +71,7 @@ from video_cleaner.paths import (
     name_under,
     outputs_outside_library,
     path_key,
+    record_key,
 )
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Progress, Reporter
@@ -436,11 +437,27 @@ class _Runner:
         only: Path | None,
         now: Callable[[], datetime],
         include_unresolved: bool = False,
+        acknowledged: str | None = None,
     ) -> None:
         self.include_unresolved = include_unresolved
         self.settings = settings
         self.tools = tools
         self.state = state
+        # The files this run may process: the queued ones as they are now, each with whether its
+        # subtitle was FOUND. A `subs resolve` beside the run may change files later; those
+        # changes were not acknowledged. The plan hash is checked again right after the snapshot
+        # (the early check in `run_queue` came before the lock): a file that changed in between
+        # is in the snapshot but not in the acknowledged plan, so the run is refused.
+        found = self._found()
+        self.start: dict[tuple[str, int, float], bool] = {
+            record_key(r): record_key(r) in found
+            for r in state.records(Status.PENDING, Status.RETRY)
+        }
+        if (
+            acknowledged is not None
+            and planning.plan_hash(planning.build_plan(state)) != acknowledged
+        ):
+            raise PlanNotAcknowledged(planning.PLAN_CHANGED)
         self.reporter = reporter
         self.pipeline = pipeline
         self.deadline = deadline
@@ -460,14 +477,6 @@ class _Runner:
             (Status.COMPLETED, Status.LEFT_ALONE, Status.FLAGGED, Status.RETRY), 0
         )
         self.bytes_saved = 0
-        # The files this run may process: the queued ones as they are now, that the plan hash
-        # has just been checked against, each with whether its subtitle was FOUND. A `subs
-        # resolve` beside the run may change files later; those changes were not acknowledged.
-        found = self._found()
-        self.start: dict[tuple[str, int, float], bool] = {
-            (name_key(r.path), r.size, r.mtime): (name_key(r.path), r.size, r.mtime) in found
-            for r in state.records(Status.PENDING, Status.RETRY)
-        }
 
     # -- selection ------------------------------------------------------------------------
 
@@ -493,15 +502,12 @@ class _Runner:
         """Keys of the files whose subtitle is still WANTED, none when they run regardless."""
         if self.include_unresolved:
             return frozenset()
-        return frozenset(
-            (name_key(sub.path), sub.size, sub.mtime) for sub in self.state.wanted_subtitles()
-        )
+        return frozenset(record_key(sub) for sub in self.state.wanted_subtitles())
 
     def _found(self) -> frozenset[tuple[str, int, float]]:
         """Keys of the files whose subtitle is FOUND."""
         return frozenset(
-            (name_key(sub.path), sub.size, sub.mtime)
-            for sub in self.state.subtitles_with_status(SubtitleStatus.FOUND)
+            record_key(sub) for sub in self.state.subtitles_with_status(SubtitleStatus.FOUND)
         )
 
     def _changed(
@@ -519,7 +525,7 @@ class _Runner:
         waiting: frozenset[tuple[str, int, float]],
         found: frozenset[tuple[str, int, float]],
     ) -> bool:
-        key = (name_key(rec.path), rec.size, rec.mtime)
+        key = record_key(rec)
         return (
             rec.decision in _WORK_DECISIONS
             and key not in self.attempted
@@ -533,7 +539,7 @@ class _Runner:
         found = self._found()
         count = 0
         for rec in self.state.records(Status.PENDING, Status.RETRY):
-            key = (name_key(rec.path), rec.size, rec.mtime)
+            key = record_key(rec)
             if (
                 rec.decision in _WORK_DECISIONS
                 and key not in self.attempted
@@ -552,7 +558,7 @@ class _Runner:
         if not waiting:
             return 0
         keys = (
-            (name_key(rec.path), rec.size, rec.mtime)
+            record_key(rec)
             for rec in self.state.records(Status.PENDING, Status.RETRY)
             if rec.decision in _WORK_DECISIONS and self.in_scope(rec)
         )
@@ -1196,7 +1202,7 @@ class _Runner:
 
     def process(self, rec: FileRecord) -> str:
         """Handle one record; returns a stop reason, or "" to carry on with the next file."""
-        self.attempted.add((name_key(rec.path), rec.size, rec.mtime))
+        self.attempted.add(record_key(rec))
         sources = rec.parts or (rec.path,)
         if self.prefetched is not None and name_key(self.prefetched) not in {
             name_key(p) for p in sources
@@ -1327,6 +1333,7 @@ def run_queue(
             now,
             current_log,
             include_unresolved,
+            acknowledged,
         )
 
 
@@ -1341,8 +1348,12 @@ def _run_locked(
     now: Callable[[], datetime],
     current_log: Path | None,
     include_unresolved: bool,
+    acknowledged: str,
 ) -> RunSummary:
-    """The body of `run_queue`, run while this process holds the single-instance lock."""
+    """The body of `run_queue`, run while this process holds the single-instance lock.
+
+    *acknowledged* is the plan hash the early check passed; the runner checks it once more when
+    it takes its snapshot of the queue."""
     reset = state.reset_in_progress()
     if reset:
         _log.info("%d file(s) left in progress by an earlier run were reset to retry", reset)
@@ -1351,7 +1362,16 @@ def _run_locked(
         _log.info("archived %d old log file(s)", len(removed))
 
     runner = _Runner(
-        settings, tools, state, reporter, pipeline, deadline, only, now, include_unresolved
+        settings,
+        tools,
+        state,
+        reporter,
+        pipeline,
+        deadline,
+        only,
+        now,
+        include_unresolved,
+        acknowledged,
     )
     if only is not None and not any(runner.in_scope(r) for r in state.records()):
         reason = f"no surveyed files under {only}: run `survey --root {only}`, `plan`, `plan --ack`"
