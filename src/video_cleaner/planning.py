@@ -26,7 +26,7 @@ from video_cleaner.atomicio import write_csv_atomic, write_text_atomic
 from video_cleaner.decide import DV5_REPLACE_REASON, Action
 from video_cleaner.manifest import ManifestEntry, check_unchanged
 from video_cleaner.multipart import find_part_groups
-from video_cleaner.state import FileRecord, State, Status
+from video_cleaner.state import FileRecord, State, Status, SubtitleStatus
 
 PLAN_CSV = "plan.csv"
 PLAN_HASH = "plan.hash"
@@ -37,6 +37,7 @@ PLAN_COLUMNS = (
     "path",
     "action",
     "status",
+    "subtitle",
     "size",
     "est_saving_bytes",
     "group",
@@ -93,6 +94,10 @@ class PlanRow:
     est_saving_bytes: int
     parts: tuple[Path, ...]
     status: Status
+    # The file's subtitle status ("wanted", "found", ...), or "" when it has no subtitle record.
+    subtitle: str = ""
+    # The sha256 of the subtitle to mux in (FOUND only): another file is another plan.
+    subtitle_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,8 @@ class PlanReport:
     est_saving_bytes: int
     groups: tuple[PlanGroup, ...]
     notes: tuple[str, ...]
+    # Files whose subtitle is still to be looked up (a WANTED record of a live file).
+    waiting_on_subtitles: int = 0
 
 
 # --- multi-part members --------------------------------------------------------------------
@@ -164,18 +171,30 @@ def build_plan(state: State) -> PlanReport:
         reasons = tuple(r for r in rec.reasons if r.strip()) or (
             _DEFAULT_REASON.get(rec.decision, rec.decision),
         )
+        sub = state.subtitle(rec.path, rec.size, rec.mtime)
         rows.append(
             PlanRow(
-                rec.path, rec.decision, reasons, size, rec.est_saving_bytes, rec.parts, rec.status
+                rec.path,
+                rec.decision,
+                reasons,
+                size,
+                rec.est_saving_bytes,
+                rec.parts,
+                rec.status,
+                subtitle="" if sub is None else sub.status.value,
+                subtitle_sha256="" if sub is None else sub.sha256,
             )
         )
 
     counts = dict.fromkeys((a.value for a in Action), 0)
     for row in rows:
         counts[row.action] = counts.get(row.action, 0) + 1
+    waiting = sum(1 for row in rows if row.subtitle == SubtitleStatus.WANTED.value)
     notes: list[str] = []
     if not rows:
         notes.append("no files recorded: run `survey` first")
+    if waiting:
+        notes.append(f"{waiting} {'file' if waiting == 1 else 'files'} waiting on subtitle lookups")
     if groups:
         notes.append(
             f"{len(groups)} multi-part group(s) will each be joined into one file: check that "
@@ -201,31 +220,39 @@ def build_plan(state: State) -> PlanReport:
         est_saving_bytes=sum(r.est_saving_bytes for r in rows if r.status in _OUTSTANDING),
         groups=tuple(groups),
         notes=tuple(notes),
+        waiting_on_subtitles=waiting,
     )
 
 
-def plan_hash(report: PlanReport) -> str:
-    """sha256 of the decisions in *report*: path, action, reasons, size, saving, parts.
+def _hash_row(row: PlanRow) -> list[object]:
+    entry: list[object] = [
+        row.path.as_posix(),
+        row.action,
+        list(row.reasons),
+        row.size,
+        row.est_saving_bytes,
+        [p.as_posix() for p in row.parts],
+    ]
+    if row.subtitle:  # nothing is added for a file without a subtitle record
+        entry.append([row.subtitle, row.subtitle_sha256])
+    return entry
 
-    Status and note are not part of it, so a run that only advances or finishes files keeps
-    the acknowledgement valid. The hash does change when a survey upserts a different size,
+
+def plan_hash(report: PlanReport) -> str:
+    """sha256 of the decisions in *report*: path, action, reasons, size, saving, parts and, for a
+    file with a subtitle record, the subtitle's status and sha256.
+
+    A subtitle turning FOUND, or being replaced by another one, is a new plan to acknowledge;
+    the provider, reason and attempts of a subtitle record are not part of it. The run status
+    and note are not part of it either, so a run that only advances or finishes files keeps the
+    acknowledgement valid. The hash does change when a survey upserts a different size,
     decision, reason, saving or parts list, when a new record appears, and when a record turns
     STALE (it drops out of the live records): the runner marks a record STALE itself when it
     finds the source changed, so the next run is refused until `plan` is reviewed and
     acknowledged again. The mtime is intentionally not part of the hash: a touch that leaves
     every decision the same needs no new review.
     """
-    canonical = [
-        [
-            row.path.as_posix(),
-            row.action,
-            list(row.reasons),
-            row.size,
-            row.est_saving_bytes,
-            [p.as_posix() for p in row.parts],
-        ]
-        for row in sorted(report.rows, key=lambda r: r.path.as_posix())
-    ]
+    canonical = [_hash_row(row) for row in sorted(report.rows, key=lambda r: r.path.as_posix())]
     text = json.dumps(canonical, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("ascii")).hexdigest()
 
@@ -257,6 +284,7 @@ def _plan_line(row: PlanRow, group_names: dict[Path, str]) -> list[object]:
         str(row.path),
         row.action,
         row.status.value,
+        row.subtitle,
         row.size,
         row.est_saving_bytes,
         group_names.get(row.path, ""),

@@ -153,7 +153,11 @@ def measure_cue_density(
 
     Returns 0.0 when nothing usable comes out: ffmpeg fails, the text is rejected (too large,
     empty, not a subtitle), or *duration_s* is not positive. A missing ffmpeg still raises
-    `ToolNotFound`.
+    `ToolNotFound`. A caller should log a 0.0 it did not expect (the survey does).
+
+    Limitation: `run_tool` keeps only the last ~1 MB of stdout, so a track whose SRT text is
+    larger than that is cut to its tail before it is parsed; its cue count, and so its density,
+    is then an undercount (cues are counted over the full *duration_s*).
     """
     if not duration_s > 0:  # also true for NaN
         return 0.0

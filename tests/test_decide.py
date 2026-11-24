@@ -141,13 +141,47 @@ def test_flag_reasons_name_every_cause() -> None:
     assert "Dolby Vision" in text and "HDR" in text and "interlaced" in text
 
 
-def test_flag_wins_over_needs_subs_and_multipart() -> None:
-    d = decide(_info(transfer="smpte2084"), _settings(), needs_subs=True, multipart=True)
+def test_multipart_alone_does_not_unflag_hdr() -> None:
+    d = decide(_info(transfer="smpte2084"), _settings(), multipart=True)
     _assert_shape(d, Action.FLAG, encode=False, remux=False)
+
+
+def test_hdr_with_new_subtitles_is_remuxed_with_the_video_left_as_is() -> None:
+    d = decide(_info(transfer="smpte2084"), _settings(), needs_subs=True)
+    _assert_shape(d, Action.REMUX, encode=False, remux=True)
+    assert d.reasons == (
+        "HDR (transfer smpte2084)",
+        "video left as is",
+        "new subtitles to mux in",
+    )
+
+
+def test_dolby_vision_profile_7_interlaced_with_new_subtitles_is_remuxed() -> None:
+    info = _info(dv_profile=7, transfer=None, field_order="tt")
+    d = decide(info, _settings(), needs_subs=True)
+    _assert_shape(d, Action.REMUX, encode=False, remux=True)
+    assert d.reasons == (
+        "Dolby Vision (profile 7)",
+        "interlaced (field order tt)",
+        "video left as is",
+        "new subtitles to mux in",
+    )
+
+
+def test_hdr_multipart_with_new_subtitles_is_remuxed_and_joined() -> None:
+    d = decide(_info(transfer="smpte2084"), _settings(), needs_subs=True, multipart=True)
+    _assert_shape(d, Action.REMUX, encode=False, remux=True)
+    assert d.reasons[-2:] == ("new subtitles to mux in", "multi-part file to join")
 
 
 def test_no_video_stream_flagged() -> None:
     d = decide(_info(has_video=False), _settings())
+    _assert_shape(d, Action.FLAG, encode=False, remux=False)
+    assert d.reasons == ("no video stream",)
+
+
+def test_no_video_stream_with_new_subtitles_still_flagged() -> None:
+    d = decide(_info(has_video=False), _settings(), needs_subs=True)
     _assert_shape(d, Action.FLAG, encode=False, remux=False)
     assert d.reasons == ("no video stream",)
 
@@ -163,10 +197,20 @@ def test_extra_video_stream_on_encodable_file_flagged() -> None:
     assert d.reasons == ("multiple video streams (1 extra)",)
 
 
-def test_extra_video_streams_flag_wins_over_needs_subs_and_multipart() -> None:
-    d = decide(_info(extra_video_streams=2), _settings(), needs_subs=True, multipart=True)
+def test_extra_video_streams_with_multipart_alone_stay_flagged() -> None:
+    d = decide(_info(extra_video_streams=2), _settings(), multipart=True)
     _assert_shape(d, Action.FLAG, encode=False, remux=False)
     assert d.reasons == ("multiple video streams (2 extra)",)
+
+
+def test_extra_video_streams_with_new_subtitles_are_remuxed_keeping_every_stream() -> None:
+    d = decide(_info(extra_video_streams=2), _settings(), needs_subs=True)
+    _assert_shape(d, Action.REMUX, encode=False, remux=True)
+    assert d.reasons == (
+        "multiple video streams (2 extra)",
+        "video left as is",
+        "new subtitles to mux in",
+    )
 
 
 def test_extra_video_streams_listed_with_other_flag_reasons() -> None:

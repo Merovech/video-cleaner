@@ -9,7 +9,8 @@ Pure function over `MediaInfo` and `Settings`; no I/O. The order of the checks m
    (MP4 and AVI included: no container conversion for its own sake).
 3. Eligible but Dolby Vision, HDR, interlaced or with more than one real video stream: flag,
    because the encode would damage it (the mux takes no video from the source, so a second
-   video stream would be lost).
+   video stream would be lost). With new subtitles to mux in there is no encode, so such a
+   file is remuxed instead: every stream is copied untouched and the subtitle is added.
 4. Otherwise encode; the new video is muxed with the untouched streams, so remux is set too.
 """
 
@@ -27,6 +28,7 @@ UHD_MIN_HEIGHT = 2000
 # A Dolby Vision profile 5 file has no HDR10 base layer, so most players
 # show wrong colours; it is left alone and listed for the user to replace with another release.
 DV5_REPLACE_REASON = "Dolby Vision profile 5: replace (no HDR10 fallback)"
+VIDEO_LEFT_AS_IS = "video left as is"
 
 
 class Action(StrEnum):
@@ -101,6 +103,15 @@ def decide(
 
     flagged = _flag_reasons(info, video)
     if flagged:
+        if needs_subs:
+            # The video is never re-encoded here, so the reasons that forbid an encode do not
+            # apply; the file only gains its subtitle.
+            return Decision(
+                Action.REMUX,
+                (*flagged, VIDEO_LEFT_AS_IS, *_remux_reasons(needs_subs, multipart)),
+                encode=False,
+                remux=True,
+            )
         return Decision(Action.FLAG, tuple(flagged), encode=False, remux=False)
 
     reason = (

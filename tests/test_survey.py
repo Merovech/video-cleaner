@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -139,7 +140,7 @@ def _run(
     hash_fn: Callable[[Path], str | None] | None = None,
 ) -> tuple[SurveyResult, State]:
     state = State.open(settings.state_db)
-    extra = {} if hash_fn is None else {"hash_fn": hash_fn}
+    extra: dict[str, Any] = {} if hash_fn is None else {"hash_fn": hash_fn}
     result = run_survey(
         settings,
         FAKE_TOOLS,
