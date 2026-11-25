@@ -167,7 +167,8 @@ def restrict_to_owner(
     POSIX: ``chmod 600``. Windows: ``icacls <path> /inheritance:r /grant:r <identity>:F`` (the
     folder's inherited rights are removed, the identity keeps full control), run from
     ``System32`` by full path and without a shell. The identity is the one the running process
-    holds (`current_identity`), never a name taken from the environment alone. The keyword
+    holds (`current_identity`): its SID from ``whoami``, and only when that fails the name made
+    of ``USERDOMAIN`` and ``USERNAME`` from the environment. The keyword
     arguments exist for tests.
     """
     on_windows = os.name == "nt" if windows is None else windows
