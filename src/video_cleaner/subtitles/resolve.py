@@ -438,7 +438,8 @@ class _Resolution:
         self.ctx.reporter.stage(f"subtitle: checking {provider} file {_safe(path.name, 60)}")
         names: CacheNames | None = None
         try:
-            # The path came from a folder listing; it must still be that regular file.
+            # The path came from a folder listing: it must still name a regular file (not a
+            # link), and be the very file that was opened.
             raw = read_bytes_capped(path, self.settings.subtitle_max_bytes, regular_only=True)
             if raw is None:
                 self._reject_file(provider, "larger than the size limit")

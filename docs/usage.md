@@ -72,7 +72,7 @@ activated virtual environment). `--help` works on every command.
 | `calibrate --approve --vmaf-target X --crf-max Y` | Approves a VMAF target (`guard_mean_floor` to 100) and a CRF ceiling (`crf_min` to 51). A run uses these instead of the config's `vmaf_target` and `crf_max`. Refused until a `calibrate --samples` sweep has finished. |
 | `run [--until HH:MM] [--max-hours N] [--path X] [--include-unresolved]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. A queued file whose subtitle is still `wanted` is skipped (the summary says how many); `--include-unresolved` runs those files too, without a subtitle, and a file delivered that way is never looked up afterwards (see [Statuses](#statuses)). A file whose subtitle was found after the run started is also left for the next run (the summary says so; `plan` and `plan --ack` first). |
 | `status` | Shows the number of files per status, how many files wait on subtitles, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
-| `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, or only a plain-text one such as `keyrings.alt`'s, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. A store that cannot be read or written gives a `[FAIL]` line naming the kind of error (never a value) and exit code 2. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. `--status` and `--clear` together are refused. Takes `--config`. Without stored credentials `subs resolve` still uses sidecar files and your local folders and leaves the other files `wanted`. |
+| `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, or only a `keyrings.alt` backend, one named as plain text, or a chain containing one, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. A store that cannot be read or written gives a `[FAIL]` line naming the kind of error (never a value) and exit code 2. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. `--status` and `--clear` together are refused. Takes `--config`. Without stored credentials `subs resolve` still uses sidecar files and your local folders and leaves the other files `wanted`. |
 | `subs resolve [--limit N] [--until HH:MM] [--path X]` | Looks up a subtitle for every file whose subtitle is `wanted` (sidecar, local folders, then OpenSubtitles; see [Where subtitles come from](#where-subtitles-come-from)), biggest expected saving first, under its own lock (only one at a time). `--limit N` attempts at most N files this time; `--until HH:MM` starts no new file after that time of day (it rolls to tomorrow when the time has passed); `--path X` only looks at that file or folder (a part of a multi-part film selects the film). At the start it checks that the cached file of every found subtitle (of files no run has delivered, is working on or has decided on, and within `--path`) is still there and unchanged, and sends a missing or changed one back to `wanted` (see [The cache](#the-cache)). It prints one line per file, then `Subtitles: found N, unavailable N, deferred N (allowance), skipped N`, then `Finished` or `Stopped: <reason>`. Running out of the day's allowance, `--limit`, `--until` and Ctrl+C are normal stops; exit code 1 means a problem to fix (the cache folder is not writable or overlaps a video, or OpenSubtitles failed for three files in a row); 2 a refusal, before anything is looked up (no state database, another `subs resolve` active, a bad option or setting, a cache folder that overlaps the library, a credential store that cannot be read, ffmpeg, ffprobe or mkvmerge not found, or ffsubsync not usable: it is started with `--help` first, with or without credentials, so a broken install costs no download); 130 Ctrl+C. Takes `--config`, `-v`, `-q`, `--log-file` and `--progress` like `run`. |
 | `subs status` | Shows the number of subtitle records per status, the OpenSubtitles downloads left and when they renew (UTC), the files waiting on subtitles and how many wanted subtitles are not looked up because a run has delivered, is working on or has decided on the file. It reads the database only: it does not look at the cache folder. Takes `--config`. |
 | `subs retry --path X` | Makes the `unavailable` or `unclear` subtitle of file `X` (or of any part of a multi-part film) `wanted` again, forgetting which candidates were tried and resetting the per-file download count, so the next `subs resolve` starts afresh. It says how many of the remembered candidates are still kept in the cache and are re-checked without a download; it does not look anything up itself. Any other status, or a path with no surveyed file or no subtitle record, is refused (exit code 1, nothing changed); no state database or a configuration error is exit code 2. Takes `--config`. |
@@ -131,7 +131,8 @@ principal names `Everyone`, `BUILTIN\Users` and `NT AUTHORITY\Authenticated User
 output, so it misses a localized Windows or an ACE for another account, and it is no proof of
 privacy; `setup.ps1` restricts the file with `icacls` regardless); the `keyring` backend in use
 (informational): the line names the backend class, and when the library found no usable one (its
-"fail" or "null" backend, a plain-text or `keyrings.alt` one, or none) it is a `[WARN]` saying that credentials are then kept in the owner-only
+"fail" or "null" backend, a `keyrings.alt` one or one named as plain text, a chain containing
+one, or none) it is a `[WARN]` saying that credentials are then kept in the owner-only
 `credentials.json`, or, without `LOCALAPPDATA`, can only come from the `VC_OPENSUBTITLES_*`
 variables (this check only asks which backend is in use; the credentials check below looks the
 values up to see whether they are set and never prints one);
@@ -262,7 +263,8 @@ local_subtitle_dirs = ['D:\subs', 'E:\more\subs']
 ```
 
 `subs resolve` indexes them each time and prints how many files it found. They are searched to
-8 folder levels (at most 100,000 entries), links and junctions are never followed, and only `.srt`,
+8 folder levels (at most 100,000 entries), links and junctions found while listing are skipped
+(and a file that turns into a link before it is read is refused), and only `.srt`,
 `.ass`, `.ssa` and `.vtt` files are looked at. The subtitle is matched by name: the library file's
 name is read as `Title (2010)` (the folder's name fills in a missing year when its title is the
 same, or gives the whole title and year of a generic name such as `movie.mkv`), and the subtitle's name is read the way a release name is, so
@@ -383,7 +385,8 @@ until one of those two commands has noticed.
 
 - The OpenSubtitles API key, username and password (and the login token the service returns) are
   kept in the operating system's keyring (the Windows Credential Manager). Where the system has no
-  usable keyring (or only a plain-text one, such as one from `keyrings.alt`) they go to
+  usable keyring (or only a `keyrings.alt` backend, one named as plain text, or a chain
+  containing one) they go to
   `%LOCALAPPDATA%\video-cleaner\credentials.json`, restricted to your user. They are never written
   to the state database, the logs (every credential the tool loads is masked in log lines and in
   tool output; the messages the tool prints itself contain none by construction), the plan and
@@ -424,8 +427,8 @@ until one of those two commands has noticed.
   every alignment and the reason for every rejection.
 - A hash-exact OpenSubtitles match is not aligned, since the service says it was made for this
   file; the length check still applies to it.
-- A download that was counted but whose link fetch then fails is not retried: it costs one
-  download and the candidate is remembered as tried.
+- A download that was counted but whose link fetch still fails after its retries is not tried
+  again later: it costs one download and the candidate is remembered as tried.
 - ffprobe, mkvmerge and the verification have no time limit, so a crafted file that makes one of
   them loop would hold `survey` or `run` until you stop it (Ctrl+C).
 - Very long single-line output from a tool (for example an embedded subtitle track that is one
