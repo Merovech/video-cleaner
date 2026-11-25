@@ -53,7 +53,7 @@ from typing import Protocol, TypeVar
 
 from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.config import Settings
-from video_cleaner.logging_setup import redact
+from video_cleaner.logging_setup import printable
 from video_cleaner.probe import MediaInfo
 from video_cleaner.progress import Reporter
 from video_cleaner.state import FileRecord, SubtitleRecord, SubtitleStatus
@@ -198,10 +198,9 @@ class OnlineFailure(ResolveStop):
 
 
 def _safe(value: object, limit: int = _SHORT_REASON_CHARS) -> str:
-    """*value* as one short line of printable ASCII with credentials masked, for logs and
-    reasons: the server's and the subtitle's text is never trusted to be tidy."""
-    text = ascii(redact(str(value)))[1:-1]
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+    """*value* as one short safe line for logs and reasons: the server's and the subtitle's text
+    is never trusted to be tidy (see `printable`)."""
+    return printable(value, limit)
 
 
 def _bounded_ids(ids: Iterable[int]) -> list[int]:

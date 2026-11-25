@@ -366,3 +366,14 @@ def test_real_ffmpeg_extracts_the_embedded_track_and_counts_its_cues(tmp_path: P
     density = measure_cue_density(tools, clip, info.subtitles[0], info.duration_s, reporter)
     # The generated track has two cues.
     assert density == pytest.approx(2 / info.duration_s * 3600.0)
+
+
+def test_a_hostile_file_name_is_escaped_in_the_extraction_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = patch_run_tool(monkeypatch, ok(srt(5)))
+    hostile = Path("D:/lib/evil\u202e\u200b.mkv")
+    measure_cue_density(TOOLS, hostile, track(7, forced=True), HOUR_S, RecordingReporter())
+    label = fake.calls[0][1]["label"]
+    assert "\u202e" not in label and "\u200b" not in label
+    assert "evil" in label

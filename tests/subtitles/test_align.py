@@ -1421,3 +1421,18 @@ def test_a_module_planted_in_the_current_directory_is_not_imported_by_the_probe(
     monkeypatch.chdir(planted)
     result = align.probe_ffsubsync()
     assert result.ok is True, result.detail
+
+
+def test_a_hostile_file_name_and_hostile_tool_output_reach_labels_and_logs_only_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    case = Case(tmp_path, "evil\u202ename\u200b.mkv")
+    log = "           INFO     path evil\u202e\u200b\x9b31m\n"
+    fake = patch_run(monkeypatch, FakeFfsubsync(raises=failed(1), log=log))
+    with caplog.at_level(logging.WARNING, logger="video_cleaner.subtitles.align"):
+        case.run()
+    seen = warnings_of(caplog) + fake.calls[0][1]["label"]
+    assert "evilname" not in seen  # the raw name never appears...
+    for bad in ("\u202e", "\u200b", "\x9b"):
+        assert bad not in seen
+    assert "evil" in seen  # ...but the escaped one does

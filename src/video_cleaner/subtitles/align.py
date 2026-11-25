@@ -29,7 +29,7 @@ from pathlib import Path
 from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
-from video_cleaner.logging_setup import redact
+from video_cleaner.logging_setup import printable
 from video_cleaner.progress import Reporter
 from video_cleaner.subtitles.textfmt import (
     SubtitleRejected,
@@ -70,6 +70,7 @@ _SPEECH_FRAMES_PER_S = 100.0
 _EXCERPT_LINES = 10
 _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
+_LABEL_CHARS = 200
 WORK_PREFIX = ".align-"
 _STAGED_INPUT = "input.srt"
 _STAGED_OUTPUT = "aligned.srt"
@@ -346,7 +347,7 @@ def _log_excerpt(label: str, text: str) -> None:
     the cause (a traceback, a missing module) is kept.
     """
     lines = [line.rstrip() for line in normalise_newlines(text).split("\n") if line.strip()]
-    kept = [redact(line)[:_EXCERPT_LINE_CHARS] for line in lines[-_EXCERPT_LINES:]]
+    kept = [printable(line, _EXCERPT_LINE_CHARS) for line in lines[-_EXCERPT_LINES:]]
     if kept:
         _log.warning("%s: the end of ffsubsync's output:\n%s", label, "\n".join(kept))
 
@@ -391,7 +392,7 @@ def _run(
     """Run ffsubsync: (its result, the log text, "") or (None, the log text, why it failed)."""
     log_path = work / _STAGED_LOG
     cmd = _command(media, work / _STAGED_INPUT, work / _STAGED_OUTPUT, settings)
-    label = f"align subtitle to {out_label}"
+    label = f"align subtitle to {printable(out_label, _LABEL_CHARS)}"
     try:
         result = run_tool(
             cmd,
@@ -452,7 +453,7 @@ def align_subtitle(
         result, text, why = _run(tools, media, work, media.name, settings, reporter, timeout_s)
         if result is None:
             return AlignResult(ok=False, reason=why)
-        label = f"align subtitle to {media.name}"
+        label = f"align subtitle to {printable(media.name, _LABEL_CHARS)}"
         if result.returncode != 0:
             _log.warning("%s: ffsubsync exited with code %d", label, result.returncode)
             _log_excerpt(label, text)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import unicodedata
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +93,28 @@ def redact(text: str, secrets: Iterable[str] = ()) -> str:
     for pattern in _GENERIC_PATTERNS:
         text = pattern.sub(rf"\g<1>{MASK}", text)
     return text
+
+
+def printable(text: object, limit: int = 120, *, escape: bool = True) -> str:
+    """*text* as one short line that is safe to show or log: credentials masked, and control,
+    format and separator characters (terminal codes, C1 controls, bidi overrides, zero-width
+    characters, line separators, lone surrogates) written as escapes, or dropped (and the result
+    stripped) with ``escape=False``. At most *limit* characters; a longer one ends in "...".
+
+    The one sanitiser for text a file name, a tool or a server wrote, on its way to the console,
+    the log or a stored reason.
+    """
+    out: list[str] = []
+    for ch in redact(str(text)[: limit * 4]):
+        category = unicodedata.category(ch)
+        if category[0] != "C" and category not in ("Zl", "Zp"):
+            out.append(ch)
+        elif escape:
+            out.append(ascii(ch)[1:-1])
+    line = "".join(out)
+    if not escape:
+        return line.strip()[:limit]
+    return line if len(line) <= limit else line[: limit - 3] + "..."
 
 
 class RedactingFilter(logging.Filter):

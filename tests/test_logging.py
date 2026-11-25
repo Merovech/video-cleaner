@@ -11,6 +11,7 @@ from video_cleaner.consolefmt import ConsoleLogHandler
 from video_cleaner.logging_setup import (
     LOGGER_NAME,
     RedactingFilter,
+    printable,
     redact,
     register_secrets,
     setup_logging,
@@ -356,3 +357,53 @@ def test_registering_accumulates_and_ignores_values_under_four_characters() -> N
     register_secrets(["abcd"])
     register_secrets(["wxyz"])
     assert redact("abcd wxyz") == "*** ***"
+
+
+# --- printable ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "\x1b[31m",  # terminal escape
+        "\x9b31m",  # C1 control (CSI)
+        "\u202e",  # right-to-left override
+        "\u2066",  # bidi isolate
+        "\u200b",  # zero-width space
+        "\u2028",  # line separator
+        "\u2029",  # paragraph separator
+        "\x00",
+        "\ud800",  # lone surrogate
+    ],
+)
+def test_printable_escapes_what_could_spoof_or_steer_a_terminal(hostile: str) -> None:
+    shown = printable(f"movie{hostile}.mkv")
+    assert hostile not in shown
+    assert shown.startswith("movie") and shown.endswith(".mkv")
+    assert shown.isascii()
+
+
+def test_printable_keeps_ordinary_text_including_accents() -> None:
+    assert printable("Amélie (2001).mkv") == "Amélie (2001).mkv"
+
+
+def test_printable_masks_registered_secrets_and_credential_labels() -> None:
+    register_secrets(["s3cr3t-value"])
+    shown = printable("failed with s3cr3t-value and --api-key=abcdef123456")
+    assert "s3cr3t-value" not in shown
+    assert "abcdef123456" not in shown
+
+
+def test_printable_caps_the_length_with_an_ellipsis() -> None:
+    shown = printable("x" * 500, 50)
+    assert len(shown) == 50
+    assert shown.endswith("...")
+
+
+def test_printable_can_drop_instead_of_escape() -> None:
+    assert printable("  Rel\x1b[31mease\x00\u202e  ", 30, escape=False) == "Rel[31mease"
+    assert len(printable("y" * 100, 10, escape=False)) == 10
+
+
+def test_printable_accepts_any_object() -> None:
+    assert printable(ValueError("bad\nthing")) == "bad\\nthing"
