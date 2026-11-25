@@ -1303,3 +1303,89 @@ def _run_ffmpeg(tools: Tools, args: list[str]) -> None:
         check=True,
         stdin=subprocess.DEVNULL,
     )
+
+
+# --- the ffsubsync probe -------------------------------------------------------------------
+
+FFSUBSYNC_START = [
+    sys.executable,
+    "-W",
+    "ignore::RuntimeWarning:runpy",
+    "-m",
+    "ffsubsync.ffsubsync",
+]
+
+
+class ProbeRun:
+    def __init__(self, outcome: tuple[int, str] | BaseException = (0, "usage: ffsubsync.py\n")):
+        self.outcome = outcome
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def __call__(self, cmd: Sequence[str], env: Any) -> tuple[int, str]:
+        self.calls.append((list(cmd), dict(env)))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def test_the_aligner_and_the_probe_start_ffsubsync_the_same_way(tmp_path: Path) -> None:
+    assert align.ffsubsync_command() == FFSUBSYNC_START
+    case = Case(tmp_path)
+    cmd = align._command(case.media, tmp_path / "in.srt", tmp_path / "out.srt", case.settings)
+    assert cmd[: len(FFSUBSYNC_START)] == FFSUBSYNC_START
+
+
+def test_the_probe_asks_for_help_and_passes_when_it_works() -> None:
+    run = ProbeRun()
+    result = align.probe_ffsubsync(run, {"PATH": "p"})
+    assert result.ok is True
+    assert [cmd for cmd, _ in run.calls] == [[*FFSUBSYNC_START, "--help"]]
+
+
+def test_the_probe_reports_the_first_line_of_a_failure() -> None:
+    run = ProbeRun((1, "\nModuleNotFoundError: No module named 'ffsubsync'\nmore\n"))
+    result = align.probe_ffsubsync(run, {})
+    assert result.ok is False
+    assert result.timed_out is False
+    assert result.detail == "ModuleNotFoundError: No module named 'ffsubsync'"
+
+
+def test_the_probe_names_the_exit_code_when_there_is_no_output() -> None:
+    assert align.probe_ffsubsync(ProbeRun((3, "")), {}).detail == "exit 3"
+
+
+def test_the_probe_reports_a_start_failure() -> None:
+    result = align.probe_ffsubsync(ProbeRun(OSError("cannot start")), {})
+    assert result.ok is False
+    assert "OSError" in result.detail
+
+
+def test_the_probe_reports_a_timeout_without_the_command_line() -> None:
+    timeout = subprocess.TimeoutExpired([*FFSUBSYNC_START, "--help"], 20)
+    result = align.probe_ffsubsync(ProbeRun(timeout), {})
+    assert result.ok is False
+    assert result.timed_out is True
+    assert result.detail == f"did not answer within {align.PROBE_TIMEOUT_S:g} s"
+    assert "ffsubsync.ffsubsync" not in result.detail
+
+
+def test_the_probe_child_gets_the_environment_the_aligner_gets() -> None:
+    run = ProbeRun()
+    environ = {
+        "PATH": "p",
+        "VC_OPENSUBTITLES_API_KEY": "k",
+        "VC_OPENSUBTITLES_PASSWORD": "pw",
+        "SOME_SERVICE_TOKEN": "t",
+    }
+    align.probe_ffsubsync(run, environ)
+    (_, env) = run.calls[0]
+    assert env == {"PATH": "p"}
+
+
+def test_the_default_probe_runs_a_real_command_with_the_given_environment() -> None:
+    code, output = align._run_probe(
+        [sys.executable, "-c", "import os; print(os.environ.get('VC_PROBE_TEST', 'unset'))"],
+        {**os.environ, "VC_PROBE_TEST": "seen"},
+    )
+    assert code == 0
+    assert "seen" in output

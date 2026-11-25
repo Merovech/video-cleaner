@@ -19,8 +19,10 @@ import math
 import os
 import re
 import shutil
+import subprocess  # nosec B404
 import sys
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -215,15 +217,22 @@ def _is_secret_name(name: str) -> bool:
     )
 
 
+def filtered_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A copy of *environ* (default: this process's) without the variables ffsubsync must not
+    see: it needs no credentials, so the OpenSubtitles variables and any variable whose name
+    looks like a secret are not passed on."""
+    source = os.environ if environ is None else environ
+    return {name: value for name, value in source.items() if not _is_secret_name(name)}
+
+
 def _child_env(tools: Tools) -> dict[str, str]:
-    """A copy of this environment with the ffmpeg (and ffprobe) folders first on PATH.
+    """The filtered environment with the ffmpeg (and ffprobe) folders first on PATH.
 
     ffsubsync finds ffmpeg only through PATH. Python's stdio is set to UTF-8 so the log, which
     names the video, is decoded the way `run_tool` reads it, and the console is pinned to plain,
-    wide output. ffsubsync needs no credentials, so the OpenSubtitles variables and any variable
-    whose name looks like a secret are not passed on.
+    wide output.
     """
-    env = {name: value for name, value in os.environ.items() if not _is_secret_name(name)}
+    env = filtered_environ()
     key = next((name for name in env if name.upper() == "PATH"), "PATH")
     folders = list(dict.fromkeys(str(tool.parent) for tool in (tools.ffmpeg, tools.ffprobe)))
     existing = env.get(key, "")
@@ -239,15 +248,75 @@ def _child_env(tools: Tools) -> dict[str, str]:
     return env
 
 
+def ffsubsync_command() -> list[str]:
+    """The interpreter and arguments that start ffsubsync; its own options follow.
+
+    ffsubsync has no __main__ module, so it is run as ffsubsync.ffsubsync, which makes Python
+    warn on every start that the module was imported twice; only that warning is silenced.
+    The aligner and the `--help` probe (`probe_ffsubsync`, used by `doctor` and `subs resolve`)
+    both start it this way.
+    """
+    return [sys.executable, "-W", "ignore::RuntimeWarning:runpy", "-m", "ffsubsync.ffsubsync"]
+
+
+#: How long the `--help` probe may take; importing ffsubsync takes about a second.
+PROBE_TIMEOUT_S = 20.0
+
+ProbeRunner = Callable[[Sequence[str], Mapping[str, str]], tuple[int, str]]
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Whether ffsubsync starts; *detail* says why not (a short line, never the command line)."""
+
+    ok: bool
+    detail: str
+    timed_out: bool = False
+
+
+def _run_probe(cmd: Sequence[str], env: Mapping[str, str]) -> tuple[int, str]:
+    """Run *cmd* (an argument list, no shell) with *env*; (exit code, stdout + stderr)."""
+    # Fixed argument list, shell=False.
+    proc = subprocess.run(  # noqa: S603  # nosec B603
+        [str(part) for part in cmd],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=PROBE_TIMEOUT_S,
+        check=False,
+        shell=False,
+        env=dict(env),
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def probe_ffsubsync(
+    run: ProbeRunner | None = None, environ: Mapping[str, str] | None = None
+) -> ProbeResult:
+    """Start ffsubsync with ``--help`` and say whether it ran.
+
+    The child gets the aligner's filtered environment (`filtered_environ` of *environ*). A broken
+    or missing ffsubsync would otherwise only show as every subtitle being rejected, after the
+    downloads were spent. *run* is replaceable for tests.
+    """
+    cmd = [*ffsubsync_command(), "--help"]
+    try:
+        code, output = (run or _run_probe)(cmd, filtered_environ(environ))
+    except subprocess.TimeoutExpired:
+        return ProbeResult(False, f"did not answer within {PROBE_TIMEOUT_S:g} s", timed_out=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ProbeResult(False, f"{type(exc).__name__}: {exc}")
+    if code == 0:
+        return ProbeResult(True, "runs")
+    first = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    return ProbeResult(False, first or f"exit {code}")
+
+
 def _command(media: Path, staged_in: Path, staged_out: Path, settings: Settings) -> list[str]:
     return [
         *flatten(
-            (sys.executable,),
-            # ffsubsync has no __main__ module, so it is run as ffsubsync.ffsubsync, which
-            # makes Python warn on every start that the module was imported twice; silence
-            # only that warning.
-            ("-W", "ignore::RuntimeWarning:runpy"),
-            ("-m", "ffsubsync.ffsubsync"),
+            tuple(ffsubsync_command()),
             # The values are attached with "=", so a path that starts with "-" is a value and
             # never an option.
             (f"--srtin={staged_in}",),

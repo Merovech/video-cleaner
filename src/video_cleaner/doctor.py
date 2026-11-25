@@ -3,7 +3,8 @@
 Every external command goes through an injectable *runner* so tests never start a process.
 No check raises: a problem, including an unexpected exception inside a check, becomes a
 `Check` with ``ok=False``. The doctor only reads, except for a probe file it creates and
-deletes in ``completed_dir`` and ``scratch_dir``; it never writes under ``library_root``.
+deletes in ``completed_dir``, ``scratch_dir`` and ``subtitle_cache_dir`` (when they exist);
+it never writes under ``library_root``.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from pathlib import Path
 from video_cleaner import credentials as creds
 from video_cleaner.config import Settings, default_config_path
 from video_cleaner.paths import library_overlaps
+from video_cleaner.subtitles import align
 from video_cleaner.tools import ToolNotFound, locate_tool
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
@@ -133,6 +135,7 @@ class _Doctor:
         file_mode: FileModeFn,
         credential_store: creds.CredentialStore | None,
         keyring_backend: Callable[[], object | None] | None,
+        ffsubsync_runner: align.ProbeRunner | None,
     ) -> None:
         self.settings = settings
         self.env = env
@@ -144,6 +147,7 @@ class _Doctor:
         self.file_mode = file_mode
         self.credential_store = credential_store
         self.keyring_backend = keyring_backend
+        self.ffsubsync_runner = ffsubsync_runner
         self.ffmpeg: Path | None = None
 
     def _run(self, cmd: Sequence[str]) -> tuple[int, str]:
@@ -205,26 +209,15 @@ class _Doctor:
                 yield Check(name, False, f"not in ffmpeg {flag[1:]}", required)
 
     def ffsubsync(self) -> Iterator[Check]:
-        """The aligner runs in this interpreter (a declared dependency, so required).
-
-        The same module `subtitles.align` starts; ffsubsync has no ``__main__``.
-        """
-        code, output = self._run(
-            [
-                sys.executable,
-                "-W",
-                "ignore::RuntimeWarning:runpy",
-                "-m",
-                "ffsubsync.ffsubsync",
-                "--help",
-            ]
-        )
-        if code == 0:
+        """The aligner starts in this interpreter (a declared dependency, so required)."""
+        result = align.probe_ffsubsync(self.ffsubsync_runner, self.env)
+        if result.ok:
             yield Check("ffsubsync", True, "runs (python -m ffsubsync.ffsubsync --help)")
-            return
-        problem = _first_line(output) or f"exit {code}"
-        hint = "run `uv sync`, or `uv pip install ffsubsync`"
-        yield Check("ffsubsync", False, f"does not run ({problem}); {hint}")
+        elif result.timed_out:
+            yield Check("ffsubsync", False, result.detail)
+        else:
+            hint = "run `uv sync`, or `uv pip install ffsubsync`"
+            yield Check("ffsubsync", False, f"does not run ({result.detail}); {hint}")
 
     def gpu(self) -> Iterator[Check]:
         code, output = self._run(
@@ -385,13 +378,15 @@ def run_doctor(
     file_mode: FileModeFn | None = None,
     credential_store: creds.CredentialStore | None = None,
     keyring_backend: Callable[[], object | None] | None = None,
+    ffsubsync_runner: align.ProbeRunner | None = None,
 ) -> list[Check]:
     """Run every environment check and return the results; never raises.
 
     *config_path* defaults to `config.default_config_path` for *env*, the file `load_settings`
     reads when it is given no path. The other
     keyword arguments exist for tests and default to the real system (*credential_store*:
-    `credentials.open_store` for *env*; *keyring_backend*: `keyring.get_keyring`).
+    `credentials.open_store` for *env*; *keyring_backend*: `keyring.get_keyring`;
+    *ffsubsync_runner*: starts the `--help` probe with the aligner's filtered environment).
     """
     environ: Mapping[str, str] = os.environ if env is None else env
     doc = _Doctor(
@@ -405,6 +400,7 @@ def run_doctor(
         file_mode or _file_mode,
         credential_store,
         keyring_backend,
+        ffsubsync_runner,
     )
     groups: list[tuple[str, Callable[[], Iterator[Check]]]] = [
         ("python", doc.python),

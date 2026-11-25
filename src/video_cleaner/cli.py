@@ -33,6 +33,7 @@ from video_cleaner.progress import (
     make_reporter,
 )
 from video_cleaner.state import State, StateError, SubtitleStatus
+from video_cleaner.subtitles import align as _align
 from video_cleaner.subtitles import job as _job
 from video_cleaner.subtitles.local import index_local_folders
 from video_cleaner.subtitles.models import QuotaInfo
@@ -753,6 +754,16 @@ def _opensubtitles_client(settings: Settings, reporter: Reporter) -> OpenSubtitl
         _fail(f"credentials: {exc}")
 
 
+def _require_ffsubsync() -> None:
+    """Exit 2 unless ffsubsync starts. Sidecar and local candidates are aligned with it too, so
+    a broken one rejects every candidate, after the OpenSubtitles downloads were spent."""
+    result = _align.probe_ffsubsync()
+    if result.ok:
+        return
+    hint = "" if result.timed_out else "; run `uv sync` (or `uv pip install ffsubsync`)"
+    _fail(f"ffsubsync is not usable ({result.detail}){hint}; nothing was looked up")
+
+
 def _resolve_subtitles(
     settings: Settings,
     tools: Tools,
@@ -841,6 +852,7 @@ def subs_resolve(
         _fail(str(exc))
     _logging(settings, verbose, quiet, log_file)
     tools = _tools()
+    _require_ffsubsync()
     with _open_reporter(settings, progress) as reporter, power.keep_awake():
         try:
             summary, held_back, plan_changed = _resolve_subtitles(

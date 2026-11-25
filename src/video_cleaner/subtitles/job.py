@@ -432,7 +432,7 @@ class _Job:
             except ResolveStop as stop:
                 return self._stopped(tag, remaining, rec, current, stop)
             except ToolNotFound:
-                raise  # a missing ffsubsync or ffprobe is a setup problem: end the job
+                raise  # a missing ffmpeg or ffprobe is a setup problem: end the job
             except Exception as exc:  # one hostile file must never end the job
                 self.skipped += 1
                 _log.error("%s: unexpected %s; skipped", tag, type(exc).__name__)

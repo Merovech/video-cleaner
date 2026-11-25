@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import keyring.backends.fail
@@ -17,6 +18,7 @@ from video_cleaner.cli import app
 from video_cleaner.config import Settings, default_config_path, load_settings
 from video_cleaner.doctor import Check, run_doctor
 from video_cleaner.logarchive import ARCHIVE_DIR_NAME
+from video_cleaner.subtitles import align
 
 ENCODERS_OK = """Encoders:
  V..... = Video
@@ -40,6 +42,14 @@ FILTERS_NO_VMAF = """Filters:
  ... vmafmotion        V->V       Calculate the VMAF Motion score.
 """
 FFSUBSYNC_HELP = (0, "usage: ffsubsync.py [-h] [-i [SRTIN ...]] [-o SRTOUT]\n")
+FFSUBSYNC_COMMAND = [
+    sys.executable,
+    "-W",
+    "ignore::RuntimeWarning:runpy",
+    "-m",
+    "ffsubsync.ffsubsync",
+    "--help",
+]
 ICACLS_TIGHT = (
     "C:\\cfg\\config.toml DESKTOP\\ari:(F)\n"
     "                    NT AUTHORITY\\SYSTEM:(F)\n\n"
@@ -59,19 +69,15 @@ class FakeRunner:
         filters: str = FILTERS_OK,
         gpu: tuple[int, str] = (0, "NVIDIA GeForce RTX 4080 SUPER, 16376 MiB\n"),
         icacls: str = ICACLS_TIGHT,
-        ffsubsync: tuple[int, str] = FFSUBSYNC_HELP,
     ) -> None:
         self.encoders = encoders
         self.filters = filters
         self.gpu = gpu
         self.icacls = icacls
-        self.ffsubsync = ffsubsync
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd: Sequence[str]) -> tuple[int, str]:
         self.calls.append(list(cmd))
-        if "ffsubsync.ffsubsync" in cmd:
-            return self.ffsubsync
         if "-encoders" in cmd:
             return 0, self.encoders
         if "-filters" in cmd:
@@ -81,6 +87,20 @@ class FakeRunner:
         if Path(cmd[0]).stem == "icacls":
             return 0, self.icacls
         raise AssertionError(f"unexpected command {cmd}")
+
+
+class FakeProbe:
+    """The runner the ffsubsync check uses: it also gets the environment the child would see."""
+
+    def __init__(self, outcome: tuple[int, str] | BaseException = FFSUBSYNC_HELP) -> None:
+        self.outcome = outcome
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def __call__(self, cmd: Sequence[str], env: Mapping[str, str]) -> tuple[int, str]:
+        self.calls.append((list(cmd), dict(env)))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
 
 
 def _make_tools(directory: Path, names: Sequence[str] = ("ffmpeg", "ffprobe", "mkvmerge")) -> None:
@@ -128,6 +148,7 @@ def _run(tmp_path: Path, **kwargs: object) -> dict[str, Check]:
     params: dict[str, object] = {
         "env": _env(tmp_path),
         "runner": FakeRunner(),
+        "ffsubsync_runner": FakeProbe(),
         "disk_usage": _usage(10**12),
         "config_path": None,
         "python_version": (3, 12),
@@ -762,19 +783,35 @@ def test_cli_subtitle_cache_in_the_library_from_the_environment(tmp_path: Path) 
 
 
 def test_doctor_checks_that_ffsubsync_runs(tmp_path: Path) -> None:
-    runner = FakeRunner()
-    check = _run(tmp_path, runner=runner)["ffsubsync"]
+    probe = FakeProbe()
+    check = _run(tmp_path, ffsubsync_runner=probe)["ffsubsync"]
     assert check.ok is True
     assert check.required
-    (call,) = [c for c in runner.calls if "ffsubsync.ffsubsync" in c]
-    assert call[0] == sys.executable
-    assert call[-1] == "--help"
-    assert all(isinstance(part, str) for part in call)
+    assert [cmd for cmd, _ in probe.calls] == [FFSUBSYNC_COMMAND]
+
+
+def test_doctor_starts_ffsubsync_like_the_aligner_does() -> None:
+    assert [*align.ffsubsync_command(), "--help"] == FFSUBSYNC_COMMAND
+
+
+def test_doctor_gives_the_ffsubsync_child_the_aligners_filtered_environment(
+    tmp_path: Path,
+) -> None:
+    probe = FakeProbe()
+    env = {
+        **_env(tmp_path),
+        "VC_OPENSUBTITLES_API_KEY": "k",
+        "VC_OPENSUBTITLES_PASSWORD": "p",
+        "SOME_API_TOKEN": "t",
+    }
+    _run(tmp_path, env=env, ffsubsync_runner=probe)
+    ((_, child_env),) = probe.calls
+    assert child_env == _env(tmp_path)
 
 
 def test_doctor_ffsubsync_failure_is_required_and_says_how_to_install(tmp_path: Path) -> None:
-    runner = FakeRunner(ffsubsync=(1, "ModuleNotFoundError: No module named 'ffsubsync'\n"))
-    check = _run(tmp_path, runner=runner)["ffsubsync"]
+    probe = FakeProbe((1, "ModuleNotFoundError: No module named 'ffsubsync'\n"))
+    check = _run(tmp_path, ffsubsync_runner=probe)["ffsubsync"]
     assert check.ok is False
     assert check.required
     assert "ModuleNotFoundError" in check.detail
@@ -783,18 +820,21 @@ def test_doctor_ffsubsync_failure_is_required_and_says_how_to_install(tmp_path: 
 
 
 def test_doctor_ffsubsync_that_cannot_be_started_is_a_failed_check(tmp_path: Path) -> None:
-    fake = FakeRunner()
-
-    def runner(cmd: Sequence[str]) -> tuple[int, str]:
-        if "ffsubsync.ffsubsync" in cmd:
-            raise OSError("cannot start")
-        return fake(cmd)
-
-    checks = _run(tmp_path, runner=runner)
+    probe = FakeProbe(OSError("cannot start"))
+    checks = _run(tmp_path, ffsubsync_runner=probe)
     assert checks["ffsubsync"].ok is False
     assert checks["ffsubsync"].required
     assert "uv sync" in checks["ffsubsync"].detail
     assert checks["libx265"].ok  # the other checks still ran
+
+
+def test_doctor_ffsubsync_timeout_says_it_did_not_answer(tmp_path: Path) -> None:
+    probe = FakeProbe(subprocess.TimeoutExpired(FFSUBSYNC_COMMAND, 20))
+    check = _run(tmp_path, ffsubsync_runner=probe)["ffsubsync"]
+    assert check.ok is False
+    assert check.required
+    assert "did not answer within 20 s" in check.detail
+    assert "ffsubsync.ffsubsync" not in check.detail
 
 
 def test_doctor_reports_a_missing_subtitle_cache_without_creating_it(tmp_path: Path) -> None:
