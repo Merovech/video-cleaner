@@ -207,8 +207,8 @@ def _lstat_as(monkeypatch: pytest.MonkeyPatch, path: Path, **changes: int) -> No
     )
     real_lstat = os.lstat
 
-    def lstat(p: Any) -> Any:
-        return fake if Path(p) == path else real_lstat(p)
+    def lstat(p: Any, *args: Any, **kwargs: Any) -> Any:
+        return fake if Path(p) == path else real_lstat(p, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", lstat)
 

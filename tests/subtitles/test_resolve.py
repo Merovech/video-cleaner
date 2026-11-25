@@ -519,10 +519,10 @@ def test_a_sidecar_that_turns_into_a_link_when_it_is_read_is_rejected(
     sidecar = write_sidecar(case, ".en.srt", srt_bytes(tag="sidecar"))
     real_lstat = os.lstat
 
-    def lstat(path: Any) -> Any:
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
         if Path(path) == sidecar:  # swapped for a link after it was listed
             return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
-        return real_lstat(path)
+        return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", lstat)
     out = case.resolve()
@@ -539,10 +539,10 @@ def test_a_local_file_that_turns_into_a_link_when_it_is_read_is_rejected(
     local = tmp_path / "local-subs" / "The Great Movie 2010.srt"
     real_lstat = os.lstat
 
-    def lstat(path: Any) -> Any:
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
         if Path(path) == local:
             return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
-        return real_lstat(path)
+        return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", lstat)
     out = case.resolve()
