@@ -38,8 +38,8 @@ subtitle folders work without it.
 
 1. **`survey`** once, and again after you add or replace files. Besides probing each file it
    classifies the file's own subtitle tracks and stores one subtitle record per video. After
-   upgrading from a version without subtitle support, survey again: every video then gets a
-   subtitle record, which changes the plan.
+   upgrading from a version without subtitle support, survey again: every video that can be
+   processed then gets a subtitle record, which changes the plan.
 2. **`plan`, review `plan.csv`, then `plan --ack`.** The plan hash includes each file's subtitle
    status (and, for a found subtitle, which subtitle), so the plan changes whenever a subtitle is
    found, replaced, goes missing or ends up unavailable or unclear, and `run` is refused until you
@@ -52,7 +52,8 @@ subtitle folders work without it.
    way is left to the next run, which needs a new `plan` and `plan --ack` first.
 4. **`run`** overnight (`run --until 07:00`, say). A file that is queued but whose subtitle is
    still wanted is deferred: the run skips it and says how many it skipped, so you do not have to
-   wait for every lookup. `run --include-unresolved` runs those files too, without a subtitle.
+   wait for every lookup. `run --include-unresolved` runs those files too, without a subtitle,
+   and such a file then never gets one from this tool (see [Statuses](#statuses)).
 
 A normal day is therefore `subs resolve`, `plan`, review, `plan --ack`, `run`. Acknowledge again
 after every `subs resolve` that changed the plan; it prints "The plan changed" when it did.
@@ -69,17 +70,17 @@ activated virtual environment). `--help` works on every command.
 | `plan [--ack] [--retry PATH]` | Dry run: decides per file what will happen (re-encode, remux, leave alone, skip and flag) and projects the savings. Writes `plan.csv` (with a `subtitle` column: each file's subtitle status) and `plan.hash` beside the state database. The hash covers the subtitle status, so it changes when a subtitle is found or a lookup ends. `--ack` acknowledges the plan last written (its hash must still match the current state). `--retry PATH` puts a file a run left alone or flagged back in the queue. |
 | `calibrate --samples N` | Encodes N sample files at CRF 17/20/23/26, scores them with VMAF and writes `calibration.txt` beside the state database and side-by-side clips to `completed_dir\calibration`. |
 | `calibrate --approve --vmaf-target X --crf-max Y` | Approves a VMAF target (`guard_mean_floor` to 100) and a CRF ceiling (`crf_min` to 51). A run uses these instead of the config's `vmaf_target` and `crf_max`. Refused until a `calibrate --samples` sweep has finished. |
-| `run [--until HH:MM] [--max-hours N] [--path X] [--include-unresolved]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. A queued file whose subtitle is still `wanted` is skipped (the summary says how many); `--include-unresolved` runs those files too, without a subtitle. A file whose subtitle was found after the run started is also left for the next run (the summary says so; `plan` and `plan --ack` first). |
+| `run [--until HH:MM] [--max-hours N] [--path X] [--include-unresolved]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. A queued file whose subtitle is still `wanted` is skipped (the summary says how many); `--include-unresolved` runs those files too, without a subtitle, and a file delivered that way is never looked up afterwards (see [Statuses](#statuses)). A file whose subtitle was found after the run started is also left for the next run (the summary says so; `plan` and `plan --ack` first). |
 | `status` | Shows the number of files per status, how many files wait on subtitles, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
 | `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. A store that cannot be read or written gives a `[FAIL]` line naming the kind of error (never a value) and exit code 2. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. `--status` and `--clear` together are refused. Takes `--config`. Without stored credentials `subs resolve` still uses sidecar files and your local folders and leaves the other files `wanted`. |
-| `subs resolve [--limit N] [--until HH:MM] [--path X]` | Looks up a subtitle for every file whose subtitle is `wanted` (sidecar, local folders, then OpenSubtitles; see [Where subtitles come from](#where-subtitles-come-from)), biggest expected saving first, under its own lock (only one at a time). `--limit N` attempts at most N files this time; `--until HH:MM` starts no new file after that time of day (it rolls to tomorrow when the time has passed); `--path X` only looks at that file or folder (a part of a multi-part film selects the film). At the start it checks that the cached file of every found subtitle (of files no run has delivered, is working on or has decided on, and within `--path`) is still there and unchanged, and sends a missing or changed one back to `wanted` (see [The cache](#the-cache)). It prints one line per file, then `Subtitles: found N, unavailable N, deferred N (allowance), skipped N`, then `Finished` or `Stopped: <reason>`. Running out of the day's allowance, `--limit`, `--until` and Ctrl+C are normal stops; exit code 1 means a problem to fix (the cache folder is not writable, the cache folder setting is unusable, or OpenSubtitles failed three calls in a row); 2 a refusal (no state database, another `subs resolve` active, a bad option or setting, ffmpeg or ffprobe not found); 130 Ctrl+C. Takes `--config`, `-v`, `-q`, `--log-file` and `--progress` like `run`. |
+| `subs resolve [--limit N] [--until HH:MM] [--path X]` | Looks up a subtitle for every file whose subtitle is `wanted` (sidecar, local folders, then OpenSubtitles; see [Where subtitles come from](#where-subtitles-come-from)), biggest expected saving first, under its own lock (only one at a time). `--limit N` attempts at most N files this time; `--until HH:MM` starts no new file after that time of day (it rolls to tomorrow when the time has passed); `--path X` only looks at that file or folder (a part of a multi-part film selects the film). At the start it checks that the cached file of every found subtitle (of files no run has delivered, is working on or has decided on, and within `--path`) is still there and unchanged, and sends a missing or changed one back to `wanted` (see [The cache](#the-cache)). It prints one line per file, then `Subtitles: found N, unavailable N, deferred N (allowance), skipped N`, then `Finished` or `Stopped: <reason>`. Running out of the day's allowance, `--limit`, `--until` and Ctrl+C are normal stops; exit code 1 means a problem to fix (the cache folder is not writable or overlaps a video, or OpenSubtitles failed for three files in a row); 2 a refusal, before anything is looked up (no state database, another `subs resolve` active, a bad option or setting, a cache folder that overlaps the library, a credential store that cannot be read, ffmpeg, ffprobe or mkvmerge not found, or ffsubsync not usable: it is started with `--help` first, with or without credentials, so a broken install costs no download); 130 Ctrl+C. Takes `--config`, `-v`, `-q`, `--log-file` and `--progress` like `run`. |
 | `subs status` | Shows the number of subtitle records per status, the OpenSubtitles downloads left and when they renew (UTC), the files waiting on subtitles and how many wanted subtitles are not looked up because a run has delivered, is working on or has decided on the file. It reads the database only: it does not look at the cache folder. Takes `--config`. |
-| `subs retry --path X` | Makes the `unavailable` or `unclear` subtitle of file `X` (or of any part of a multi-part film) `wanted` again, forgetting which candidates were tried and resetting the per-file download count, so the next `subs resolve` starts afresh. It says how many of the remembered candidates are still kept in the cache and are re-checked without a download; it does not look anything up itself. Any other status is refused (exit code 1, nothing changed). Takes `--config`. |
+| `subs retry --path X` | Makes the `unavailable` or `unclear` subtitle of file `X` (or of any part of a multi-part film) `wanted` again, forgetting which candidates were tried and resetting the per-file download count, so the next `subs resolve` starts afresh. It says how many of the remembered candidates are still kept in the cache and are re-checked without a download; it does not look anything up itself. Any other status, or a path with no surveyed file or no subtitle record, is refused (exit code 1, nothing changed); no state database or a configuration error is exit code 2. Takes `--config`. |
 | `report [--output FILE]` | Writes the results so far to `report.csv` beside the state database (or `FILE`) and prints a summary, including how many subtitles were added and, for every manifest entry, whether its original(s) are still unchanged (run it before overwriting originals). `report.csv` and `manifest.csv` have a `subtitle` column: the track title of the subtitle muxed in (`English (OpenSubtitles)`, `English (local file)` or `English (sidecar)`), empty when none was added. |
 
-**Current state (Phases 1 and 2):** every command works. Phase 2 added the subtitle commands
-(`auth`, `subs resolve | status | retry`), the subtitle columns in the CSV files and the subtitle
-step of `run`; see [Subtitles](#subtitles). `run` searches a CRF per file (3 sample
+**Current state:** every command works, including the subtitle commands (`auth`,
+`subs resolve | status | retry`), the subtitle columns in the CSV files and the subtitle step of
+`run`; see [Subtitles](#subtitles). `run` searches a CRF per file (3 sample
 windows of 30 s encoded at CRF 20 and 24 and scored with VMAF, interpolated to the approved VMAF
 target and clamped to `crf_min`..the approved `crf_max`), leaves the file alone when the projected
 saving is under `min_saving`, encodes, muxes, scores 4 windows of 20 s against the original (the
@@ -129,7 +130,8 @@ config file not readable by other users (informational); the `keyring` backend i
 the line names the backend class, and when the library found no usable one (its "fail" or "null"
 backend, or none) it is a `[WARN]` saying that credentials are then kept in the owner-only
 `credentials.json`, or, without `LOCALAPPDATA`, can only come from the `VC_OPENSUBTITLES_*`
-variables (`doctor` never reads a credential);
+variables (this check only asks which backend is in use; the credentials check below looks the
+values up to see whether they are set and never prints one);
 the OpenSubtitles credentials set (a warning, not a failure, when they are missing); and, when the
 fallback `credentials.json` exists, that other users cannot read it (informational). Tools are found through `VC_FFMPEG` / `VC_FFPROBE` / `VC_MKVMERGE`, then `PATH`,
 then the default winget and MKVToolNix install folders.
@@ -222,8 +224,9 @@ and hearing-impaired tracks included. A forced-only English track (only the sign
 dialogue) does not count, unless it is a text track with at least `forced_full_cues_per_hour` cues
 per hour of video: then it is a full track that was marked forced by mistake (`reclassified` in
 `survey.csv`). A forced image track cannot be counted and stays forced-only. English only as
-closed captions inside the video stream, or a subtitle track tagged `und` (undetermined language),
-makes the file `unclear` (see below).
+closed captions inside the video stream, or a subtitle track tagged `und` (undetermined language)
+or with no language tag at all (when there is no English track that counts), makes the file
+`unclear` (see below).
 
 **Lookup order.** For a `wanted` file `subs resolve` tries these in turn and takes the first
 candidate that passes the checks below:
@@ -235,7 +238,8 @@ candidate that passes the checks below:
 3. **OpenSubtitles**, with the stored credentials: first a search by the video's movie hash (a hit
    says the subtitle was made for this very file), and only when that gives nothing usable a
    search by title and year. A result is skipped without a download when it is marked foreign
-   parts only, was tried before, or does not match the file's title and year. A file whose name
+   parts only, was tried before, or (unless it is a hash match) does not match the file's title
+   and year. A file whose name
    reads as a TV episode is searched by hash only. A multi-part film is not looked up at all (see
    `unclear`).
 
@@ -256,15 +260,16 @@ local_subtitle_dirs = ['D:\subs', 'E:\more\subs']
 `subs resolve` indexes them each time and prints how many files it found. They are searched to
 8 folder levels (at most 100,000 entries), links and junctions are never followed, and only `.srt`,
 `.ass`, `.ssa` and `.vtt` files are looked at. The subtitle is matched by name: the library file's
-name is read as `Title (2010)` (the folder's name fills in a missing year, or the title of a
-generic name such as `movie.mkv`), and the subtitle's name is read the way a release name is, so
+name is read as `Title (2010)` (the folder's name fills in a missing year when its title is the
+same, or gives the whole title and year of a generic name such as `movie.mkv`), and the subtitle's name is read the way a release name is, so
 `Title (2010).srt` and `Title.2010.1080p.BluRay.en.srt` both count. A subtitle matches when its
 year is the same and its title is near-identical, when the years differ by one and the title is
 closer still, or, when either side has no year, when the title is near-exact. A match counts only
-if it is clearly the best one; two similar candidates are ambiguous and both ignored. Ignored as
-well: names that read as TV episodes or give no title, names tagged with a language other than
-English (`fr`, `spa`, `pt-BR`, `en.fr`), empty files, files above `subtitle_max_bytes`, and
-anything else (an untagged name stays, and its text is checked for English like any other).
+if it is clearly the best one; two similar candidates are ambiguous and both ignored (so are two
+copies of the same film's subtitle in different folders). Ignored as well: names that read as TV
+episodes or give no title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`,
+`en.fr`), empty files, files above `subtitle_max_bytes`, links and anything that is not a regular
+file. A name with no language tag is kept; its text is checked for English like any other.
 
 ### Statuses
 
@@ -273,13 +278,14 @@ them):
 
 | Status | Meaning | What you do |
 |---|---|---|
-| `wanted` | No English subtitle in the file; the lookup has not finished. Also the state of a file whose lookup stopped early: no credentials, login refused, allowance spent. Its reason says which. | Run `subs resolve`; `auth` if credentials are missing. A queued `wanted` file is deferred by `run` unless you pass `--include-unresolved`. |
+| `wanted` | No English subtitle in the file; the lookup has not finished. Also the state of a file whose lookup stopped early: no credentials, login refused, allowance spent, OpenSubtitles failing, cache folder not writable. Its reason says which. | Run `subs resolve`; `auth` if credentials are missing. A queued `wanted` file is deferred by `run` unless you pass `--include-unresolved`; a file delivered that way is never looked up afterwards (`subs resolve` skips it and `subs status` counts it as already delivered, `plan --retry` refuses a completed file), so it only gets a subtitle after you have replaced the original with the result and surveyed again. |
 | `found` | A subtitle was accepted and is in the cache. The file is planned as a remux (or an encode) that adds it. | Review the plan, `plan --ack`, `run`. |
 | `not_needed` | The file has a full English track. Nothing is added. | Nothing. |
-| `unavailable` | The lookup finished and nothing passed. The reason says what each source did, and a file that used up `subtitle_candidates_per_file` downloads says so. The file is not retried by itself and a re-survey keeps the status. | Nothing, if you can do without: the file is encoded or left alone as planned, with no subtitle. To try again put a subtitle beside the video or in a local folder, or loosen a setting (for example `align_min_score`), then `subs retry --path` and `subs resolve`. |
-| `unclear` | The tool cannot tell whether the file needs one: a subtitle track tagged `und`, English only as closed captions, or a multi-part film. | See below. |
+| `unavailable` | The lookup finished and nothing passed. The reason says what each source did, and a file that used up `subtitle_candidates_per_file` downloads says so. The file is not retried by itself and a re-survey keeps the status. | Nothing, if you can do without: the file is encoded or left alone as planned, with no subtitle. To try again put a subtitle beside the video or in a local folder, or loosen an alignment setting (`align_max_offset_s`, `align_scale_tolerance`, or `align_min_score` if you raised it), then `subs retry --path` and `subs resolve`. |
+| `unclear` | The tool cannot tell whether the file needs one: a subtitle track tagged `und` or with no language tag, English only as closed captions, or a multi-part film. | See below. |
 
-An **`und`** track flags the file: the survey cannot know whether the track is English, so it
+A track tagged **`und`**, or with no language tag at all, flags the file (unless the file has an
+English track that counts): the survey cannot know whether the track is English, so it
 puts the file in the plan as `flag` (never touched) instead of searching, and the survey may flag
 more files than you expect. To see them, open `survey.csv` and filter `english_subtitle` or
 `subtitle_status` on `unclear`; the `reasons` column says `subtitle track with no language tag
@@ -298,8 +304,8 @@ unchanged and retrying it gives the same answer.
 
 ### Quota
 
-OpenSubtitles limits downloads: 20 a day on a free account (the tool stores whatever allowance the
-service reports). A download counts against it when the request reaches the service, whether or
+OpenSubtitles limits downloads: 20 a day on a free account at the time of writing (the tool uses
+whatever allowance the service reports). A download counts against it when the request reaches the service, whether or
 not the subtitle is then accepted; a download that fails in a way that may have reached the
 service is counted too.
 `subs resolve` checks the stored allowance before every file and stops as soon as it is used up
@@ -310,30 +316,30 @@ never taken to be more than an hour past the next midnight UTC).
 
 Besides the daily allowance each file has its own cap: `subtitle_candidates_per_file` (default 3)
 downloads in total, counted across days. A file that reaches it becomes `unavailable` with the reason
-"per-file download limit reached"; `subs retry` resets the count and forgets which candidates were
-tried. A download that a setting could have saved (an alignment rejected for its score or offset,
-or for its length) is kept on disk as a `.dl.srt` file, so after loosening the setting and
-retrying, the candidate is checked again without a new download; the retry message says how many
-are kept. A download rejected for its content (not English, not a subtitle) is not kept.
+"per-file download limit (N) reached"; `subs retry` resets the count and forgets which candidates
+were tried. A download rejected at or after the alignment (its score, offset or frame-rate scale,
+too little speech, too few cues kept, or its length) is kept on disk as a `.dl.srt` file, so after
+changing an alignment setting and `subs retry` it is checked again without a new download; the
+retry message says how many are kept. A download rejected for its content (not English, not a subtitle) is not kept.
 
 A refused login (wrong credentials, key revoked) turns OpenSubtitles off for the rest of that
 `subs resolve` only: sidecar and local files are still used, the other files stay `wanted` with
-the reason "OpenSubtitles login was refused this run", and the next run tries again. Three failed
-calls in a row (the service not answering) end the job with `Stopped: OpenSubtitles is not
-answering` and exit code 1.
+the reason "OpenSubtitles login was refused this run", and the next `subs resolve` tries again.
+When OpenSubtitles fails for three files in a row (the service not answering) the job ends with
+`Stopped: OpenSubtitles is not answering` and exit code 1.
 
 ### What gets added to the MKV
 
 When a file's subtitle is `found`, `run` adds exactly one new track to its MKV: language `eng`,
 title `English (OpenSubtitles)`, `English (local file)` or `English (sidecar)`, with the default
-and forced flags off, so players keep choosing audio and subtitles as before. Every original track
-(including an `und` subtitle track), the chapters and the other streams stay as they were. The
+and forced flags off, so players keep choosing audio and subtitles as before. Every original audio and
+subtitle track (including an `und` one), the chapters and the attachments stay as they were. The
 output is verified to hold exactly that one new track more.
 
 - A file that is also re-encoded gets the subtitle in the same step. If its encode is not worth
   keeping (the projected saving is below `min_saving`, the quality guard fails, or the output is
   too large), a subtitle-only remux of the original is delivered instead.
-- A file that needs no re-encode (already HEVC, small, low bitrate) becomes a remux whose only
+- A file that needs no re-encode (already HEVC or AV1, 4K, small, low bitrate) becomes a remux whose only
   change is the subtitle. It is delivered even though the new file is slightly larger.
 - An HDR, Dolby Vision, interlaced or multi-video-stream file, which a plan would otherwise flag,
   is remuxed with its video copied untouched when a subtitle was found.
@@ -352,7 +358,7 @@ files you may see there:
 
 | Name | What it is |
 |---|---|
-| `*.dl.srt` | A download kept on disk while it is aligned, or after an alignment or length rejection that a setting could undo, so a retry can check it again for free. At most `subtitle_candidates_per_file` are kept per video; the oldest are removed. It is removed once the subtitle is accepted. |
+| `*.dl.srt` | A copy of a candidate while it is aligned (any source), or an OpenSubtitles download kept after a rejection at or after the alignment (see [Quota](#quota)), so a retry can check it again for free. The accepted candidate's copy is removed; other kept downloads of the video stay (at most `subtitle_candidates_per_file` are kept, the oldest removed when another is added) until you delete them. |
 | `*.aligned.srt` | The aligner's output; removed after use. |
 | `.align-*` (folders) | `ffsubsync` work folders; removed after each alignment, and any a killed run left are swept at the start of `subs resolve`. |
 
@@ -362,20 +368,22 @@ them: the next `subs resolve` (at its start) or `run` (when it reaches the file,
 anything) notices that the cached file of a `found` subtitle is missing or changed, and puts the
 file back to `wanted`, remembering what was tried and how many downloads it used. A sidecar or
 local subtitle is then read again for free; an OpenSubtitles one has to be downloaded again, which
-costs a download from the day's allowance and counts toward the file's cap (`subs retry` is for
-`unavailable` and `unclear` files, not for this). The plan changes, so `plan` and `plan --ack`
-again. `survey`, `plan` and `subs status` do not look in the cache folder, so they report `found`
+costs a download from the day's allowance and counts toward the file's cap: if the file has
+already used `subtitle_candidates_per_file` downloads, the lookup cannot download it again and the
+file becomes `unavailable` (per-file download limit); run `subs retry --path` and `subs resolve`
+then. The plan changes, so `plan` and `plan --ack` again. `survey`, `plan` and `subs status` do not look in the cache folder, so they report `found`
 until one of those two commands has noticed.
 
 ### Security and privacy
 
 - The OpenSubtitles API key, username and password (and the login token the service returns) are
   kept in the operating system's keyring (the Windows Credential Manager). Where the system has no
-  usable keyring they go to `credentials.json` beside the config, restricted to your user. They
+  usable keyring they go to `%LOCALAPPDATA%\video-cleaner\credentials.json`, restricted to your user. They
   are never written to the state database, the logs (every credential the tool loads is masked in
   log lines and error text), the plan and report files, or a command line: `auth` reads them with
-  hidden input, and the aligner is started without any `VC_OPENSUBTITLES_*` variable or any
-  variable whose name contains `API_KEY`, `PASSWORD`, `TOKEN` or `SECRET`.
+  hidden input, and the aligner (like the `--help` check of ffsubsync that `doctor` and
+  `subs resolve` make) is started without any `VC_OPENSUBTITLES_*` variable or any variable whose
+  name contains `API_KEY`, `PASSWORD`, `TOKEN` or `SECRET`.
 - Subtitles are untrusted input. Their size is checked before anything is decoded, only plain-text
   formats are read (nothing is evaluated), formatting is stripped and the result is written as the
   tool's own SRT, and no name or text from a server or a subtitle ever becomes part of a path
@@ -423,7 +431,7 @@ and has the default shown.
 | `state_db` | `%LOCALAPPDATA%\video-cleaner\state.db` | State database. |
 | `log_dir` | `%LOCALAPPDATA%\video-cleaner\logs` | Per-run log files. |
 | `scratch_cap_bytes` | `2000000000000` (2 TB) | Maximum scratch use; `doctor` requires this much free space. |
-| `min_file_size` | `0` | Files smaller than this many bytes are not re-encoded (they can still be remuxed as part of a multi-part group). |
+| `min_file_size` | `0` | Files smaller than this many bytes are not re-encoded (they can still be remuxed: as part of a multi-part group, or to add a found subtitle). |
 | `bitrate_floor_kbps` | `2500` | Files whose overall container bitrate (video plus audio) is below this are not re-encoded. A placeholder you set in the config; calibration does not change it. |
 | `vmaf_target` | `95.0` | VMAF the per-file CRF search aims for. Overridden by the approved calibration. |
 | `crf_min` / `crf_max` | `16` / `24` | Clamp for the chosen CRF. `crf_max` is overridden by the approved calibration. |
@@ -463,7 +471,7 @@ zips yourself when you no longer need them. Other files in the folder are never 
 ## Third-party licences
 
 video-cleaner itself is MIT. It runs on these Python packages, with the licences their package
-metadata declares (read from the packages installed on Windows with Python 3.11; this is a
+metadata declares (read from the packages installed on Windows with Python 3.11, at the versions `uv.lock` pins for it; this is a
 summary, not legal advice):
 
 | Package | Licence | Note |
@@ -473,7 +481,7 @@ summary, not legal advice):
 | `auditok` | GPL-3.0 | **Copyleft.** Installed because `ffsubsync` depends on it, but `ffsubsync` imports it only when run with an auditok voice detector; the tool always starts it with `--vad webrtc`, so it is never loaded. |
 | `faust-cchardet` | MPL-1.1 OR GPL-2.0-or-later OR LGPL-2.1-or-later | **Copyleft** (a choice of licences). Installed by `ffsubsync`, unmodified. |
 | `tqdm` | MPL-2.0 AND MIT | **Weak copyleft** (file-level). Installed by `ffsubsync`, unmodified. |
-| `numpy` | BSD-3-Clause and permissive licences of bundled parts | Installed by `ffsubsync`. |
+| `numpy` | BSD-3-Clause | Installed by `ffsubsync`. The Windows wheel bundles OpenBLAS and LAPACK (BSD) and the GCC runtime library (GPL-3.0-or-later with the GCC runtime library exception, which permits this use). |
 
 The other packages in `uv.lock` declare MIT, BSD, Apache-2.0, ISC, PSF-2.0 or 0BSD licences. Those
 that only other platforms install (the Linux keyring support: `secretstorage`, `jeepney`,

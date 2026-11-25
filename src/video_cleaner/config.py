@@ -43,7 +43,7 @@ DEFAULT_OPENSUBTITLES_DOMAIN = "opensubtitles.com"
 DEFAULT_OPENSUBTITLES_API_HOST = "api.opensubtitles.com"
 DEFAULT_OPENSUBTITLES_API_PATH = "/api/v1"
 DEFAULT_SUBTITLE_LANGUAGE = "en"
-MAX_HEARTBEAT_S = 15.0  # plan 4.4: never silent longer than 15 s
+MAX_HEARTBEAT_S = 15.0  # the console is never silent longer than this
 
 
 class ConfigError(ValueError):
@@ -77,7 +77,7 @@ class Settings:
     forced_full_cues_per_hour: float = 250.0  # placeholder, calibrated against the real library
     align_max_offset_s: float = 120.0
     align_scale_tolerance: float = 0.05
-    align_min_score: float = 0.0  # 0 disables the score check
+    align_min_score: float = 0.0  # 0: no minimum (a score of zero or less is always refused)
     subtitle_max_bytes: int = 2_000_000
     subtitle_min_cues: int = 20
     subtitle_candidates_per_file: int = 3
@@ -272,7 +272,9 @@ def _validate(values: Mapping[str, Any]) -> None:
     _require(
         0 <= values["align_scale_tolerance"] < 1, "align_scale_tolerance must be within [0, 1)"
     )
-    _require(values["align_min_score"] >= 0, "align_min_score must not be negative (0 disables)")
+    _require(
+        values["align_min_score"] >= 0, "align_min_score must not be negative (0 sets no minimum)"
+    )
     _require(values["subtitle_max_bytes"] > 0, "subtitle_max_bytes must be positive")
     _require(values["subtitle_min_cues"] >= 0, "subtitle_min_cues must not be negative")
     _require(

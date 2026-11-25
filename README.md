@@ -3,13 +3,13 @@
 A Python command-line tool that re-encodes a video library to HEVC (x265) to reclaim disk space,
 without ever modifying the source library.
 
-Status: early development (Phases 1 and 2). `doctor`, `survey`, `plan`, `calibrate`, `run`,
+Status: early development. `doctor`, `survey`, `plan`, `calibrate`, `run`,
 `status` and `report` work: `run` encodes with x265 at a per-file CRF found by a VMAF sample
 search and keeps an output only if it passes the VMAF guard and is at least 10% smaller.
 
-Subtitles (Phase 2): `survey` checks which files lack an English subtitle, `subs resolve | status |
+Subtitles: `survey` checks which files lack an English subtitle, `subs resolve | status |
 retry` finds one for each (a sidecar file, your own subtitle folders, then OpenSubtitles, aligned
-to the audio with ffsubsync; `auth` stores the OpenSubtitles credentials) and `run` adds it to the
+to the audio with ffsubsync unless it was made for this very file; `auth` stores the OpenSubtitles credentials) and `run` adds it to the
 MKV as a new track. OpenSubtitles allows a limited number of downloads a day, so the lookups
 spread over days. See the [daily routine](docs/usage.md#daily-routine) for the order of the
 commands, and [docs/usage.md](docs/usage.md) for all commands, the run model, all settings and
@@ -33,7 +33,8 @@ creates a private `%LOCALAPPDATA%\video-cleaner\config.toml` from `config.exampl
   that is found is added as one new English track (not default, not forced).
 - 4K, already-HEVC/AV1, low-bitrate and small files are left alone (not re-encoded).
 - Encode candidates that are HDR, Dolby Vision, interlaced or have several video streams are
-  flagged and skipped for review.
+  flagged and skipped for review (when a subtitle is found for one, it is remuxed with its video
+  untouched).
 
 ## Requirements
 

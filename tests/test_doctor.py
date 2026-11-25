@@ -51,13 +51,13 @@ FFSUBSYNC_COMMAND = [
     "--help",
 ]
 ICACLS_TIGHT = (
-    "C:\\cfg\\config.toml DESKTOP\\ari:(F)\n"
+    "C:\\cfg\\config.toml DESKTOP\\user:(F)\n"
     "                    NT AUTHORITY\\SYSTEM:(F)\n\n"
     "Successfully processed 1 files; Failed processing 0 files\n"
 )
 ICACLS_LOOSE = (
     "C:\\cfg\\config.toml BUILTIN\\Users:(I)(RX)\n"
-    "                    DESKTOP\\ari:(I)(F)\n\n"
+    "                    DESKTOP\\user:(I)(F)\n\n"
     "Successfully processed 1 files; Failed processing 0 files\n"
 )
 
