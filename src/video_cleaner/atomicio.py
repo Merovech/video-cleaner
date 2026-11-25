@@ -44,9 +44,6 @@ def write_text_atomic(
         raise
 
 
-_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: symlinks, junctions, mount points
-
-
 def read_bytes_capped(path: Path, max_bytes: int, *, regular_only: bool = False) -> bytes | None:
     """The bytes of *path* when it has at most *max_bytes* of them, else None.
 
@@ -77,7 +74,7 @@ def _require_regular(fd: int, path: Path) -> None:
     if (
         not stat.S_ISREG(opened.st_mode)
         or not stat.S_ISREG(named.st_mode)
-        or attributes & _REPARSE_POINT
+        or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
         # Zero means the file system reports no id (nothing to compare).
         or (opened.st_ino and named.st_ino and opened.st_ino != named.st_ino)
         or (opened.st_dev and named.st_dev and opened.st_dev != named.st_dev)

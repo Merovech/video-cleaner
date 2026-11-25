@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,7 +45,6 @@ CONFIDENCE_NO_YEAR_MAX = 0.9
 _CONFIDENCE_YEAR_OFF_BY_ONE = 0.95
 
 _scandir = os.scandir  # a seam for tests that need a listing to fail
-_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: symlinks, junctions, mount points
 
 
 @dataclass(frozen=True)
@@ -64,7 +64,7 @@ def is_link_like(entry: os.DirEntry[str]) -> bool:
     if entry.is_symlink():
         return True
     attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-    return bool(attributes & _REPARSE_POINT)
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _subtitle_extension(name: str) -> str | None:
