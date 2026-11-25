@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import keyring
+import keyring.backends.chainer
 import keyring.backends.fail
 import keyring.backends.null
 import keyring.errors
@@ -269,16 +270,36 @@ def _default_keyring_backend() -> object | None:
 _INSECURE_BACKEND_MARKERS = ("keyrings.alt", "plaintext")
 
 
+def _members(backend: object) -> list[object] | None:
+    """The backends a chain tries in turn, or None when *backend* is not a chain."""
+    if isinstance(backend, keyring.backends.chainer.ChainerBackend):
+        return list(backend.backends)
+    return None
+
+
 def _usable(backend: object | None) -> bool:
-    """False for no backend, the library's "no backend found" one, the null one and any
-    plain-text or ``keyrings.alt`` backend."""
+    """False for no backend, the library's "no backend found" one, the null one, any plain-text
+    or ``keyrings.alt`` backend, and a chain of backends with an unusable one among them (or
+    none)."""
     if backend is None or isinstance(
         backend, (keyring.backends.fail.Keyring, keyring.backends.null.Keyring)
     ):
         return False
+    members = _members(backend)
+    if members is not None:
+        return bool(members) and all(_usable(member) for member in members)
     kind = type(backend)
     name = f"{kind.__module__}.{kind.__qualname__}".lower()
     return not any(marker in name for marker in _INSECURE_BACKEND_MARKERS)
+
+
+def _name_of(backend: object) -> str:
+    kind = type(backend)
+    name = f"{kind.__module__}.{kind.__qualname__}"
+    members = _members(backend)
+    if members is None:
+        return name
+    return f"{name} of {', '.join(_name_of(member) for member in members) or 'nothing'}"
 
 
 def keyring_status(
@@ -296,8 +317,7 @@ def keyring_status(
         return f"unavailable: {type(exc).__name__}", False
     if backend is None:
         return "none", False
-    kind = type(backend)
-    return f"{kind.__module__}.{kind.__qualname__}", _usable(backend)
+    return _name_of(backend), _usable(backend)
 
 
 def open_store(

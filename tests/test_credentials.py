@@ -911,3 +911,34 @@ def test_the_credentials_helper_runner_never_hands_credentials_to_a_child(
     monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "k")
     code = "import os; print(os.environ.get('VC_OPENSUBTITLES_API_KEY', 'absent'))"
     assert credentials._run_tool([sys.executable, "-c", code])[1].strip() == "absent"
+
+
+def _chain(*members: object) -> object:
+    import keyring.backends.chainer
+
+    class Chain(keyring.backends.chainer.ChainerBackend):
+        backends = tuple(members)
+
+    return Chain()  # type: ignore[no-untyped-call]
+
+
+def test_a_chain_with_a_plaintext_member_is_not_used(tmp_path: Path) -> None:
+    chain = _chain(FakeBackend(), PlaintextKeyring())
+    assert isinstance(open_store(_env(tmp_path), backend_factory=lambda: chain), FileStore)
+    name, usable = keyring_status(lambda: chain)
+    assert usable is False
+    assert "PlaintextKeyring" in name  # the reason is visible
+
+
+def test_a_chain_of_ordinary_backends_is_used(tmp_path: Path) -> None:
+    class Vault(FakeBackend):
+        pass
+
+    chain = _chain(FakeBackend(), Vault())
+    assert isinstance(open_store(_env(tmp_path), backend_factory=lambda: chain), KeyringStore)
+    assert keyring_status(lambda: chain)[1] is True
+
+
+def test_an_empty_chain_is_not_used(tmp_path: Path) -> None:
+    chain = _chain()
+    assert isinstance(open_store(_env(tmp_path), backend_factory=lambda: chain), FileStore)
