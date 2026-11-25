@@ -416,3 +416,28 @@ def test_printable_masks_a_secret_that_lies_across_the_old_cut() -> None:
     text = "\x00" * (30 * 4 - 5) + "SuperSecretValue123 and more"
     shown = printable(text, 30, escape=False)
     assert "Super" not in shown
+
+
+def test_every_record_is_escaped_before_it_reaches_the_handlers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = setup_logging(tmp_path, verbosity=1)
+    log = logging.getLogger(f"{LOGGER_NAME}.names")
+    # A bidi override, a C1 control and a lone surrogate (NTFS allows all of them in a name).
+    name = "evil\u202e\x9b31m\ud800.mkv"
+    log.warning("finished %s", Path(name))
+    log.warning("two\nlines\tand a tab")
+    try:
+        raise RuntimeError("bad " + name)
+    except RuntimeError:
+        log.exception("boom")
+    err = capsys.readouterr().err
+    content = path.read_text(encoding="utf-8")  # strict UTF-8: a lone surrogate would have failed
+    assert "Logging error" not in err
+    for blob in (err, content):
+        assert "evil" in blob
+        for raw in ("\u202e", "\x9b", "\ud800"):
+            assert raw not in blob
+    assert "\\u202e" in content and "\\ud800" in content  # written out as escapes
+    assert "two\nlines\tand a tab" in content  # newlines and tabs are kept
+    assert "RuntimeError" in content  # the traceback is there, escaped

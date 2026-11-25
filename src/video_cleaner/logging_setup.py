@@ -95,6 +95,17 @@ def redact(text: str, secrets: Iterable[str] = ()) -> str:
     return text
 
 
+def _unsafe(ch: str) -> bool:
+    """Control, format, surrogate, private-use, unassigned and separator (line, paragraph)."""
+    category = unicodedata.category(ch)
+    return category[0] == "C" or category in ("Zl", "Zp")
+
+
+def escape_unsafe(text: str) -> str:
+    """*text* with its unsafe characters written as escapes; newlines and tabs stay."""
+    return "".join(ascii(ch)[1:-1] if _unsafe(ch) and ch not in "\n\t" else ch for ch in text)
+
+
 def printable(text: object, limit: int = 120, *, escape: bool = True) -> str:
     """*text* as one short line that is safe to show or log: credentials masked, and control,
     format and separator characters (terminal codes, C1 controls, bidi overrides, zero-width
@@ -106,8 +117,7 @@ def printable(text: object, limit: int = 120, *, escape: bool = True) -> str:
     """
     out: list[str] = []
     for ch in redact(str(text)):  # the whole text first: a secret must not be cut in two
-        category = unicodedata.category(ch)
-        if category[0] != "C" and category not in ("Zl", "Zp"):
+        if not _unsafe(ch):
             out.append(ch)
         elif escape:
             out.append(ascii(ch)[1:-1])
@@ -120,7 +130,9 @@ def printable(text: object, limit: int = 120, *, escape: bool = True) -> str:
 
 
 class RedactingFilter(logging.Filter):
-    """Redacts the rendered message, traceback and stack of every record."""
+    """Redacts the rendered message, traceback and stack of every record and writes their unsafe
+    characters (terminal codes, bidi overrides, lone surrogates a UTF-8 file cannot hold) as
+    escapes, so no record, whatever it was given, spoofs a line or fails to be written."""
 
     def __init__(self, secrets: Iterable[str] = ()) -> None:
         super().__init__()
@@ -133,15 +145,15 @@ class RedactingFilter(logging.Filter):
             # A malformed log call must never abort the run (the stdlib would only print
             # "Logging error"); fall back to the raw message plus the arguments.
             message = f"{record.msg} {record.args!r}" if record.args else str(record.msg)
-        record.msg = redact(message, self._secrets)
+        record.msg = escape_unsafe(redact(message, self._secrets))
         record.args = None
         if record.exc_info and not record.exc_text:
             # Render now (Formatter would do the same) so the text can be redacted.
             record.exc_text = logging.Formatter().formatException(record.exc_info)
         if record.exc_text:
-            record.exc_text = redact(record.exc_text, self._secrets)
+            record.exc_text = escape_unsafe(redact(record.exc_text, self._secrets))
         if record.stack_info:
-            record.stack_info = redact(record.stack_info, self._secrets)
+            record.stack_info = escape_unsafe(redact(record.stack_info, self._secrets))
         return True
 
 

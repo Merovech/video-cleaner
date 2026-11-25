@@ -481,7 +481,9 @@ class _Job:
         try:
             redecide_found(info, self.settings, self.state, movie_hash=rec.movie_hash)
         except StateError as exc:
-            _log.warning("%s: the file could not be decided again: %s", rec.path.name, exc)
+            _log.warning(
+                "%s: the file could not be decided again: %s", _printable(rec.path.name), exc
+            )
             return "plan unchanged"
         again = self.state.get(rec.path)
         if again is None:
