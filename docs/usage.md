@@ -72,7 +72,7 @@ activated virtual environment). `--help` works on every command.
 | `calibrate --approve --vmaf-target X --crf-max Y` | Approves a VMAF target (`guard_mean_floor` to 100) and a CRF ceiling (`crf_min` to 51). A run uses these instead of the config's `vmaf_target` and `crf_max`. Refused until a `calibrate --samples` sweep has finished. |
 | `run [--until HH:MM] [--max-hours N] [--path X] [--include-unresolved]` | Executes the acknowledged plan, one encode at a time, biggest expected saving first. Stops cleanly after the current file at `--until` or after `--max-hours`; rerunning resumes. Only one `run` or `calibrate` runs at a time. A queued file whose subtitle is still `wanted` is skipped (the summary says how many); `--include-unresolved` runs those files too, without a subtitle, and a file delivered that way is never looked up afterwards (see [Statuses](#statuses)). A file whose subtitle was found after the run started is also left for the next run (the summary says so; `plan` and `plan --ack` first). |
 | `status` | Shows the number of files per status, how many files wait on subtitles, whether the plan is acknowledged (and still matches) and the calibration approved, and the last 10 events. |
-| `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. A store that cannot be read or written gives a `[FAIL]` line naming the kind of error (never a value) and exit code 2. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. `--status` and `--clear` together are refused. Takes `--config`. Without stored credentials `subs resolve` still uses sidecar files and your local folders and leaves the other files `wanted`. |
+| `auth [--status] [--clear]` | Stores the OpenSubtitles API key, username and password. It prompts for the three values with hidden input (no value is accepted as an option or an argument), keeps them in the Windows Credential Manager through `keyring` (or, when the system has no usable keyring, or only a plain-text one such as `keyrings.alt`'s, in `%LOCALAPPDATA%\video-cleaner\credentials.json`, which only your user can open) and forgets the cached login token. `--status` prints one `[ OK ]` / `[WARN]` line per name saying whether it is set, never a value. `--clear` deletes all four stored names. A store that cannot be read or written gives a `[FAIL]` line naming the kind of error (never a value) and exit code 2. `VC_OPENSUBTITLES_API_KEY`, `VC_OPENSUBTITLES_USERNAME` and `VC_OPENSUBTITLES_PASSWORD` override what is stored. `--status` and `--clear` together are refused. Takes `--config`. Without stored credentials `subs resolve` still uses sidecar files and your local folders and leaves the other files `wanted`. |
 | `subs resolve [--limit N] [--until HH:MM] [--path X]` | Looks up a subtitle for every file whose subtitle is `wanted` (sidecar, local folders, then OpenSubtitles; see [Where subtitles come from](#where-subtitles-come-from)), biggest expected saving first, under its own lock (only one at a time). `--limit N` attempts at most N files this time; `--until HH:MM` starts no new file after that time of day (it rolls to tomorrow when the time has passed); `--path X` only looks at that file or folder (a part of a multi-part film selects the film). At the start it checks that the cached file of every found subtitle (of files no run has delivered, is working on or has decided on, and within `--path`) is still there and unchanged, and sends a missing or changed one back to `wanted` (see [The cache](#the-cache)). It prints one line per file, then `Subtitles: found N, unavailable N, deferred N (allowance), skipped N`, then `Finished` or `Stopped: <reason>`. Running out of the day's allowance, `--limit`, `--until` and Ctrl+C are normal stops; exit code 1 means a problem to fix (the cache folder is not writable or overlaps a video, or OpenSubtitles failed for three files in a row); 2 a refusal, before anything is looked up (no state database, another `subs resolve` active, a bad option or setting, a cache folder that overlaps the library, a credential store that cannot be read, ffmpeg, ffprobe or mkvmerge not found, or ffsubsync not usable: it is started with `--help` first, with or without credentials, so a broken install costs no download); 130 Ctrl+C. Takes `--config`, `-v`, `-q`, `--log-file` and `--progress` like `run`. |
 | `subs status` | Shows the number of subtitle records per status, the OpenSubtitles downloads left and when they renew (UTC), the files waiting on subtitles and how many wanted subtitles are not looked up because a run has delivered, is working on or has decided on the file. It reads the database only: it does not look at the cache folder. Takes `--config`. |
 | `subs retry --path X` | Makes the `unavailable` or `unclear` subtitle of file `X` (or of any part of a multi-part film) `wanted` again, forgetting which candidates were tried and resetting the per-file download count, so the next `subs resolve` starts afresh. It says how many of the remembered candidates are still kept in the cache and are re-checked without a download; it does not look anything up itself. Any other status, or a path with no surveyed file or no subtitle record, is refused (exit code 1, nothing changed); no state database or a configuration error is exit code 2. Takes `--config`. |
@@ -119,21 +119,25 @@ resolve` and `subs retry` have their own meanings for 1 and 2; they are listed i
 
 `doctor` checks: Python 3.11 or 3.12; ffmpeg found and built with `libx265` and `libvmaf`
 (`hevc_nvenc` is informational); ffprobe and mkvmerge found; `ffsubsync` runs
-(`python -m ffsubsync.ffsubsync --help` with this Python; required, and a failure says to run
+(`python -m ffsubsync.ffsubsync --help` with this Python, started the way the aligner is, from a folder of its own; required, and a failure says to run
 `uv sync` or `uv pip install ffsubsync`); an NVIDIA GPU visible
 (informational); free space on the scratch drive at least `scratch_cap_bytes`; `library_root`
 readable; the state database, log folder, subtitle cache, `completed_dir` and `scratch_dir` neither
 inside the library nor containing it ("library overlap"); `completed_dir` and `scratch_dir` writable
 (a missing one is reported as "does not exist (will be created)"; `doctor` creates nothing), and the
 same for `subtitle_cache_dir`, which is informational because only `subs resolve` needs it; the
-config file not readable by other users (informational); the `keyring` backend in use (informational):
-the line names the backend class, and when the library found no usable one (its "fail" or "null"
-backend, or none) it is a `[WARN]` saying that credentials are then kept in the owner-only
+config file not readable by other users (informational; it looks for the well-known English
+principal names `Everyone`, `BUILTIN\Users` and `NT AUTHORITY\Authenticated Users` in the `icacls`
+output, so it misses a localized Windows or an ACE for another account, and it is no proof of
+privacy; `setup.ps1` restricts the file with `icacls` regardless); the `keyring` backend in use
+(informational): the line names the backend class, and when the library found no usable one (its
+"fail" or "null" backend, a plain-text or `keyrings.alt` one, or none) it is a `[WARN]` saying that credentials are then kept in the owner-only
 `credentials.json`, or, without `LOCALAPPDATA`, can only come from the `VC_OPENSUBTITLES_*`
 variables (this check only asks which backend is in use; the credentials check below looks the
 values up to see whether they are set and never prints one);
 the OpenSubtitles credentials set (a warning, not a failure, when they are missing); and, when the
-fallback `credentials.json` exists, that other users cannot read it (informational). Tools are found through `VC_FFMPEG` / `VC_FFPROBE` / `VC_MKVMERGE`, then `PATH`,
+fallback `credentials.json` exists, that other users cannot read it (informational; the same
+check as for the config file, with the same limits; the file is created owner-only regardless). Tools are found through `VC_FFMPEG` / `VC_FFPROBE` / `VC_MKVMERGE`, then `PATH`,
 then the default winget and MKVToolNix install folders.
 
 ## Run model
@@ -350,7 +354,8 @@ output is verified to hold exactly that one new track more.
 ### The cache
 
 Subtitles are cached in `subtitle_cache_dir` (default `%LOCALAPPDATA%\video-cleaner\subtitles`),
-a local folder that must not be inside the library, contain it, or overlap a video. File names are
+a folder that should be on a local drive (not enforced) and must not be inside the library,
+contain it, or overlap a video. File names are
 `<key>-<source>-<id>.srt`: `<key>` is 16 hex digits made from the video's path, size and
 modification time, `<source>` is `sidecar`, `local` or `opensubtitles`, and `<id>` is 12 hex
 digits taken from the subtitle's text (sidecar and local) or the OpenSubtitles file number. Other
@@ -360,7 +365,7 @@ files you may see there:
 |---|---|
 | `*.dl.srt` | A copy of a candidate while it is aligned (any source), or an OpenSubtitles download kept after a rejection at or after the alignment (see [Quota](#quota)), so a retry can check it again for free. The accepted candidate's copy is removed; other kept downloads of the video stay (at most `subtitle_candidates_per_file` are kept, the oldest removed when another is added) until you delete them. |
 | `*.aligned.srt` | The aligner's output; removed after use. |
-| `.align-*` (folders) | `ffsubsync` work folders; removed after each alignment, and any a killed run left are swept at the start of `subs resolve`. |
+| `.align-*` (folders) | `ffsubsync` work folders; removed after each alignment, and any a killed run left are swept at the start of `subs resolve`. Only folders that hold this tool's marker file (`.video-cleaner-align`) are swept, so an `.align-*` folder of another tool in the same place is left alone. |
 
 The tool never deletes a finished `.srt` itself, not even when the video it belongs to has been
 replaced or removed; clean those up yourself when you no longer need them. It is safe to delete
@@ -378,20 +383,28 @@ until one of those two commands has noticed.
 
 - The OpenSubtitles API key, username and password (and the login token the service returns) are
   kept in the operating system's keyring (the Windows Credential Manager). Where the system has no
-  usable keyring they go to `%LOCALAPPDATA%\video-cleaner\credentials.json`, restricted to your user. They
-  are never written to the state database, the logs (every credential the tool loads is masked in
-  log lines and error text), the plan and report files, or a command line: `auth` reads them with
-  hidden input, and the aligner (like the `--help` check of ffsubsync that `doctor` and
-  `subs resolve` make) is started without any `VC_OPENSUBTITLES_*` variable or any variable whose
-  name contains `API_KEY`, `PASSWORD`, `TOKEN` or `SECRET`.
+  usable keyring (or only a plain-text one, such as one from `keyrings.alt`) they go to
+  `%LOCALAPPDATA%\video-cleaner\credentials.json`, restricted to your user. They are never written
+  to the state database, the logs (every credential the tool loads is masked in log lines and in
+  tool output; the messages the tool prints itself contain none by construction), the plan and
+  report files, or a command line: `auth` reads them with hidden input. Every program the tool
+  starts (ffmpeg, ffprobe, mkvmerge, ffsubsync, and the `--help` check of ffsubsync that `doctor`
+  and `subs resolve` make) is started without any `VC_OPENSUBTITLES_*` variable or any variable
+  whose name contains `API_KEY`, `PASSWORD`, `TOKEN` or `SECRET`.
 - Subtitles are untrusted input. Their size is checked before anything is decoded, only plain-text
   formats are read (nothing is evaluated), formatting is stripped and the result is written as the
   tool's own SRT, and no name or text from a server or a subtitle ever becomes part of a path
-  or a command line (cache names are built from a hash and a number).
+  or a command line (cache names are built from a hash and a number). File names, tool output and
+  server text are shown on the console and in the logs with control, bidi and zero-width
+  characters escaped.
 - The tool talks only to the domain in `opensubtitles_domain` (default `opensubtitles.com`) and
-  its subdomains, over HTTPS, with a size cap and a timeout on every reply. A login reply, a
+  its subdomains, over HTTPS, with a size cap on every reply. Each network operation has a
+  timeout and a reply body has an overall limit of 120 s; name resolution (DNS) has no timeout of
+  its own, and the connection and header phase is bounded only per operation. A login reply, a
   download link or a redirect that names any other domain is refused, so your credentials cannot
-  be sent elsewhere.
+  be sent to another site. The system proxy (the Windows Internet settings, or `HTTPS_PROXY`) is
+  used when one is set: the connection stays encrypted end to end, but a TLS-inspecting proxy
+  whose certificate your machine trusts would see the credentials.
 - Nothing is written to the library: sidecar and local subtitles are only read, and the cache
   folder is refused when it overlaps the library.
 
@@ -411,6 +424,14 @@ until one of those two commands has noticed.
   every alignment and the reason for every rejection.
 - A hash-exact OpenSubtitles match is not aligned, since the service says it was made for this
   file; the length check still applies to it.
+- A download that was counted but whose link fetch then fails is not retried: it costs one
+  download and the candidate is remembered as tried.
+- ffprobe, mkvmerge and the verification have no time limit, so a crafted file that makes one of
+  them loop would hold `survey` or `run` until you stop it (Ctrl+C).
+- Very long single-line output from a tool (for example an embedded subtitle track that is one
+  huge cue) is held in memory before the output cap applies.
+- With the `credentials.json` fallback, running `auth` while `subs resolve` is running can lose
+  an update (the two read and write the whole file without a lock); run them one after the other.
 
 ## Settings
 
