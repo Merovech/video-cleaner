@@ -482,3 +482,43 @@ def test_the_resolver_itself_does_not_sweep(tmp_path: Path) -> None:
     (case.cache_dir / ".align-old").mkdir()
     case.resolve()
     assert (case.cache_dir / ".align-old").is_dir()
+
+
+def test_a_sidecar_that_turns_into_a_link_when_it_is_read_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    case = local_case(tmp_path, srt_bytes(tag="local"))
+    sidecar = write_sidecar(case, ".en.srt", srt_bytes(tag="sidecar"))
+    real_lstat = os.lstat
+
+    def lstat(path: Any) -> Any:
+        if Path(path) == sidecar:  # swapped for a link after it was listed
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    out = case.resolve()
+    assert out.status is SubtitleStatus.FOUND
+    assert out.provider == "local"  # the sidecar was not read; the next source was used
+
+
+def test_a_local_file_that_turns_into_a_link_when_it_is_read_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    case = local_case(tmp_path, srt_bytes(tag="local"))
+    local = tmp_path / "local-subs" / "The Great Movie 2010.srt"
+    real_lstat = os.lstat
+
+    def lstat(path: Any) -> Any:
+        if Path(path) == local:
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    out = case.resolve()
+    assert out.status is SubtitleStatus.WANTED  # nothing accepted; no OpenSubtitles client
+    assert out.cache_path is None
