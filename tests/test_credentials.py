@@ -872,3 +872,32 @@ def test_auth_with_a_real_failing_file_store_names_no_value(
 
 def test_the_app_never_shows_local_variables_in_a_traceback() -> None:
     assert app.pretty_exceptions_show_locals is False
+
+
+class PlaintextKeyring(FakeBackend):
+    """Named like the keyrings.alt backend that keeps passwords in a plain file."""
+
+
+class AltFileKeyring(FakeBackend):
+    pass
+
+
+AltFileKeyring.__module__ = "keyrings.alt.file"
+
+
+@pytest.mark.parametrize("backend_class", [PlaintextKeyring, AltFileKeyring])
+def test_a_plaintext_or_alt_keyring_is_not_used(tmp_path: Path, backend_class: type) -> None:
+    backend = backend_class()
+    store = open_store(_env(tmp_path), backend_factory=lambda: backend)
+    assert isinstance(store, FileStore)  # the owner-only file, not the plain-text keyring
+    name, usable = keyring_status(lambda: backend)
+    assert usable is False
+    assert backend_class.__name__ in name
+
+
+def test_an_ordinary_third_party_keyring_is_still_used(tmp_path: Path) -> None:
+    class SecretServiceLike(FakeBackend):
+        pass
+
+    store = open_store(_env(tmp_path), backend_factory=SecretServiceLike)
+    assert isinstance(store, KeyringStore)

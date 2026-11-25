@@ -869,3 +869,18 @@ def test_doctor_does_not_create_a_subtitle_cache_inside_the_library(tmp_path: Pa
     assert checks["subtitle_cache_dir"].ok is False
     assert checks["library overlap"].ok is False
     assert not (library / "subs").exists()
+
+
+def test_doctor_treats_a_plaintext_keyring_backend_as_unusable(tmp_path: Path) -> None:
+    class PlaintextKeyring:
+        pass
+
+    appdata = tmp_path / "appdata"
+    env = {**_env(tmp_path), "LOCALAPPDATA": str(appdata)}
+    check = _run(tmp_path, env=env, credential_store=_Store(), keyring_backend=PlaintextKeyring)[
+        "keyring"
+    ]
+    assert check.ok is False
+    assert not check.required
+    assert "PlaintextKeyring" in check.detail
+    assert str(appdata / "video-cleaner" / "credentials.json") in check.detail

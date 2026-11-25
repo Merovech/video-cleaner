@@ -273,11 +273,22 @@ def _default_keyring_backend() -> object | None:
     return keyring.get_keyring()
 
 
+# A backend whose module or class name contains one of these keeps credentials in a plain file
+# (``keyrings.alt.file.PlaintextKeyring``) or is not the system's vault: the owner-only file of
+# this tool is the better place.
+_INSECURE_BACKEND_MARKERS = ("keyrings.alt", "plaintext")
+
+
 def _usable(backend: object | None) -> bool:
-    """False for no backend, the library's "no backend found" one and the null one."""
-    return backend is not None and not isinstance(
+    """False for no backend, the library's "no backend found" one, the null one and any
+    plain-text or ``keyrings.alt`` backend."""
+    if backend is None or isinstance(
         backend, (keyring.backends.fail.Keyring, keyring.backends.null.Keyring)
-    )
+    ):
+        return False
+    kind = type(backend)
+    name = f"{kind.__module__}.{kind.__qualname__}".lower()
+    return not any(marker in name for marker in _INSECURE_BACKEND_MARKERS)
 
 
 def keyring_status(
@@ -304,7 +315,8 @@ def open_store(
     *,
     backend_factory: Callable[[], object | None] | None = None,
 ) -> CredentialStore:
-    """The keyring when it has a usable backend, otherwise the owner-only `FileStore`.
+    """The keyring when it has a usable backend (see `_usable`), otherwise the owner-only
+    `FileStore`.
 
     *backend_factory* (tests) returns the keyring backend to consider; it defaults to
     ``keyring.get_keyring``. A factory that raises counts as "no usable backend".
