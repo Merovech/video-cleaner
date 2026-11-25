@@ -785,3 +785,57 @@ def test_run_tool_redacts_a_registered_secret_in_stderr_and_the_command_log(
     assert messages
     assert not any("hunter22" in m for m in messages)
     assert "hunter22" not in log.read_text(encoding="utf-8")
+
+
+_SECRETS = {
+    "VC_OPENSUBTITLES_API_KEY": "k",
+    "VC_OPENSUBTITLES_USERNAME": "u",
+    "VC_OPENSUBTITLES_PASSWORD": "p",
+    "GITHUB_TOKEN": "t",
+    "SOME_CLIENT_SECRET": "s",
+}
+_SHOW_SECRETS = f"import os; print(sorted(n for n in os.environ if n in {sorted(_SECRETS)!r}))"
+
+
+def test_run_tool_never_hands_credentials_to_a_child_that_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in _SECRETS.items():
+        monkeypatch.setenv(name, value)
+    result = run_tool(_py(_SHOW_SECRETS), label="env", reporter=FakeReporter())
+    assert result.stdout.strip() == "[]"
+
+
+def test_run_tool_filters_an_environment_it_is_given_too() -> None:
+    env = {**os.environ, **_SECRETS, "VC_TEST_ENV_MARKER": "kept"}
+    code = _SHOW_SECRETS[:-1] + ", os.environ.get('VC_TEST_ENV_MARKER'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter(), env=env)
+    assert result.stdout.strip() == "[] kept"
+
+
+def test_the_filter_keeps_the_variables_windows_tools_need() -> None:
+    needed = {
+        "PATH": "p",
+        "PATHEXT": ".EXE",
+        "TEMP": "t",
+        "TMP": "t",
+        "SystemRoot": r"C:\Windows",
+        "windir": r"C:\Windows",
+        "ComSpec": "cmd.exe",
+        "LOCALAPPDATA": "l",
+        "APPDATA": "a",
+        "USERNAME": "u",
+        "USERDOMAIN": "d",
+        "USERPROFILE": "p",
+        "ProgramFiles": "pf",
+        "ProgramFiles(x86)": "pf",
+        "ProgramData": "pd",
+        "ALLUSERSPROFILE": "au",
+        "NUMBER_OF_PROCESSORS": "8",
+        "PROCESSOR_ARCHITECTURE": "AMD64",
+        "OS": "Windows_NT",
+        "PSModulePath": "m",
+        "VC_FFMPEG": "f",
+        "VC_LOCAL_SUBTITLE_DIRS": "d",
+    }
+    assert tools.filtered_environ({**needed, **_SECRETS}) == needed

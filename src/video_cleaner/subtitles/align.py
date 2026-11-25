@@ -42,6 +42,7 @@ from video_cleaner.tools import (
     ToolResult,
     Tools,
     ToolTimedOut,
+    filtered_environ,
     run_tool,
 )
 
@@ -70,10 +71,6 @@ _EXCERPT_LINES = 10
 _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
 WORK_PREFIX = ".align-"
-# Environment variables that are not passed to ffsubsync: this tool's OpenSubtitles credentials
-# and, as a net for others, any name with one of these words in it (compared in upper case).
-_OPENSUBTITLES_ENV_PREFIX = "VC_OPENSUBTITLES_"
-_SECRET_NAME_MARKERS = ("API_KEY", "PASSWORD", "TOKEN", "SECRET")
 _STAGED_INPUT = "input.srt"
 _STAGED_OUTPUT = "aligned.srt"
 _STAGED_LOG = "ffsubsync.log"
@@ -207,22 +204,6 @@ def accept_alignment(
     if settings.align_min_score > 0 and score < settings.align_min_score:
         return False, f"score {score:.3f} is below the minimum {settings.align_min_score:g}"
     return True, f"offset {offset_s:+.3f} s, framerate scale {scale:.3f}, score {score:.3f}"
-
-
-def _is_secret_name(name: str) -> bool:
-    """Whether an environment variable may hold a credential (compared in upper case)."""
-    upper = name.upper()
-    return upper.startswith(_OPENSUBTITLES_ENV_PREFIX) or any(
-        marker in upper for marker in _SECRET_NAME_MARKERS
-    )
-
-
-def filtered_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """A copy of *environ* (default: this process's) without the variables ffsubsync must not
-    see: it needs no credentials, so the OpenSubtitles variables and any variable whose name
-    looks like a secret are not passed on."""
-    source = os.environ if environ is None else environ
-    return {name: value for name, value in source.items() if not _is_secret_name(name)}
 
 
 def _child_env(tools: Tools) -> dict[str, str]:
