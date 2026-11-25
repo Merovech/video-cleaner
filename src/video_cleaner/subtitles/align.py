@@ -72,6 +72,9 @@ _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
 _LABEL_CHARS = 200
 WORK_PREFIX = ".align-"
+#: A file in every work folder this tool makes: the sweep (`cache.sweep_align_workdirs`) removes
+#: only folders that hold it, so a foreign folder with the same prefix is never touched.
+ALIGN_MARKER = ".video-cleaner-align"
 _STAGED_INPUT = "input.srt"
 _STAGED_OUTPUT = "aligned.srt"
 _STAGED_LOG = "ffsubsync.log"
@@ -449,6 +452,7 @@ def align_subtitle(
     out.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=out.parent))
     try:
+        (work / ALIGN_MARKER).write_text("video-cleaner align work folder", encoding="utf-8")
         shutil.copyfile(subtitle, work / _STAGED_INPUT)
         result, text, why = _run(tools, media, work, media.name, settings, reporter, timeout_s)
         if result is None:

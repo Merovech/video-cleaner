@@ -1436,3 +1436,19 @@ def test_a_hostile_file_name_and_hostile_tool_output_reach_labels_and_logs_only_
     for bad in ("\u202e", "\u200b", "\x9b"):
         assert bad not in seen
     assert "evil" in seen  # ...but the escaped one does
+
+
+def test_the_work_folder_is_marked_as_ours_before_ffsubsync_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeFfsubsync()
+    marked: list[bool] = []
+
+    def spy(cmd: Sequence[str], **kwargs: Any) -> ToolResult:
+        work = Path(option_value(cmd, "--srtout")).parent
+        marked.append((work / align.ALIGN_MARKER).is_file())
+        return fake(cmd, **kwargs)
+
+    monkeypatch.setattr(align, "run_tool", spy)
+    Case(tmp_path).run()
+    assert marked == [True]

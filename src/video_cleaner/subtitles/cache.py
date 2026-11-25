@@ -12,6 +12,7 @@ import itertools
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from video_cleaner.atomicio import read_bytes_capped
 from video_cleaner.config import Settings
 from video_cleaner.paths import is_under
 from video_cleaner.state import SubtitleRecord
-from video_cleaner.subtitles.align import WORK_PREFIX
+from video_cleaner.subtitles.align import ALIGN_MARKER, WORK_PREFIX
 from video_cleaner.subtitles.local import is_link_like
 
 _log = logging.getLogger("video_cleaner.subtitles.cache")
@@ -199,11 +200,20 @@ def sidecar_candidates(path: Path) -> list[Path]:
     return [path.parent / name for name in sorted(found)[:MAX_SIDECARS]]
 
 
+def _has_marker(folder: str) -> bool:
+    """Whether *folder* holds the align marker as a regular file (not a link)."""
+    try:
+        return stat.S_ISREG(os.lstat(os.path.join(folder, ALIGN_MARKER)).st_mode)
+    except OSError:
+        return False
+
+
 def sweep_align_workdirs(cache_dir: Path) -> int:
     """Remove the work folders ffsubsync runs left in *cache_dir* (killed runs) and count them.
 
-    Only direct children that are real folders named with the align work prefix are removed;
-    files, links, junctions and everything else stay. A folder that cannot be removed is logged
+    Only direct children that are real folders named with the align work prefix and holding the
+    marker file `align.ALIGN_MARKER` (so they are ours) are removed; files, links, junctions,
+    other tools' folders and everything else stay. A folder that cannot be removed is logged
     and skipped.
     """
     folders: list[str] = []
@@ -215,6 +225,7 @@ def sweep_align_workdirs(cache_dir: Path) -> int:
                         entry.name.startswith(WORK_PREFIX)
                         and entry.is_dir(follow_symlinks=False)
                         and not is_link_like(entry)
+                        and _has_marker(entry.path)
                     ):
                         folders.append(entry.path)
                 except OSError:
