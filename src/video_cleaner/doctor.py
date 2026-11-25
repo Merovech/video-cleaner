@@ -25,7 +25,7 @@ from video_cleaner import credentials as creds
 from video_cleaner.config import Settings, default_config_path
 from video_cleaner.paths import library_overlaps
 from video_cleaner.subtitles import align
-from video_cleaner.tools import ToolNotFound, locate_tool
+from video_cleaner.tools import ToolNotFound, locate_tool, run_captured
 
 Runner = Callable[[Sequence[str]], tuple[int, str]]
 DiskUsageFn = Callable[[Path], tuple[int, int, int]]  # (total, used, free), as shutil
@@ -58,18 +58,7 @@ class Check:
 
 def default_runner(cmd: Sequence[str]) -> tuple[int, str]:
     """Run *cmd* (argument list, no shell) and return (exit code, stdout + stderr)."""
-    # Fixed argument list, shell=False.
-    proc = subprocess.run(  # noqa: S603  # nosec B603
-        [str(part) for part in cmd],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=RUNNER_TIMEOUT_S,
-        check=False,
-        shell=False,
-    )
-    return proc.returncode, proc.stdout + proc.stderr
+    return run_captured(cmd, RUNNER_TIMEOUT_S)
 
 
 def _disk_usage(path: Path) -> tuple[int, int, int]:

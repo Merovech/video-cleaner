@@ -839,3 +839,44 @@ def test_the_filter_keeps_the_variables_windows_tools_need() -> None:
         "VC_LOCAL_SUBTITLE_DIRS": "d",
     }
     assert tools.filtered_environ({**needed, **_SECRETS}) == needed
+
+
+_PRINT_KEY_CODE = "import os; print(os.environ.get('VC_OPENSUBTITLES_API_KEY', 'absent'))"
+
+
+def test_run_captured_returns_the_exit_code_and_both_streams() -> None:
+    code, output = tools.run_captured(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)",
+        ],
+        timeout_s=30,
+    )
+    assert code == 3
+    assert "out" in output and "err" in output
+
+
+def test_run_captured_never_hands_credentials_to_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "k")
+    assert tools.run_captured([sys.executable, "-c", _PRINT_KEY_CODE], timeout_s=30)[1].strip() == (
+        "absent"
+    )
+    env = {**os.environ, "VC_OPENSUBTITLES_API_KEY": "k"}
+    given = tools.run_captured([sys.executable, "-c", _PRINT_KEY_CODE], timeout_s=30, env=env)
+    assert given[1].strip() == "absent"
+
+
+def test_run_captured_uses_the_folder_it_is_given(tmp_path: Path) -> None:
+    code, output = tools.run_captured(
+        [sys.executable, "-c", "import os; print(os.getcwd())"], timeout_s=30, cwd=tmp_path
+    )
+    assert code == 0
+    assert Path(output.strip()).resolve() == tmp_path.resolve()
+
+
+def test_run_captured_times_out() -> None:
+    with pytest.raises(subprocess.TimeoutExpired):
+        tools.run_captured([sys.executable, "-c", "import time; time.sleep(30)"], timeout_s=0.5)

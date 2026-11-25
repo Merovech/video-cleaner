@@ -30,6 +30,7 @@ import keyring.errors
 
 from video_cleaner.config import APP_DIR_NAME, env_var
 from video_cleaner.logging_setup import register_secrets
+from video_cleaner.tools import run_captured
 
 SERVICE = "video-cleaner"
 
@@ -102,18 +103,7 @@ Runner = Callable[[Sequence[str]], tuple[int, str]]
 
 
 def _run_tool(cmd: Sequence[str]) -> tuple[int, str]:
-    # Fixed argument list, shell=False.
-    proc = subprocess.run(  # noqa: S603  # nosec B603
-        [str(part) for part in cmd],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=ICACLS_TIMEOUT_S,
-        check=False,
-        shell=False,
-    )
-    return proc.returncode, proc.stdout + proc.stderr
+    return run_captured(cmd, ICACLS_TIMEOUT_S)
 
 
 _SID = re.compile(r"S-1-\d+(?:-\d+)+")

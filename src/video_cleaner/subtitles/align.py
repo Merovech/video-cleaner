@@ -43,6 +43,7 @@ from video_cleaner.tools import (
     Tools,
     ToolTimedOut,
     filtered_environ,
+    run_captured,
     run_tool,
 )
 
@@ -274,20 +275,7 @@ def _run_probe(cmd: Sequence[str], env: Mapping[str, str]) -> tuple[int, str]:
     others), and the folder is removed afterwards.
     """
     with tempfile.TemporaryDirectory(prefix="vc-probe-", ignore_cleanup_errors=True) as cwd:
-        # Fixed argument list, shell=False.
-        proc = subprocess.run(  # noqa: S603  # nosec B603
-            [str(part) for part in cmd],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=PROBE_TIMEOUT_S,
-            check=False,
-            shell=False,
-            env=dict(env),
-            cwd=cwd,
-        )
-    return proc.returncode, proc.stdout + proc.stderr
+        return run_captured(cmd, PROBE_TIMEOUT_S, cwd=cwd, env=env)
 
 
 def probe_ffsubsync(

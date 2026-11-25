@@ -884,3 +884,11 @@ def test_doctor_treats_a_plaintext_keyring_backend_as_unusable(tmp_path: Path) -
     assert not check.required
     assert "PlaintextKeyring" in check.detail
     assert str(appdata / "video-cleaner" / "credentials.json") in check.detail
+
+
+def test_the_doctors_own_runner_never_hands_credentials_to_a_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "k")
+    code = "import os; print(os.environ.get('VC_OPENSUBTITLES_API_KEY', 'absent'))"
+    assert doctor.default_runner([sys.executable, "-c", code])[1].strip() == "absent"

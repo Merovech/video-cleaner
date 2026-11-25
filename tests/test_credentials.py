@@ -901,3 +901,13 @@ def test_an_ordinary_third_party_keyring_is_still_used(tmp_path: Path) -> None:
 
     store = open_store(_env(tmp_path), backend_factory=SecretServiceLike)
     assert isinstance(store, KeyringStore)
+
+
+def test_the_credentials_helper_runner_never_hands_credentials_to_a_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "k")
+    code = "import os; print(os.environ.get('VC_OPENSUBTITLES_API_KEY', 'absent'))"
+    assert credentials._run_tool([sys.executable, "-c", code])[1].strip() == "absent"

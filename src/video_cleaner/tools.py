@@ -61,6 +61,36 @@ def filtered_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]
     return {name: value for name, value in source.items() if not _is_secret_name(name)}
 
 
+def run_captured(
+    cmd: Sequence[str],
+    timeout_s: float,
+    *,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, str]:
+    """Run *cmd* (an argument list, no shell, no stdin) and return (exit code, stdout + stderr).
+
+    For the short helper commands (``icacls``, ``whoami``, ``nvidia-smi``, an ffmpeg listing, a
+    ``--help``), where `run_tool`'s progress and heartbeat machinery is not wanted. The child gets
+    `filtered_environ` of *env* (default: this process's), like every other tool. Raises
+    `subprocess.TimeoutExpired` after *timeout_s* and `OSError` when it cannot be started.
+    """
+    # Fixed argument list, shell=False.
+    proc = subprocess.run(  # noqa: S603  # nosec B603
+        [str(part) for part in cmd],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        check=False,
+        shell=False,
+        cwd=cwd,
+        env=filtered_environ(env),
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 class ToolNotFound(Exception):
     """A required external tool could not be located."""
 
@@ -399,6 +429,7 @@ def _kill_tree_windows(proc: subprocess.Popen[str]) -> None:  # pragma: no cover
             shell=False,
             check=False,
             timeout=_TERMINATE_GRACE_S * 2,
+            env=filtered_environ(),
         )
     except (OSError, subprocess.TimeoutExpired):
         _log.warning("taskkill failed for process %d; killing only that process", proc.pid)
