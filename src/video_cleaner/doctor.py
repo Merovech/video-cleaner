@@ -132,6 +132,7 @@ class _Doctor:
         windows: bool,
         file_mode: FileModeFn,
         credential_store: creds.CredentialStore | None,
+        keyring_backend: Callable[[], object | None] | None,
     ) -> None:
         self.settings = settings
         self.env = env
@@ -142,6 +143,7 @@ class _Doctor:
         self.windows = windows
         self.file_mode = file_mode
         self.credential_store = credential_store
+        self.keyring_backend = keyring_backend
         self.ffmpeg: Path | None = None
 
     def _run(self, cmd: Sequence[str]) -> tuple[int, str]:
@@ -202,6 +204,28 @@ class _Doctor:
             else:
                 yield Check(name, False, f"not in ffmpeg {flag[1:]}", required)
 
+    def ffsubsync(self) -> Iterator[Check]:
+        """The aligner runs in this interpreter (a declared dependency, so required).
+
+        The same module `subtitles.align` starts; ffsubsync has no ``__main__``.
+        """
+        code, output = self._run(
+            [
+                sys.executable,
+                "-W",
+                "ignore::RuntimeWarning:runpy",
+                "-m",
+                "ffsubsync.ffsubsync",
+                "--help",
+            ]
+        )
+        if code == 0:
+            yield Check("ffsubsync", True, "runs (python -m ffsubsync.ffsubsync --help)")
+            return
+        problem = _first_line(output) or f"exit {code}"
+        hint = "run `uv sync`, or `uv pip install ffsubsync`"
+        yield Check("ffsubsync", False, f"does not run ({problem}); {hint}")
+
     def gpu(self) -> Iterator[Check]:
         code, output = self._run(
             [
@@ -239,33 +263,34 @@ class _Doctor:
             yield Check("library overlap", False, "; ".join(overlaps.values()))
         else:
             yield Check("library overlap", True, "outputs and library root are apart")
-        for name, label in (
-            ("completed_dir", "completed folder"),
-            ("scratch_dir", "scratch folder"),
+        # Only `subs resolve` needs the subtitle cache, so a problem there is a warning.
+        for name, label, required in (
+            ("completed_dir", "completed folder", True),
+            ("scratch_dir", "scratch folder", True),
+            ("subtitle_cache_dir", "subtitle cache", False),
         ):
             directory: Path = getattr(self.settings, name)
             problem = overlaps.get(label)
             if problem is not None:
-                yield Check(name, False, problem)  # never created inside the library
+                yield Check(name, False, problem, required)  # never created inside the library
             else:
-                yield self._writable(name, directory)
+                yield self._writable(name, directory, required)
 
-    def _writable(self, name: str, directory: Path) -> Check:
+    def _writable(self, name: str, directory: Path, required: bool = True) -> Check:
         if not directory.exists():
             # Never created here: doctor runs on the unedited example config during setup.
             ancestor = _existing_ancestor(directory)
             if ancestor.is_dir() and os.access(ancestor, os.W_OK):
-                return Check(name, True, f"{directory} does not exist (will be created)")
-            return Check(
-                name, False, f"{directory} cannot be created: {ancestor} is not a writable folder"
-            )
+                return Check(name, True, f"{directory} does not exist (will be created)", required)
+            detail = f"{directory} cannot be created: {ancestor} is not a writable folder"
+            return Check(name, False, detail, required)
         try:
             fd, probe = tempfile.mkstemp(prefix=".vc-doctor-", dir=directory)
             os.close(fd)
             Path(probe).unlink()
         except OSError as exc:
-            return Check(name, False, f"{directory} not writable: {exc}")
-        return Check(name, True, f"{directory} writable")
+            return Check(name, False, f"{directory} not writable: {exc}", required)
+        return Check(name, True, f"{directory} writable", required)
 
     def _owner_only(self, name: str, path: Path, fix: str) -> Check:
         """Informational check that *path* (an existing file) is closed to other users."""
@@ -326,9 +351,26 @@ class _Doctor:
             yield Check(name, True, "OpenSubtitles credentials are set", required=False)
 
     def keyring(self) -> Iterator[Check]:
-        found = importlib.util.find_spec("keyring") is not None
-        detail = "importable" if found else "not installed (needed for credentials)"
-        yield Check("keyring", found, detail, required=False)
+        """The keyring backend credentials would use; nothing is read from it."""
+        if importlib.util.find_spec("keyring") is None:
+            detail = "not installed (needed for credentials)"
+            yield Check("keyring", False, detail, required=False)
+            return
+        name, usable = creds.keyring_status(self.keyring_backend)
+        if usable:
+            yield Check("keyring", True, f"backend {name}", required=False)
+            return
+        # What `credentials.open_store` does without a usable backend.
+        path = creds.credentials_file_path(self.env)
+        if path is None:
+            where = (
+                "LOCALAPPDATA is not set, so credentials can only come from the "
+                "VC_OPENSUBTITLES_* environment variables"
+            )
+        else:
+            where = f"credentials are kept in the owner-only file {path}"
+        detail = f"no usable keyring backend ({name}); {where}"
+        yield Check("keyring", False, detail, required=False)
 
 
 def run_doctor(
@@ -342,13 +384,14 @@ def run_doctor(
     windows: bool | None = None,
     file_mode: FileModeFn | None = None,
     credential_store: creds.CredentialStore | None = None,
+    keyring_backend: Callable[[], object | None] | None = None,
 ) -> list[Check]:
     """Run every environment check and return the results; never raises.
 
     *config_path* defaults to `config.default_config_path` for *env*, the file `load_settings`
     reads when it is given no path. The other
     keyword arguments exist for tests and default to the real system (*credential_store*:
-    `credentials.open_store` for *env*).
+    `credentials.open_store` for *env*; *keyring_backend*: `keyring.get_keyring`).
     """
     environ: Mapping[str, str] = os.environ if env is None else env
     doc = _Doctor(
@@ -361,10 +404,12 @@ def run_doctor(
         os.name == "nt" if windows is None else windows,
         file_mode or _file_mode,
         credential_store,
+        keyring_backend,
     )
     groups: list[tuple[str, Callable[[], Iterator[Check]]]] = [
         ("python", doc.python),
         ("ffmpeg", doc.ffmpeg_and_tools),
+        ("ffsubsync", doc.ffsubsync),
         ("gpu", doc.gpu),
         ("scratch space", doc.scratch_space),
         ("library_root", doc.library_root),

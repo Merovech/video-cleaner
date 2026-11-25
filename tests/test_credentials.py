@@ -29,6 +29,7 @@ from video_cleaner.credentials import (
     OpenSubtitlesCredentials,
     credentials_file_path,
     current_identity,
+    keyring_status,
     load_credentials,
     open_store,
     restrict_to_owner,
@@ -454,6 +455,34 @@ def test_open_store_falls_back_when_the_keyring_cannot_be_loaded(tmp_path: Path)
         raise RuntimeError("no dbus")
 
     assert isinstance(open_store(_env(tmp_path), backend_factory=broken), FileStore)
+
+
+def test_keyring_status_names_a_usable_backend() -> None:
+    backend = FakeBackend()
+    name, usable = keyring_status(lambda: backend)
+    assert name == f"{FakeBackend.__module__}.{FakeBackend.__qualname__}"
+    assert usable is True
+
+
+@pytest.mark.parametrize(
+    ("backend", "name"),
+    [
+        (None, "none"),
+        (keyring.backends.fail.Keyring(), "keyring.backends.fail.Keyring"),  # type: ignore[no-untyped-call]
+        (keyring.backends.null.Keyring(), "keyring.backends.null.Keyring"),  # type: ignore[no-untyped-call]
+    ],
+)
+def test_keyring_status_flags_the_backends_open_store_does_not_use(
+    backend: object, name: str
+) -> None:
+    assert keyring_status(lambda: backend) == (name, False)
+
+
+def test_keyring_status_never_repeats_the_text_of_a_loading_error() -> None:
+    def broken() -> object:
+        raise RuntimeError("secret-detail")
+
+    assert keyring_status(broken) == ("unavailable: RuntimeError", False)
 
 
 def test_open_store_without_keyring_or_localappdata_is_an_error() -> None:

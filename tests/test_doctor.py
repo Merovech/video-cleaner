@@ -7,6 +7,8 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+import keyring.backends.fail
+import keyring.backends.null
 import pytest
 from typer.testing import CliRunner
 
@@ -37,6 +39,7 @@ FILTERS_NO_VMAF = """Filters:
  ... scale             V->V       Scale the input video size.
  ... vmafmotion        V->V       Calculate the VMAF Motion score.
 """
+FFSUBSYNC_HELP = (0, "usage: ffsubsync.py [-h] [-i [SRTIN ...]] [-o SRTOUT]\n")
 ICACLS_TIGHT = (
     "C:\\cfg\\config.toml DESKTOP\\ari:(F)\n"
     "                    NT AUTHORITY\\SYSTEM:(F)\n\n"
@@ -56,15 +59,19 @@ class FakeRunner:
         filters: str = FILTERS_OK,
         gpu: tuple[int, str] = (0, "NVIDIA GeForce RTX 4080 SUPER, 16376 MiB\n"),
         icacls: str = ICACLS_TIGHT,
+        ffsubsync: tuple[int, str] = FFSUBSYNC_HELP,
     ) -> None:
         self.encoders = encoders
         self.filters = filters
         self.gpu = gpu
         self.icacls = icacls
+        self.ffsubsync = ffsubsync
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd: Sequence[str]) -> tuple[int, str]:
         self.calls.append(list(cmd))
+        if "ffsubsync.ffsubsync" in cmd:
+            return self.ffsubsync
         if "-encoders" in cmd:
             return 0, self.encoders
         if "-filters" in cmd:
@@ -93,6 +100,7 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         "state_db": tmp_path / "state.db",
         "log_dir": tmp_path / "logs",
         "scratch_cap_bytes": 10**9,
+        "subtitle_cache_dir": tmp_path / "subtitles",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
@@ -155,6 +163,8 @@ def test_doctor_all_ok(tmp_path: Path) -> None:
         "scratch_dir",
         "config permissions",
         "keyring",
+        "ffsubsync",
+        "subtitle_cache_dir",
     ):
         assert name in checks
     assert checks["hevc_nvenc"].ok and not checks["hevc_nvenc"].required
@@ -624,10 +634,68 @@ def test_doctor_credentials_file_icacls_failure_is_a_warning(tmp_path: Path) -> 
     assert "Access is denied" in check.detail
 
 
+class _Vault:
+    """Stands for a usable keyring backend; reading a credential from it fails the test."""
+
+    def get_password(self, service: str, name: str) -> str:
+        raise AssertionError("doctor must not read a credential")
+
+
 def test_doctor_keeps_the_informational_keyring_check(tmp_path: Path) -> None:
-    check = _run(tmp_path, credential_store=_Store())["keyring"]
+    check = _run(tmp_path, credential_store=_Store(), keyring_backend=_Vault)["keyring"]
     assert check.ok is True
     assert not check.required
+
+
+def test_doctor_names_the_keyring_backend(tmp_path: Path) -> None:
+    check = _run(tmp_path, credential_store=_Store(), keyring_backend=_Vault)["keyring"]
+    assert f"{_Vault.__module__}.{_Vault.__qualname__}" in check.detail
+
+
+@pytest.mark.parametrize(
+    ("backend", "name"),
+    [
+        (keyring.backends.fail.Keyring, "keyring.backends.fail.Keyring"),
+        (keyring.backends.null.Keyring, "keyring.backends.null.Keyring"),
+    ],
+)
+def test_doctor_says_when_the_keyring_backend_is_unusable(
+    tmp_path: Path, backend: type, name: str
+) -> None:
+    appdata = tmp_path / "appdata"
+    env = {**_env(tmp_path), "LOCALAPPDATA": str(appdata)}
+    check = _run(tmp_path, env=env, credential_store=_Store(), keyring_backend=backend)["keyring"]
+    assert check.ok is False
+    assert not check.required
+    assert name in check.detail
+    assert "no usable keyring backend" in check.detail
+    assert str(appdata / "video-cleaner" / "credentials.json") in check.detail
+    assert "owner" in check.detail
+
+
+def test_doctor_unusable_keyring_without_localappdata_says_environment_only(
+    tmp_path: Path,
+) -> None:
+    check = _run(
+        tmp_path,
+        credential_store=_Store(),
+        keyring_backend=keyring.backends.fail.Keyring,
+    )["keyring"]
+    assert check.ok is False
+    assert not check.required
+    assert "LOCALAPPDATA" in check.detail
+    assert "VC_OPENSUBTITLES_" in check.detail
+
+
+def test_doctor_keyring_backend_that_fails_to_load_is_unusable(tmp_path: Path) -> None:
+    def broken() -> object:
+        raise RuntimeError("secret-detail-from-the-backend")
+
+    check = _run(tmp_path, credential_store=_Store(), keyring_backend=broken)["keyring"]
+    assert check.ok is False
+    assert not check.required
+    assert "RuntimeError" in check.detail
+    assert "secret-detail" not in check.detail
 
 
 def test_doctor_credential_store_with_any_other_error_is_a_warning(tmp_path: Path) -> None:
@@ -688,3 +756,75 @@ def test_cli_subtitle_cache_in_the_library_from_the_environment(tmp_path: Path) 
     )
     assert result.exit_code == 2
     assert "subtitle cache" in result.output
+
+
+# --- ffsubsync and the subtitle cache folder ----------------------------------------------
+
+
+def test_doctor_checks_that_ffsubsync_runs(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    check = _run(tmp_path, runner=runner)["ffsubsync"]
+    assert check.ok is True
+    assert check.required
+    (call,) = [c for c in runner.calls if "ffsubsync.ffsubsync" in c]
+    assert call[0] == sys.executable
+    assert call[-1] == "--help"
+    assert all(isinstance(part, str) for part in call)
+
+
+def test_doctor_ffsubsync_failure_is_required_and_says_how_to_install(tmp_path: Path) -> None:
+    runner = FakeRunner(ffsubsync=(1, "ModuleNotFoundError: No module named 'ffsubsync'\n"))
+    check = _run(tmp_path, runner=runner)["ffsubsync"]
+    assert check.ok is False
+    assert check.required
+    assert "ModuleNotFoundError" in check.detail
+    assert "uv sync" in check.detail
+    assert "uv pip install ffsubsync" in check.detail
+
+
+def test_doctor_ffsubsync_that_cannot_be_started_is_a_failed_check(tmp_path: Path) -> None:
+    fake = FakeRunner()
+
+    def runner(cmd: Sequence[str]) -> tuple[int, str]:
+        if "ffsubsync.ffsubsync" in cmd:
+            raise OSError("cannot start")
+        return fake(cmd)
+
+    checks = _run(tmp_path, runner=runner)
+    assert checks["ffsubsync"].ok is False
+    assert checks["ffsubsync"].required
+    assert "uv sync" in checks["ffsubsync"].detail
+    assert checks["libx265"].ok  # the other checks still ran
+
+
+def test_doctor_reports_a_missing_subtitle_cache_without_creating_it(tmp_path: Path) -> None:
+    check = _run(tmp_path)["subtitle_cache_dir"]
+    assert check.ok, check.detail
+    assert "does not exist (will be created)" in check.detail
+    assert not (tmp_path / "subtitles").exists()
+
+
+def test_doctor_subtitle_cache_write_probe_leaves_no_file(tmp_path: Path) -> None:
+    (tmp_path / "subtitles").mkdir()
+    check = _run(tmp_path)["subtitle_cache_dir"]
+    assert check.ok
+    assert "writable" in check.detail
+    assert list((tmp_path / "subtitles").iterdir()) == []
+
+
+def test_doctor_unwritable_subtitle_cache_is_a_warning(tmp_path: Path) -> None:
+    blocker = tmp_path / "file"
+    blocker.write_bytes(b"")
+    settings = _settings(tmp_path, subtitle_cache_dir=blocker / "subtitles")
+    check = _run(tmp_path, settings=settings)["subtitle_cache_dir"]
+    assert check.ok is False
+    assert not check.required  # runs and encodes do not need it; `subs resolve` does
+
+
+def test_doctor_does_not_create_a_subtitle_cache_inside_the_library(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    settings = _settings(tmp_path, subtitle_cache_dir=library / "subs")
+    checks = _run(tmp_path, settings=settings)
+    assert checks["subtitle_cache_dir"].ok is False
+    assert checks["library overlap"].ok is False
+    assert not (library / "subs").exists()

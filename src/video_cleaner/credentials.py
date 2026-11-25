@@ -279,6 +279,25 @@ def _usable(backend: object | None) -> bool:
     )
 
 
+def keyring_status(
+    backend_factory: Callable[[], object | None] | None = None,
+) -> tuple[str, bool]:
+    """The keyring backend's name (``module.Class``) and whether `open_store` would use it.
+
+    It only asks the keyring library which backend it chose; no credential is read. A factory
+    that raises gives a name made of the exception's type (never its text) and False.
+    """
+    factory = backend_factory or _default_keyring_backend
+    try:
+        backend = factory()
+    except Exception as exc:
+        return f"unavailable: {type(exc).__name__}", False
+    if backend is None:
+        return "none", False
+    kind = type(backend)
+    return f"{kind.__module__}.{kind.__qualname__}", _usable(backend)
+
+
 def open_store(
     env: Mapping[str, str] | None = None,
     *,
