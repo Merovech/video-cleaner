@@ -243,14 +243,16 @@ def ffsubsync_command() -> list[str]:
     both start it this way. ``-P`` keeps the current folder off the import path, so a module of
     that name planted there (``srt.py``, ``numpy.py``) is never imported in its place.
     """
-    return [
-        sys.executable,
-        "-P",
-        "-W",
-        "ignore::RuntimeWarning:runpy",
-        "-m",
-        "ffsubsync.ffsubsync",
-    ]
+    return flatten(
+        # This interpreter, so the aligner is the one installed with the tool.
+        (sys.executable,),
+        # Keep the current folder off the import path (a planted module there is never imported).
+        ("-P",),
+        # Silence only the "imported twice" warning that running ffsubsync.ffsubsync causes.
+        ("-W", "ignore::RuntimeWarning:runpy"),
+        # ffsubsync has no __main__ module: run the module that holds its entry point.
+        ("-m", "ffsubsync.ffsubsync"),
+    )
 
 
 #: How long the `--help` probe may take; importing ffsubsync takes about a second.
@@ -287,7 +289,11 @@ def probe_ffsubsync(
     or missing ffsubsync would otherwise only show as every subtitle being rejected, after the
     downloads were spent. *run* is replaceable for tests.
     """
-    cmd = [*ffsubsync_command(), "--help"]
+    cmd = flatten(
+        tuple(ffsubsync_command()),
+        # Print the usage and exit: starts the program without touching any file.
+        ("--help",),
+    )
     try:
         code, output = (run or _run_probe)(cmd, filtered_environ(environ))
     except subprocess.TimeoutExpired:
