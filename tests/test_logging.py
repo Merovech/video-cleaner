@@ -407,3 +407,12 @@ def test_printable_can_drop_instead_of_escape() -> None:
 
 def test_printable_accepts_any_object() -> None:
     assert printable(ValueError("bad\nthing")) == "bad\\nthing"
+
+
+def test_printable_masks_a_secret_that_lies_across_the_old_cut() -> None:
+    register_secrets(["SuperSecretValue123"])
+    # Control characters are dropped, so what follows them is shown; the secret starts 5
+    # characters before the point where the text used to be cut.
+    text = "\x00" * (30 * 4 - 5) + "SuperSecretValue123 and more"
+    shown = printable(text, 30, escape=False)
+    assert "Super" not in shown

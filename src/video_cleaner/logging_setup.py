@@ -105,12 +105,14 @@ def printable(text: object, limit: int = 120, *, escape: bool = True) -> str:
     the log or a stored reason.
     """
     out: list[str] = []
-    for ch in redact(str(text)[: limit * 4]):
+    for ch in redact(str(text)):  # the whole text first: a secret must not be cut in two
         category = unicodedata.category(ch)
         if category[0] != "C" and category not in ("Zl", "Zp"):
             out.append(ch)
         elif escape:
             out.append(ascii(ch)[1:-1])
+        if len(out) >= limit * 2:  # more than enough to fill *limit* (a long text costs no more)
+            break
     line = "".join(out)
     if not escape:
         return line.strip()[:limit]
