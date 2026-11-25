@@ -29,6 +29,7 @@ from video_cleaner.credentials import (
     OpenSubtitlesCredentials,
     credentials_file_path,
     current_identity,
+    keyring_status,
     load_credentials,
     open_store,
     restrict_to_owner,
@@ -456,6 +457,34 @@ def test_open_store_falls_back_when_the_keyring_cannot_be_loaded(tmp_path: Path)
     assert isinstance(open_store(_env(tmp_path), backend_factory=broken), FileStore)
 
 
+def test_keyring_status_names_a_usable_backend() -> None:
+    backend = FakeBackend()
+    name, usable = keyring_status(lambda: backend)
+    assert name == f"{FakeBackend.__module__}.{FakeBackend.__qualname__}"
+    assert usable is True
+
+
+@pytest.mark.parametrize(
+    ("backend", "name"),
+    [
+        (None, "none"),
+        (keyring.backends.fail.Keyring(), "keyring.backends.fail.Keyring"),  # type: ignore[no-untyped-call]
+        (keyring.backends.null.Keyring(), "keyring.backends.null.Keyring"),  # type: ignore[no-untyped-call]
+    ],
+)
+def test_keyring_status_flags_the_backends_open_store_does_not_use(
+    backend: object, name: str
+) -> None:
+    assert keyring_status(lambda: backend) == (name, False)
+
+
+def test_keyring_status_never_repeats_the_text_of_a_loading_error() -> None:
+    def broken() -> object:
+        raise RuntimeError("secret-detail")
+
+    assert keyring_status(broken) == ("unavailable: RuntimeError", False)
+
+
 def test_open_store_without_keyring_or_localappdata_is_an_error() -> None:
     with pytest.raises(CredentialError, match="LOCALAPPDATA"):
         open_store({}, backend_factory=lambda: None)
@@ -843,3 +872,73 @@ def test_auth_with_a_real_failing_file_store_names_no_value(
 
 def test_the_app_never_shows_local_variables_in_a_traceback() -> None:
     assert app.pretty_exceptions_show_locals is False
+
+
+class PlaintextKeyring(FakeBackend):
+    """Named like the keyrings.alt backend that keeps passwords in a plain file."""
+
+
+class AltFileKeyring(FakeBackend):
+    pass
+
+
+AltFileKeyring.__module__ = "keyrings.alt.file"
+
+
+@pytest.mark.parametrize("backend_class", [PlaintextKeyring, AltFileKeyring])
+def test_a_plaintext_or_alt_keyring_is_not_used(tmp_path: Path, backend_class: type) -> None:
+    backend = backend_class()
+    store = open_store(_env(tmp_path), backend_factory=lambda: backend)
+    assert isinstance(store, FileStore)  # the owner-only file, not the plain-text keyring
+    name, usable = keyring_status(lambda: backend)
+    assert usable is False
+    assert backend_class.__name__ in name
+
+
+def test_an_ordinary_third_party_keyring_is_still_used(tmp_path: Path) -> None:
+    class SecretServiceLike(FakeBackend):
+        pass
+
+    store = open_store(_env(tmp_path), backend_factory=SecretServiceLike)
+    assert isinstance(store, KeyringStore)
+
+
+def test_the_credentials_helper_runner_never_hands_credentials_to_a_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "k")
+    code = "import os; print(os.environ.get('VC_OPENSUBTITLES_API_KEY', 'absent'))"
+    assert credentials._run_tool([sys.executable, "-c", code])[1].strip() == "absent"
+
+
+def _chain(*members: object) -> object:
+    import keyring.backends.chainer
+
+    class Chain(keyring.backends.chainer.ChainerBackend):
+        backends = tuple(members)
+
+    return Chain()  # type: ignore[no-untyped-call]
+
+
+def test_a_chain_with_a_plaintext_member_is_not_used(tmp_path: Path) -> None:
+    chain = _chain(FakeBackend(), PlaintextKeyring())
+    assert isinstance(open_store(_env(tmp_path), backend_factory=lambda: chain), FileStore)
+    name, usable = keyring_status(lambda: chain)
+    assert usable is False
+    assert "PlaintextKeyring" in name  # the reason is visible
+
+
+def test_a_chain_of_ordinary_backends_is_used(tmp_path: Path) -> None:
+    class Vault(FakeBackend):
+        pass
+
+    chain = _chain(FakeBackend(), Vault())
+    assert isinstance(open_store(_env(tmp_path), backend_factory=lambda: chain), KeyringStore)
+    assert keyring_status(lambda: chain)[1] is True
+
+
+def test_an_empty_chain_is_not_used(tmp_path: Path) -> None:
+    chain = _chain()
+    assert isinstance(open_store(_env(tmp_path), backend_factory=lambda: chain), FileStore)

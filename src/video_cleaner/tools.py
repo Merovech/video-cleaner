@@ -39,6 +39,57 @@ _EXECUTABLE_SUFFIXES = ("", ".exe")
 
 _ENV_VARS = {"ffmpeg": "VC_FFMPEG", "ffprobe": "VC_FFPROBE", "mkvmerge": "VC_MKVMERGE"}
 
+# Environment variables no tool is given: this tool's OpenSubtitles credentials and, as a net for
+# others, any name with one of these words in it (compared in upper case).
+_OPENSUBTITLES_ENV_PREFIX = "VC_OPENSUBTITLES_"
+_SECRET_NAME_MARKERS = ("API_KEY", "PASSWORD", "TOKEN", "SECRET")
+
+
+def _is_secret_name(name: str) -> bool:
+    """Whether an environment variable may hold a credential (compared in upper case)."""
+    upper = name.upper()
+    return upper.startswith(_OPENSUBTITLES_ENV_PREFIX) or any(
+        marker in upper for marker in _SECRET_NAME_MARKERS
+    )
+
+
+def filtered_environ(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A copy of *environ* (default: this process's) without the variables a tool must not see:
+    none of ffmpeg, ffprobe, mkvmerge or ffsubsync needs a credential, so the OpenSubtitles
+    variables and any variable whose name looks like a secret are not passed on."""
+    source = os.environ if environ is None else environ
+    return {name: value for name, value in source.items() if not _is_secret_name(name)}
+
+
+def run_captured(
+    cmd: Sequence[str],
+    timeout_s: float,
+    *,
+    cwd: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, str]:
+    """Run *cmd* (an argument list, no shell, no stdin) and return (exit code, stdout + stderr).
+
+    For the short helper commands (``icacls``, ``whoami``, ``nvidia-smi``, an ffmpeg listing, a
+    ``--help``), where `run_tool`'s progress and heartbeat machinery is not wanted. The child gets
+    `filtered_environ` of *env* (default: this process's), like every other tool. Raises
+    `subprocess.TimeoutExpired` after *timeout_s* and `OSError` when it cannot be started.
+    """
+    # Fixed argument list, shell=False.
+    proc = subprocess.run(  # noqa: S603  # nosec B603
+        [str(part) for part in cmd],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout_s,
+        check=False,
+        shell=False,
+        cwd=cwd,
+        env=filtered_environ(env),
+    )
+    return proc.returncode, proc.stdout + proc.stderr
+
 
 class ToolNotFound(Exception):
     """A required external tool could not be located."""
@@ -378,6 +429,7 @@ def _kill_tree_windows(proc: subprocess.Popen[str]) -> None:  # pragma: no cover
             shell=False,
             check=False,
             timeout=_TERMINATE_GRACE_S * 2,
+            env=filtered_environ(),
         )
     except (OSError, subprocess.TimeoutExpired):
         _log.warning("taskkill failed for process %d; killing only that process", proc.pid)
@@ -481,8 +533,9 @@ def run_tool(
     every *heartbeat_s* seconds. The child is terminated, then killed, if this call is
     interrupted or fails.
 
-    *env* is the child's whole environment; None (the default) inherits this process's. It is
-    copied, and this process's environment is never changed. With *timeout_s* the child is
+    *env* is the child's whole environment; None (the default) inherits this process's. Either
+    way it goes through `filtered_environ` (no credentials reach a tool), and this process's
+    environment is never changed. With *timeout_s* the child is
     stopped (terminated, then killed) once it has run that long and `ToolTimedOut` is raised;
     None waits for as long as the tool takes.
 
@@ -506,7 +559,7 @@ def run_tool(
             encoding="utf-8",
             errors="replace",
             cwd=cwd,
-            env=None if env is None else dict(env),
+            env=filtered_environ(env),
             shell=False,
             creationflags=power.creation_flags(),  # below normal: the PC stays usable
             # Its own process group (POSIX) so the whole tree can be stopped; on Windows the

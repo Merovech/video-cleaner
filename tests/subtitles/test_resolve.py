@@ -27,6 +27,7 @@ from resolve_fakes import (
 )
 from video_cleaner.atomicio import write_text_atomic
 from video_cleaner.state import SubtitleRecord, SubtitleStatus
+from video_cleaner.subtitles.align import ALIGN_MARKER
 from video_cleaner.subtitles.local import index_local_folders
 from video_cleaner.subtitles.resolve import (
     CacheUnwritable,
@@ -407,12 +408,19 @@ def test_steps_are_logged_and_a_hostile_file_name_is_escaped(
 # --- sweep_align_workdirs -------------------------------------------------------------------
 
 
+def mark_work_folder(folder: Path) -> Path:
+    """Make *folder* look like a work folder of this tool's aligner (it holds the marker)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / ALIGN_MARKER).write_text("video-cleaner")
+    return folder
+
+
 def test_the_sweep_removes_only_align_work_folders(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     cache.mkdir()
-    (cache / ".align-abc123").mkdir()
+    mark_work_folder(cache / ".align-abc123")
     (cache / ".align-abc123" / "input.srt").write_text("x")
-    (cache / ".align-second").mkdir()
+    mark_work_folder(cache / ".align-second")
     (cache / ".align-file").write_text("a file, not a folder")
     (cache / "keep-folder").mkdir()
     (cache / "0123456789abcdef-local-abc.srt").write_text("final")
@@ -452,6 +460,24 @@ def test_the_sweep_never_follows_a_junction(tmp_path: Path) -> None:
     assert (target / "precious.txt").is_file()
 
 
+def test_the_sweep_leaves_a_folder_that_is_not_ours(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / ".align-foreign").mkdir()  # another tool's folder with the same prefix
+    (cache / ".align-foreign" / "data.txt").write_text("not ours")
+    mark_work_folder(cache / ".align-ours")
+    assert sweep_align_workdirs(cache) == 1
+    assert (cache / ".align-foreign" / "data.txt").is_file()
+    assert not (cache / ".align-ours").exists()
+
+
+def test_a_marker_that_is_a_folder_does_not_make_a_folder_ours(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    (cache / ".align-x" / ALIGN_MARKER).mkdir(parents=True)
+    assert sweep_align_workdirs(cache) == 0
+    assert (cache / ".align-x").is_dir()
+
+
 def test_the_sweep_of_a_missing_folder_is_zero(tmp_path: Path) -> None:
     assert sweep_align_workdirs(tmp_path / "nope") == 0
 
@@ -460,8 +486,8 @@ def test_the_sweep_skips_a_folder_it_cannot_remove(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cache = tmp_path / "cache"
-    (cache / ".align-a").mkdir(parents=True)
-    (cache / ".align-b").mkdir()
+    mark_work_folder(cache / ".align-a")
+    mark_work_folder(cache / ".align-b")
 
     real = shutil.rmtree
 
@@ -479,6 +505,46 @@ def test_the_sweep_skips_a_folder_it_cannot_remove(
 def test_the_resolver_itself_does_not_sweep(tmp_path: Path) -> None:
     case = make_case(tmp_path)
     case.cache_dir.mkdir()
-    (case.cache_dir / ".align-old").mkdir()
+    mark_work_folder(case.cache_dir / ".align-old")
     case.resolve()
     assert (case.cache_dir / ".align-old").is_dir()
+
+
+def test_a_sidecar_that_turns_into_a_link_when_it_is_read_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    case = local_case(tmp_path, srt_bytes(tag="local"))
+    sidecar = write_sidecar(case, ".en.srt", srt_bytes(tag="sidecar"))
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(path) == sidecar:  # swapped for a link after it was listed
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    out = case.resolve()
+    assert out.status is SubtitleStatus.FOUND
+    assert out.provider == "local"  # the sidecar was not read; the next source was used
+
+
+def test_a_local_file_that_turns_into_a_link_when_it_is_read_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    case = local_case(tmp_path, srt_bytes(tag="local"))
+    local = tmp_path / "local-subs" / "The Great Movie 2010.srt"
+    real_lstat = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(path) == local:
+            return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    out = case.resolve()
+    assert out.status is SubtitleStatus.WANTED  # nothing accepted; no OpenSubtitles client
+    assert out.cache_path is None

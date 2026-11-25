@@ -13,6 +13,7 @@ import contextlib
 import csv
 import io
 import os
+import stat
 import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -43,19 +44,42 @@ def write_text_atomic(
         raise
 
 
-def read_bytes_capped(path: Path, max_bytes: int) -> bytes | None:
+def read_bytes_capped(path: Path, max_bytes: int, *, regular_only: bool = False) -> bytes | None:
     """The bytes of *path* when it has at most *max_bytes* of them, else None.
 
     At most ``max_bytes + 1`` bytes are ever read, so a file that is bigger than the caller
     expected (or that grew after its size was checked) costs bounded memory. The caller treats
     None as "too large". An empty file gives ``b""``. Raises `ValueError` when *max_bytes* is
     below 1; `OSError` (a missing file, a permission problem, a directory) propagates.
+
+    With *regular_only* the file that was opened must be a regular file and the very one the path
+    names now, not a link: a path found by a folder listing may have been swapped for a link to
+    another file since, and opening it follows links. A file that fails the check raises
+    `OSError`; nothing of it is read.
     """
     if max_bytes < 1:
         raise ValueError("max_bytes must be at least 1")
     with path.open("rb") as handle:
+        if regular_only:
+            _require_regular(handle.fileno(), path)
         data = handle.read(max_bytes + 1)
     return data if len(data) <= max_bytes else None
+
+
+def _require_regular(fd: int, path: Path) -> None:
+    """Raise `OSError` unless the open file *fd* is a regular file and the one *path* names."""
+    opened = os.fstat(fd)
+    named = os.lstat(path)  # does not follow a link
+    attributes: int = getattr(named, "st_file_attributes", 0)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(named.st_mode)
+        or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        # Zero means the file system reports no id (nothing to compare).
+        or (opened.st_ino and named.st_ino and opened.st_ino != named.st_ino)
+        or (opened.st_dev and named.st_dev and opened.st_dev != named.st_dev)
+    ):
+        raise OSError("not the regular file the path names (a link, or swapped after listing)")
 
 
 # A spreadsheet treats a cell starting with one of these as a formula (CSV injection, CWE-1236).

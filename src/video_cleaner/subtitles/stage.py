@@ -24,7 +24,6 @@ from video_cleaner.paths import is_under
 from video_cleaner.state import SubtitleRecord
 
 STAGED_NAME = "subtitle.srt"
-_REPARSE_POINT = 0x400  # FILE_ATTRIBUTE_REPARSE_POINT: symlinks, junctions, mount points
 
 
 class SubtitleCacheStale(Exception):
@@ -48,7 +47,7 @@ def _cache_file(sub: SubtitleRecord, settings: Settings) -> Path:
     except OSError:
         raise SubtitleCacheStale("the cache file is missing or unreadable") from None
     attributes: int = getattr(st, "st_file_attributes", 0)
-    if stat.S_ISLNK(st.st_mode) or attributes & _REPARSE_POINT:
+    if stat.S_ISLNK(st.st_mode) or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
         raise SubtitleCacheStale("the cache file is a link")
     if not stat.S_ISREG(st.st_mode):
         raise SubtitleCacheStale("the cache path is not a regular file")

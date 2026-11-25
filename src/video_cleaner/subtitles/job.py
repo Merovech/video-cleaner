@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 import re
-import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -35,7 +34,7 @@ from pathlib import Path
 
 from video_cleaner.config import Settings
 from video_cleaner.consolefmt import Level
-from video_cleaner.logging_setup import redact
+from video_cleaner.logging_setup import printable as _printable
 from video_cleaner.paths import name_key, name_under, record_key
 from video_cleaner.probe import MediaInfo, ProbeError, probe
 from video_cleaner.progress import Reporter
@@ -99,7 +98,6 @@ MAX_CONSECUTIVE_FAILURES = 3
 #: A reset time later than the next midnight UTC plus this is not believed (a hostile or broken
 #: reply could lock the job out for good); it is cut back to that limit.
 RESET_SLACK = timedelta(hours=1)
-_MAX_LINE_CHARS = 120
 _MOVIEHASH = re.compile(r"[0-9a-f]{16}")
 _SOURCES = {"sidecar": "sidecar", "local": "local", "opensubtitles": "OpenSubtitles"}
 NO_SUBTITLE = "no subtitle found"
@@ -229,17 +227,6 @@ def retry_subtitle(state: State, path: Path, cache_dir: Path) -> tuple[bool, str
         f"{shown}: subtitle {sub.status.value} -> wanted; `subs resolve` looks it up again "
         f"({cost}; a file waiting for a subtitle is skipped by `run`)"
     )
-
-
-def _printable(text: object, limit: int = _MAX_LINE_CHARS) -> str:
-    """*text* as one short line for the console: credentials masked, control, format and
-    separator characters (terminal codes, bidi overrides, lone surrogates) written as escapes."""
-    out: list[str] = []
-    for ch in redact(str(text)):
-        category = unicodedata.category(ch)
-        out.append(ascii(ch)[1:-1] if category[0] == "C" or category in ("Zl", "Zp") else ch)
-    line = "".join(out)
-    return line if len(line) <= limit else line[: limit - 3] + "..."
 
 
 def _format_reset(moment: datetime) -> str:
@@ -432,7 +419,7 @@ class _Job:
             except ResolveStop as stop:
                 return self._stopped(tag, remaining, rec, current, stop)
             except ToolNotFound:
-                raise  # a missing ffsubsync or ffprobe is a setup problem: end the job
+                raise  # a missing ffmpeg or ffprobe is a setup problem: end the job
             except Exception as exc:  # one hostile file must never end the job
                 self.skipped += 1
                 _log.error("%s: unexpected %s; skipped", tag, type(exc).__name__)
@@ -494,7 +481,9 @@ class _Job:
         try:
             redecide_found(info, self.settings, self.state, movie_hash=rec.movie_hash)
         except StateError as exc:
-            _log.warning("%s: the file could not be decided again: %s", rec.path.name, exc)
+            _log.warning(
+                "%s: the file could not be decided again: %s", _printable(rec.path.name), exc
+            )
             return "plan unchanged"
         again = self.state.get(rec.path)
         if again is None:

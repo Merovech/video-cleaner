@@ -44,7 +44,7 @@ from video_cleaner.config import (
 )
 from video_cleaner.credentials import TOKEN, CredentialError, CredentialStore
 from video_cleaner.credentials import OpenSubtitlesCredentials as OpenSubtitlesCredentials
-from video_cleaner.logging_setup import register_secrets
+from video_cleaner.logging_setup import printable, register_secrets
 from video_cleaner.progress import Reporter
 from video_cleaner.subtitles.models import QuotaInfo
 from video_cleaner.tools import heartbeat
@@ -425,9 +425,7 @@ def _int(value: object, low: int, high: int) -> int | None:
 
 def _clean(value: object, limit: int = MAX_TEXT_CHARS) -> str:
     """Printable characters only (no escape sequences or bidi controls), at most *limit* long."""
-    if not isinstance(value, str):
-        return ""
-    return "".join(ch for ch in value[: limit * 2] if ch.isprintable()).strip()[:limit]
+    return printable(value, limit, escape=False) if isinstance(value, str) else ""
 
 
 def _flag(attributes: Mapping[str, object], name: str) -> bool:

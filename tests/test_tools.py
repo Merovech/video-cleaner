@@ -785,3 +785,98 @@ def test_run_tool_redacts_a_registered_secret_in_stderr_and_the_command_log(
     assert messages
     assert not any("hunter22" in m for m in messages)
     assert "hunter22" not in log.read_text(encoding="utf-8")
+
+
+_SECRETS = {
+    "VC_OPENSUBTITLES_API_KEY": "k",
+    "VC_OPENSUBTITLES_USERNAME": "u",
+    "VC_OPENSUBTITLES_PASSWORD": "p",
+    "GITHUB_TOKEN": "t",
+    "SOME_CLIENT_SECRET": "s",
+}
+_SHOW_SECRETS = f"import os; print(sorted(n for n in os.environ if n in {sorted(_SECRETS)!r}))"
+
+
+def test_run_tool_never_hands_credentials_to_a_child_that_inherits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name, value in _SECRETS.items():
+        monkeypatch.setenv(name, value)
+    result = run_tool(_py(_SHOW_SECRETS), label="env", reporter=FakeReporter())
+    assert result.stdout.strip() == "[]"
+
+
+def test_run_tool_filters_an_environment_it_is_given_too() -> None:
+    env = {**os.environ, **_SECRETS, "VC_TEST_ENV_MARKER": "kept"}
+    code = _SHOW_SECRETS[:-1] + ", os.environ.get('VC_TEST_ENV_MARKER'))"
+    result = run_tool(_py(code), label="env", reporter=FakeReporter(), env=env)
+    assert result.stdout.strip() == "[] kept"
+
+
+def test_the_filter_keeps_the_variables_windows_tools_need() -> None:
+    needed = {
+        "PATH": "p",
+        "PATHEXT": ".EXE",
+        "TEMP": "t",
+        "TMP": "t",
+        "SystemRoot": r"C:\Windows",
+        "windir": r"C:\Windows",
+        "ComSpec": "cmd.exe",
+        "LOCALAPPDATA": "l",
+        "APPDATA": "a",
+        "USERNAME": "u",
+        "USERDOMAIN": "d",
+        "USERPROFILE": "p",
+        "ProgramFiles": "pf",
+        "ProgramFiles(x86)": "pf",
+        "ProgramData": "pd",
+        "ALLUSERSPROFILE": "au",
+        "NUMBER_OF_PROCESSORS": "8",
+        "PROCESSOR_ARCHITECTURE": "AMD64",
+        "OS": "Windows_NT",
+        "PSModulePath": "m",
+        "VC_FFMPEG": "f",
+        "VC_LOCAL_SUBTITLE_DIRS": "d",
+    }
+    assert tools.filtered_environ({**needed, **_SECRETS}) == needed
+
+
+_PRINT_KEY_CODE = "import os; print(os.environ.get('VC_OPENSUBTITLES_API_KEY', 'absent'))"
+
+
+def test_run_captured_returns_the_exit_code_and_both_streams() -> None:
+    code, output = tools.run_captured(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)",
+        ],
+        timeout_s=30,
+    )
+    assert code == 3
+    assert "out" in output and "err" in output
+
+
+def test_run_captured_never_hands_credentials_to_the_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VC_OPENSUBTITLES_API_KEY", "k")
+    assert tools.run_captured([sys.executable, "-c", _PRINT_KEY_CODE], timeout_s=30)[1].strip() == (
+        "absent"
+    )
+    env = {**os.environ, "VC_OPENSUBTITLES_API_KEY": "k"}
+    given = tools.run_captured([sys.executable, "-c", _PRINT_KEY_CODE], timeout_s=30, env=env)
+    assert given[1].strip() == "absent"
+
+
+def test_run_captured_uses_the_folder_it_is_given(tmp_path: Path) -> None:
+    code, output = tools.run_captured(
+        [sys.executable, "-c", "import os; print(os.getcwd())"], timeout_s=30, cwd=tmp_path
+    )
+    assert code == 0
+    assert Path(output.strip()).resolve() == tmp_path.resolve()
+
+
+def test_run_captured_times_out() -> None:
+    with pytest.raises(subprocess.TimeoutExpired):
+        tools.run_captured([sys.executable, "-c", "import time; time.sleep(30)"], timeout_s=0.5)

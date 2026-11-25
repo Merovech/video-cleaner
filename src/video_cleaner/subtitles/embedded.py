@@ -18,6 +18,7 @@ from pathlib import Path
 
 from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
+from video_cleaner.logging_setup import printable
 from video_cleaner.probe import MediaInfo, SubtitleStream
 from video_cleaner.progress import Reporter
 from video_cleaner.subtitles.textfmt import SubtitleRejected, cues_per_hour, normalise_subtitle
@@ -183,7 +184,7 @@ def measure_cue_density(
             ("-",),
         ),
     ]
-    label = f"extract subtitle stream {stream.index} of {path.name}"
+    label = f"extract subtitle stream {stream.index} of {printable(path.name, 200)}"
     try:
         result = run_tool(cmd, label=label, reporter=reporter, check=False, timeout_s=timeout_s)
     except ToolTimedOut as exc:

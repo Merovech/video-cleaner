@@ -185,3 +185,88 @@ def test_read_bytes_capped_never_asks_for_more_than_one_byte_past_the_cap(
 
     assert read_bytes_capped(path, 10) is None
     assert requested == [11]
+
+
+# --- read_bytes_capped(regular_only=True) ---------------------------------------------------
+
+
+class _Stat:
+    """What `os.lstat` reports for the path."""
+
+    def __init__(self, mode: int, ino: int, dev: int, attributes: int) -> None:
+        self.st_mode, self.st_ino, self.st_dev, self.st_file_attributes = mode, ino, dev, attributes
+
+
+def _lstat_as(monkeypatch: pytest.MonkeyPatch, path: Path, **changes: int) -> None:
+    real = os.lstat(path)
+    fake = _Stat(
+        changes.get("mode", real.st_mode),
+        changes.get("ino", real.st_ino),
+        changes.get("dev", real.st_dev),
+        changes.get("attributes", getattr(real, "st_file_attributes", 0)),
+    )
+    real_lstat = os.lstat
+
+    def lstat(p: Any, *args: Any, **kwargs: Any) -> Any:
+        return fake if Path(p) == path else real_lstat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def test_a_regular_file_is_read_when_it_must_be_regular(tmp_path: Path) -> None:
+    path = tmp_path / "a.srt"
+    path.write_bytes(b"hello")
+    assert read_bytes_capped(path, 100, regular_only=True) == b"hello"
+    assert read_bytes_capped(path, 3, regular_only=True) is None  # the cap still applies
+
+
+def test_a_path_that_names_a_link_when_it_is_read_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import stat
+
+    path = tmp_path / "a.srt"
+    path.write_bytes(b"hello")
+    _lstat_as(monkeypatch, path, mode=stat.S_IFLNK | 0o777)
+    with pytest.raises(OSError, match="regular file"):
+        read_bytes_capped(path, 100, regular_only=True)
+
+
+def test_a_reparse_point_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "a.srt"
+    path.write_bytes(b"hello")
+    _lstat_as(monkeypatch, path, attributes=0x400)
+    with pytest.raises(OSError, match="regular file"):
+        read_bytes_capped(path, 100, regular_only=True)
+
+
+def test_a_file_that_is_not_the_one_the_path_names_now_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "a.srt"
+    path.write_bytes(b"hello")
+    _lstat_as(monkeypatch, path, ino=os.lstat(path).st_ino + 1)
+    with pytest.raises(OSError, match="regular file"):
+        read_bytes_capped(path, 100, regular_only=True)
+
+
+def test_a_missing_file_ino_is_not_compared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Some file systems report no inode (0): nothing to compare, the link checks still apply.
+    path = tmp_path / "a.srt"
+    path.write_bytes(b"hello")
+    _lstat_as(monkeypatch, path, ino=0)
+    assert read_bytes_capped(path, 100, regular_only=True) == b"hello"
+
+
+def test_a_real_symlink_is_refused(tmp_path: Path) -> None:
+    target = tmp_path / "secret.txt"
+    target.write_bytes(b"hello")
+    link = tmp_path / "a.srt"
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("cannot create symlinks here")
+    with pytest.raises(OSError, match="regular file"):
+        read_bytes_capped(link, 100, regular_only=True)

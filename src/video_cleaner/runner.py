@@ -53,7 +53,7 @@ from video_cleaner.consolefmt import Level
 from video_cleaner.decide import Action, decide
 from video_cleaner.encode import CrfSearchResult, EncodeError
 from video_cleaner.instancelock import instance_lock, lock_path_for
-from video_cleaner.logging_setup import redact
+from video_cleaner.logging_setup import printable, redact
 from video_cleaner.manifest import (
     ManifestEntry,
     ManifestError,
@@ -943,7 +943,7 @@ class _Runner:
 
     def _subtitle_gone(self, sub: SubtitleRecord, exc: SubtitleCacheStale) -> _SubtitleStale:
         """Send the subtitle back to WANTED (keeping what was tried) and say why."""
-        _log.warning("%s: %s; the subtitle is looked up again", sub.path, exc)
+        _log.warning("%s: %s; the subtitle is looked up again", printable(sub.path, 300), exc)
         self.state.downgrade_stale_subtitle(
             sub.path, sub.size, sub.mtime, f"{SUBTITLE_STALE_NOTE}: {exc}"
         )

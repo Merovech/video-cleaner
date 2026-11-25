@@ -53,7 +53,7 @@ from typing import Protocol, TypeVar
 
 from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.config import Settings
-from video_cleaner.logging_setup import redact
+from video_cleaner.logging_setup import printable
 from video_cleaner.probe import MediaInfo
 from video_cleaner.progress import Reporter
 from video_cleaner.state import FileRecord, SubtitleRecord, SubtitleStatus
@@ -198,10 +198,9 @@ class OnlineFailure(ResolveStop):
 
 
 def _safe(value: object, limit: int = _SHORT_REASON_CHARS) -> str:
-    """*value* as one short line of printable ASCII with credentials masked, for logs and
-    reasons: the server's and the subtitle's text is never trusted to be tidy."""
-    text = ascii(redact(str(value)))[1:-1]
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+    """*value* as one short safe line for logs and reasons: the server's and the subtitle's text
+    is never trusted to be tidy (see `printable`)."""
+    return printable(value, limit)
 
 
 def _bounded_ids(ids: Iterable[int]) -> list[int]:
@@ -439,7 +438,9 @@ class _Resolution:
         self.ctx.reporter.stage(f"subtitle: checking {provider} file {_safe(path.name, 60)}")
         names: CacheNames | None = None
         try:
-            raw = read_bytes_capped(path, self.settings.subtitle_max_bytes)
+            # The path came from a folder listing: it must still name a regular file (not a
+            # link), and be the very file that was opened.
+            raw = read_bytes_capped(path, self.settings.subtitle_max_bytes, regular_only=True)
             if raw is None:
                 self._reject_file(provider, "larger than the size limit")
                 return None

@@ -16,6 +16,7 @@ from video_cleaner.cli import app
 from video_cleaner.credentials import CredentialError
 from video_cleaner.instancelock import instance_lock, lock_path_for, subs_lock_path_for
 from video_cleaner.state import State, SubtitleRecord, SubtitleStatus
+from video_cleaner.subtitles import align
 from video_cleaner.subtitles import job as job_module
 from video_cleaner.subtitles.job import (
     DEADLINE_REACHED,
@@ -78,6 +79,7 @@ def _no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(credentials, "open_store", lambda env=None: EmptyStore())
     monkeypatch.setattr("video_cleaner.cli.locate_tools", lambda: TOOLS)
+    monkeypatch.setattr(align, "probe_ffsubsync", lambda *a, **k: align.ProbeResult(True, "runs"))
 
 
 def _invoke(*args: str, env: dict[str, str] | None = None) -> Any:
@@ -355,6 +357,71 @@ def test_a_missing_tool_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert result.exit_code == 2
     assert "ffsubsync" in result.output
     assert "Traceback" not in result.output
+
+
+def _broken_ffsubsync(monkeypatch: pytest.MonkeyPatch, result: align.ProbeResult) -> list[object]:
+    probes: list[object] = []
+
+    def probe(*args: object, **kwargs: object) -> align.ProbeResult:
+        probes.append(args)
+        return result
+
+    monkeypatch.setattr(align, "probe_ffsubsync", probe)
+    return probes
+
+
+def test_resolve_refuses_when_ffsubsync_is_not_usable_before_any_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def download(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("a download was made")
+
+    monkeypatch.setattr(OpenSubtitlesClient, "download", download)
+    probes = _broken_ffsubsync(
+        monkeypatch, align.ProbeResult(False, "ModuleNotFoundError: No module named 'ffsubsync'")
+    )
+    result, fake = _resolve(tmp_path, monkeypatch, DONE, env=LOGIN)
+    assert result.exit_code == 2
+    assert len(probes) == 1
+    assert fake.calls == []  # the job, which would download, never started
+    assert "ffsubsync is not usable" in result.output
+    assert "ModuleNotFoundError" in result.output
+    assert "uv sync" in result.output
+    assert len(result.output.strip().splitlines()) == 1
+
+
+def test_a_probe_timeout_is_refused_without_the_install_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _broken_ffsubsync(
+        monkeypatch, align.ProbeResult(False, "did not answer within 20 s", timed_out=True)
+    )
+    result, fake = _resolve(tmp_path, monkeypatch)
+    assert result.exit_code == 2
+    assert fake.calls == []
+    assert "did not answer within 20 s" in result.output
+    assert "uv sync" not in result.output
+
+
+def test_resolve_without_credentials_checks_ffsubsync_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Sidecar and local candidates are aligned with ffsubsync as well, so a broken one would
+    # reject them all and mark the files unavailable.
+    _broken_ffsubsync(monkeypatch, align.ProbeResult(False, "exit 1"))
+    result, fake = _resolve(tmp_path, monkeypatch)
+    assert result.exit_code == 2
+    assert fake.calls == []
+
+
+def test_resolve_goes_on_when_ffsubsync_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = _broken_ffsubsync(monkeypatch, align.ProbeResult(True, "runs"))
+    result, fake = _resolve(tmp_path, monkeypatch)
+    assert result.exit_code == 0, result.output
+    assert len(probes) == 1
+    assert len(fake.calls) == 1
 
 
 def test_ctrl_c_during_the_job_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

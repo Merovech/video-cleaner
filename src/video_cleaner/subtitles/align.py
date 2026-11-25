@@ -19,15 +19,17 @@ import math
 import os
 import re
 import shutil
+import subprocess  # nosec B404
 import sys
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
-from video_cleaner.logging_setup import redact
+from video_cleaner.logging_setup import printable
 from video_cleaner.progress import Reporter
 from video_cleaner.subtitles.textfmt import (
     SubtitleRejected,
@@ -40,6 +42,8 @@ from video_cleaner.tools import (
     ToolResult,
     Tools,
     ToolTimedOut,
+    filtered_environ,
+    run_captured,
     run_tool,
 )
 
@@ -67,11 +71,11 @@ _SPEECH_FRAMES_PER_S = 100.0
 _EXCERPT_LINES = 10
 _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
+_LABEL_CHARS = 200
 WORK_PREFIX = ".align-"
-# Environment variables that are not passed to ffsubsync: this tool's OpenSubtitles credentials
-# and, as a net for others, any name with one of these words in it (compared in upper case).
-_OPENSUBTITLES_ENV_PREFIX = "VC_OPENSUBTITLES_"
-_SECRET_NAME_MARKERS = ("API_KEY", "PASSWORD", "TOKEN", "SECRET")
+#: A file in every work folder this tool makes: the sweep (`cache.sweep_align_workdirs`) removes
+#: only folders that hold it, so a foreign folder with the same prefix is never touched.
+ALIGN_MARKER = ".video-cleaner-align"
 _STAGED_INPUT = "input.srt"
 _STAGED_OUTPUT = "aligned.srt"
 _STAGED_LOG = "ffsubsync.log"
@@ -207,23 +211,14 @@ def accept_alignment(
     return True, f"offset {offset_s:+.3f} s, framerate scale {scale:.3f}, score {score:.3f}"
 
 
-def _is_secret_name(name: str) -> bool:
-    """Whether an environment variable may hold a credential (compared in upper case)."""
-    upper = name.upper()
-    return upper.startswith(_OPENSUBTITLES_ENV_PREFIX) or any(
-        marker in upper for marker in _SECRET_NAME_MARKERS
-    )
-
-
 def _child_env(tools: Tools) -> dict[str, str]:
-    """A copy of this environment with the ffmpeg (and ffprobe) folders first on PATH.
+    """The filtered environment with the ffmpeg (and ffprobe) folders first on PATH.
 
     ffsubsync finds ffmpeg only through PATH. Python's stdio is set to UTF-8 so the log, which
     names the video, is decoded the way `run_tool` reads it, and the console is pinned to plain,
-    wide output. ffsubsync needs no credentials, so the OpenSubtitles variables and any variable
-    whose name looks like a secret are not passed on.
+    wide output.
     """
-    env = {name: value for name, value in os.environ.items() if not _is_secret_name(name)}
+    env = filtered_environ()
     key = next((name for name in env if name.upper() == "PATH"), "PATH")
     folders = list(dict.fromkeys(str(tool.parent) for tool in (tools.ffmpeg, tools.ffprobe)))
     existing = env.get(key, "")
@@ -239,15 +234,82 @@ def _child_env(tools: Tools) -> dict[str, str]:
     return env
 
 
+def ffsubsync_command() -> list[str]:
+    """The interpreter and arguments that start ffsubsync; its own options follow.
+
+    ffsubsync has no __main__ module, so it is run as ffsubsync.ffsubsync, which makes Python
+    warn on every start that the module was imported twice; only that warning is silenced.
+    The aligner and the `--help` probe (`probe_ffsubsync`, used by `doctor` and `subs resolve`)
+    both start it this way. ``-P`` keeps the current folder off the import path, so a module of
+    that name planted there (``srt.py``, ``numpy.py``) is never imported in its place.
+    """
+    return flatten(
+        # This interpreter, so the aligner is the one installed with the tool.
+        (sys.executable,),
+        # Keep the current folder off the import path (a planted module there is never imported).
+        ("-P",),
+        # Silence only the "imported twice" warning that running ffsubsync.ffsubsync causes.
+        ("-W", "ignore::RuntimeWarning:runpy"),
+        # ffsubsync has no __main__ module: run the module that holds its entry point.
+        ("-m", "ffsubsync.ffsubsync"),
+    )
+
+
+#: How long the `--help` probe may take; importing ffsubsync takes about a second.
+PROBE_TIMEOUT_S = 20.0
+
+ProbeRunner = Callable[[Sequence[str], Mapping[str, str]], tuple[int, str]]
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Whether ffsubsync starts; *detail* says why not (a short line, never the command line)."""
+
+    ok: bool
+    detail: str
+    timed_out: bool = False
+
+
+def _run_probe(cmd: Sequence[str], env: Mapping[str, str]) -> tuple[int, str]:
+    """Run *cmd* (an argument list, no shell) with *env*; (exit code, stdout + stderr).
+
+    It runs in a fresh empty folder, not in the caller's current one (which may be writable by
+    others), and the folder is removed afterwards.
+    """
+    with tempfile.TemporaryDirectory(prefix="vc-probe-", ignore_cleanup_errors=True) as cwd:
+        return run_captured(cmd, PROBE_TIMEOUT_S, cwd=cwd, env=env)
+
+
+def probe_ffsubsync(
+    run: ProbeRunner | None = None, environ: Mapping[str, str] | None = None
+) -> ProbeResult:
+    """Start ffsubsync with ``--help`` and say whether it ran.
+
+    The child gets the aligner's filtered environment (`filtered_environ` of *environ*). A broken
+    or missing ffsubsync would otherwise only show as every subtitle being rejected, after the
+    downloads were spent. *run* is replaceable for tests.
+    """
+    cmd = flatten(
+        tuple(ffsubsync_command()),
+        # Print the usage and exit: starts the program without touching any file.
+        ("--help",),
+    )
+    try:
+        code, output = (run or _run_probe)(cmd, filtered_environ(environ))
+    except subprocess.TimeoutExpired:
+        return ProbeResult(False, f"did not answer within {PROBE_TIMEOUT_S:g} s", timed_out=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return ProbeResult(False, f"{type(exc).__name__}: {exc}")
+    if code == 0:
+        return ProbeResult(True, "runs")
+    first = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    return ProbeResult(False, first or f"exit {code}")
+
+
 def _command(media: Path, staged_in: Path, staged_out: Path, settings: Settings) -> list[str]:
     return [
         *flatten(
-            (sys.executable,),
-            # ffsubsync has no __main__ module, so it is run as ffsubsync.ffsubsync, which
-            # makes Python warn on every start that the module was imported twice; silence
-            # only that warning.
-            ("-W", "ignore::RuntimeWarning:runpy"),
-            ("-m", "ffsubsync.ffsubsync"),
+            tuple(ffsubsync_command()),
             # The values are attached with "=", so a path that starts with "-" is a value and
             # never an option.
             (f"--srtin={staged_in}",),
@@ -282,7 +344,7 @@ def _log_excerpt(label: str, text: str) -> None:
     the cause (a traceback, a missing module) is kept.
     """
     lines = [line.rstrip() for line in normalise_newlines(text).split("\n") if line.strip()]
-    kept = [redact(line)[:_EXCERPT_LINE_CHARS] for line in lines[-_EXCERPT_LINES:]]
+    kept = [printable(line, _EXCERPT_LINE_CHARS) for line in lines[-_EXCERPT_LINES:]]
     if kept:
         _log.warning("%s: the end of ffsubsync's output:\n%s", label, "\n".join(kept))
 
@@ -327,7 +389,7 @@ def _run(
     """Run ffsubsync: (its result, the log text, "") or (None, the log text, why it failed)."""
     log_path = work / _STAGED_LOG
     cmd = _command(media, work / _STAGED_INPUT, work / _STAGED_OUTPUT, settings)
-    label = f"align subtitle to {out_label}"
+    label = f"align subtitle to {printable(out_label, _LABEL_CHARS)}"
     try:
         result = run_tool(
             cmd,
@@ -384,11 +446,12 @@ def align_subtitle(
     out.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=out.parent))
     try:
+        (work / ALIGN_MARKER).write_text("video-cleaner align work folder", encoding="utf-8")
         shutil.copyfile(subtitle, work / _STAGED_INPUT)
         result, text, why = _run(tools, media, work, media.name, settings, reporter, timeout_s)
         if result is None:
             return AlignResult(ok=False, reason=why)
-        label = f"align subtitle to {media.name}"
+        label = f"align subtitle to {printable(media.name, _LABEL_CHARS)}"
         if result.returncode != 0:
             _log.warning("%s: ffsubsync exited with code %d", label, result.returncode)
             _log_excerpt(label, text)

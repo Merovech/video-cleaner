@@ -24,12 +24,14 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import keyring
+import keyring.backends.chainer
 import keyring.backends.fail
 import keyring.backends.null
 import keyring.errors
 
 from video_cleaner.config import APP_DIR_NAME, env_var
 from video_cleaner.logging_setup import register_secrets
+from video_cleaner.tools import run_captured
 
 SERVICE = "video-cleaner"
 
@@ -102,18 +104,7 @@ Runner = Callable[[Sequence[str]], tuple[int, str]]
 
 
 def _run_tool(cmd: Sequence[str]) -> tuple[int, str]:
-    # Fixed argument list, shell=False.
-    proc = subprocess.run(  # noqa: S603  # nosec B603
-        [str(part) for part in cmd],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=ICACLS_TIMEOUT_S,
-        check=False,
-        shell=False,
-    )
-    return proc.returncode, proc.stdout + proc.stderr
+    return run_captured(cmd, ICACLS_TIMEOUT_S)
 
 
 _SID = re.compile(r"S-1-\d+(?:-\d+)+")
@@ -167,7 +158,8 @@ def restrict_to_owner(
     POSIX: ``chmod 600``. Windows: ``icacls <path> /inheritance:r /grant:r <identity>:F`` (the
     folder's inherited rights are removed, the identity keeps full control), run from
     ``System32`` by full path and without a shell. The identity is the one the running process
-    holds (`current_identity`), never a name taken from the environment alone. The keyword
+    holds (`current_identity`): its SID from ``whoami``, and only when that fails the name made
+    of ``USERDOMAIN`` and ``USERNAME`` from the environment. The keyword
     arguments exist for tests.
     """
     on_windows = os.name == "nt" if windows is None else windows
@@ -272,11 +264,60 @@ def _default_keyring_backend() -> object | None:
     return keyring.get_keyring()
 
 
+# A backend whose module or class name contains one of these keeps credentials in a plain file
+# (``keyrings.alt.file.PlaintextKeyring``) or is not the system's vault: the owner-only file of
+# this tool is the better place.
+_INSECURE_BACKEND_MARKERS = ("keyrings.alt", "plaintext")
+
+
+def _members(backend: object) -> list[object] | None:
+    """The backends a chain tries in turn, or None when *backend* is not a chain."""
+    if isinstance(backend, keyring.backends.chainer.ChainerBackend):
+        return list(backend.backends)
+    return None
+
+
 def _usable(backend: object | None) -> bool:
-    """False for no backend, the library's "no backend found" one and the null one."""
-    return backend is not None and not isinstance(
+    """False for no backend, the library's "no backend found" one, the null one, any plain-text
+    or ``keyrings.alt`` backend, and a chain of backends with an unusable one among them (or
+    none)."""
+    if backend is None or isinstance(
         backend, (keyring.backends.fail.Keyring, keyring.backends.null.Keyring)
-    )
+    ):
+        return False
+    members = _members(backend)
+    if members is not None:
+        return bool(members) and all(_usable(member) for member in members)
+    kind = type(backend)
+    name = f"{kind.__module__}.{kind.__qualname__}".lower()
+    return not any(marker in name for marker in _INSECURE_BACKEND_MARKERS)
+
+
+def _name_of(backend: object) -> str:
+    kind = type(backend)
+    name = f"{kind.__module__}.{kind.__qualname__}"
+    members = _members(backend)
+    if members is None:
+        return name
+    return f"{name} of {', '.join(_name_of(member) for member in members) or 'nothing'}"
+
+
+def keyring_status(
+    backend_factory: Callable[[], object | None] | None = None,
+) -> tuple[str, bool]:
+    """The keyring backend's name (``module.Class``) and whether `open_store` would use it.
+
+    It only asks the keyring library which backend it chose; no credential is read. A factory
+    that raises gives a name made of the exception's type (never its text) and False.
+    """
+    factory = backend_factory or _default_keyring_backend
+    try:
+        backend = factory()
+    except Exception as exc:
+        return f"unavailable: {type(exc).__name__}", False
+    if backend is None:
+        return "none", False
+    return _name_of(backend), _usable(backend)
 
 
 def open_store(
@@ -284,7 +325,8 @@ def open_store(
     *,
     backend_factory: Callable[[], object | None] | None = None,
 ) -> CredentialStore:
-    """The keyring when it has a usable backend, otherwise the owner-only `FileStore`.
+    """The keyring when it has a usable backend (see `_usable`), otherwise the owner-only
+    `FileStore`.
 
     *backend_factory* (tests) returns the keyring backend to consider; it defaults to
     ``keyring.get_keyring``. A factory that raises counts as "no usable backend".

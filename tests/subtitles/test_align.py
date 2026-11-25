@@ -1303,3 +1303,152 @@ def _run_ffmpeg(tools: Tools, args: list[str]) -> None:
         check=True,
         stdin=subprocess.DEVNULL,
     )
+
+
+# --- the ffsubsync probe -------------------------------------------------------------------
+
+FFSUBSYNC_START = [
+    sys.executable,
+    "-P",
+    "-W",
+    "ignore::RuntimeWarning:runpy",
+    "-m",
+    "ffsubsync.ffsubsync",
+]
+
+
+class ProbeRun:
+    def __init__(self, outcome: tuple[int, str] | BaseException = (0, "usage: ffsubsync.py\n")):
+        self.outcome = outcome
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def __call__(self, cmd: Sequence[str], env: Any) -> tuple[int, str]:
+        self.calls.append((list(cmd), dict(env)))
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def test_the_aligner_and_the_probe_start_ffsubsync_the_same_way(tmp_path: Path) -> None:
+    assert align.ffsubsync_command() == FFSUBSYNC_START
+    case = Case(tmp_path)
+    cmd = align._command(case.media, tmp_path / "in.srt", tmp_path / "out.srt", case.settings)
+    assert cmd[: len(FFSUBSYNC_START)] == FFSUBSYNC_START
+
+
+def test_the_probe_asks_for_help_and_passes_when_it_works() -> None:
+    run = ProbeRun()
+    result = align.probe_ffsubsync(run, {"PATH": "p"})
+    assert result.ok is True
+    assert [cmd for cmd, _ in run.calls] == [[*FFSUBSYNC_START, "--help"]]
+
+
+def test_the_probe_reports_the_first_line_of_a_failure() -> None:
+    run = ProbeRun((1, "\nModuleNotFoundError: No module named 'ffsubsync'\nmore\n"))
+    result = align.probe_ffsubsync(run, {})
+    assert result.ok is False
+    assert result.timed_out is False
+    assert result.detail == "ModuleNotFoundError: No module named 'ffsubsync'"
+
+
+def test_the_probe_names_the_exit_code_when_there_is_no_output() -> None:
+    assert align.probe_ffsubsync(ProbeRun((3, "")), {}).detail == "exit 3"
+
+
+def test_the_probe_reports_a_start_failure() -> None:
+    result = align.probe_ffsubsync(ProbeRun(OSError("cannot start")), {})
+    assert result.ok is False
+    assert "OSError" in result.detail
+
+
+def test_the_probe_reports_a_timeout_without_the_command_line() -> None:
+    timeout = subprocess.TimeoutExpired([*FFSUBSYNC_START, "--help"], 20)
+    result = align.probe_ffsubsync(ProbeRun(timeout), {})
+    assert result.ok is False
+    assert result.timed_out is True
+    assert result.detail == f"did not answer within {align.PROBE_TIMEOUT_S:g} s"
+    assert "ffsubsync.ffsubsync" not in result.detail
+
+
+def test_the_probe_child_gets_the_environment_the_aligner_gets() -> None:
+    run = ProbeRun()
+    environ = {
+        "PATH": "p",
+        "VC_OPENSUBTITLES_API_KEY": "k",
+        "VC_OPENSUBTITLES_PASSWORD": "pw",
+        "SOME_SERVICE_TOKEN": "t",
+    }
+    align.probe_ffsubsync(run, environ)
+    (_, env) = run.calls[0]
+    assert env == {"PATH": "p"}
+
+
+def test_the_default_probe_runs_a_real_command_with_the_given_environment() -> None:
+    code, output = align._run_probe(
+        [sys.executable, "-c", "import os; print(os.environ.get('VC_PROBE_TEST', 'unset'))"],
+        {**os.environ, "VC_PROBE_TEST": "seen"},
+    )
+    assert code == 0
+    assert "seen" in output
+
+
+def test_ffsubsync_is_started_without_the_current_directory_on_its_import_path() -> None:
+    assert "-P" in align.ffsubsync_command()
+
+
+def test_the_probe_runs_in_a_folder_of_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs)
+        seen["existed"] = Path(kwargs["cwd"]).is_dir()
+        return subprocess.CompletedProcess(list(cmd), 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert align._run_probe(["x"], {}) == (0, "")
+    assert Path(seen["cwd"]) != Path.cwd()
+    assert seen["existed"] is True
+    assert not Path(seen["cwd"]).exists()  # removed afterwards
+
+
+def test_a_module_planted_in_the_current_directory_is_not_imported_by_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    # ffsubsync imports srt; a file of that name in the current folder must not win.
+    (planted / "srt.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+    monkeypatch.chdir(planted)
+    result = align.probe_ffsubsync()
+    assert result.ok is True, result.detail
+
+
+def test_a_hostile_file_name_and_hostile_tool_output_reach_labels_and_logs_only_escaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    case = Case(tmp_path, "evil\u202ename\u200b.mkv")
+    log = "           INFO     path evil\u202e\u200b\x9b31m\n"
+    fake = patch_run(monkeypatch, FakeFfsubsync(raises=failed(1), log=log))
+    with caplog.at_level(logging.WARNING, logger="video_cleaner.subtitles.align"):
+        case.run()
+    seen = warnings_of(caplog) + fake.calls[0][1]["label"]
+    assert "evilname" not in seen  # the raw name never appears...
+    for bad in ("\u202e", "\u200b", "\x9b"):
+        assert bad not in seen
+    assert "evil" in seen  # ...but the escaped one does
+
+
+def test_the_work_folder_is_marked_as_ours_before_ffsubsync_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeFfsubsync()
+    marked: list[bool] = []
+
+    def spy(cmd: Sequence[str], **kwargs: Any) -> ToolResult:
+        work = Path(option_value(cmd, "--srtout")).parent
+        marked.append((work / align.ALIGN_MARKER).is_file())
+        return fake(cmd, **kwargs)
+
+    monkeypatch.setattr(align, "run_tool", spy)
+    Case(tmp_path).run()
+    assert marked == [True]

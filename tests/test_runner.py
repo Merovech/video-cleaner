@@ -3407,3 +3407,22 @@ def test_real_run_queue_encodes_one_tiny_clip_end_to_end(tmp_path: Path) -> None
     assert _content_tree(settings.library_root) == library_before  # byte-identical
     assert _scratch_files(settings) == []
     assert any(s.startswith("encode CRF") for s in reporter.stages)
+
+
+def test_the_stale_subtitle_warning_shows_a_hostile_file_name_only_escaped(
+    state: State, caplog: pytest.LogCaptureFixture
+) -> None:
+    from types import SimpleNamespace
+
+    from video_cleaner.subtitles.stage import SubtitleCacheStale
+
+    sub = SubtitleRecord(Path("D:/lib/evil\u202e\u200b.mkv"), 1, 1.0, SubtitleStatus.FOUND)
+    with caplog.at_level("WARNING", logger="video_cleaner.runner"):
+        runner_module._Runner._subtitle_gone(
+            SimpleNamespace(state=state),  # type: ignore[arg-type]
+            sub,
+            SubtitleCacheStale("missing"),
+        )
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "\u202e" not in text and "\u200b" not in text
+    assert "evil" in text
