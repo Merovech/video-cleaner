@@ -44,6 +44,7 @@ FILTERS_NO_VMAF = """Filters:
 FFSUBSYNC_HELP = (0, "usage: ffsubsync.py [-h] [-i [SRTIN ...]] [-o SRTOUT]\n")
 FFSUBSYNC_COMMAND = [
     sys.executable,
+    "-P",
     "-W",
     "ignore::RuntimeWarning:runpy",
     "-m",

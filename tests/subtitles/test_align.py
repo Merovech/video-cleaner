@@ -1309,6 +1309,7 @@ def _run_ffmpeg(tools: Tools, args: list[str]) -> None:
 
 FFSUBSYNC_START = [
     sys.executable,
+    "-P",
     "-W",
     "ignore::RuntimeWarning:runpy",
     "-m",
@@ -1389,3 +1390,34 @@ def test_the_default_probe_runs_a_real_command_with_the_given_environment() -> N
     )
     assert code == 0
     assert "seen" in output
+
+
+def test_ffsubsync_is_started_without_the_current_directory_on_its_import_path() -> None:
+    assert "-P" in align.ffsubsync_command()
+
+
+def test_the_probe_runs_in_a_folder_of_its_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def fake_run(cmd: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(kwargs)
+        seen["existed"] = Path(kwargs["cwd"]).is_dir()
+        return subprocess.CompletedProcess(list(cmd), 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert align._run_probe(["x"], {}) == (0, "")
+    assert Path(seen["cwd"]) != Path.cwd()
+    assert seen["existed"] is True
+    assert not Path(seen["cwd"]).exists()  # removed afterwards
+
+
+def test_a_module_planted_in_the_current_directory_is_not_imported_by_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    # ffsubsync imports srt; a file of that name in the current folder must not win.
+    (planted / "srt.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+    monkeypatch.chdir(planted)
+    result = align.probe_ffsubsync()
+    assert result.ok is True, result.detail

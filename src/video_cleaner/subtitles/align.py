@@ -254,9 +254,17 @@ def ffsubsync_command() -> list[str]:
     ffsubsync has no __main__ module, so it is run as ffsubsync.ffsubsync, which makes Python
     warn on every start that the module was imported twice; only that warning is silenced.
     The aligner and the `--help` probe (`probe_ffsubsync`, used by `doctor` and `subs resolve`)
-    both start it this way.
+    both start it this way. ``-P`` keeps the current folder off the import path, so a module of
+    that name planted there (``srt.py``, ``numpy.py``) is never imported in its place.
     """
-    return [sys.executable, "-W", "ignore::RuntimeWarning:runpy", "-m", "ffsubsync.ffsubsync"]
+    return [
+        sys.executable,
+        "-P",
+        "-W",
+        "ignore::RuntimeWarning:runpy",
+        "-m",
+        "ffsubsync.ffsubsync",
+    ]
 
 
 #: How long the `--help` probe may take; importing ffsubsync takes about a second.
@@ -275,19 +283,25 @@ class ProbeResult:
 
 
 def _run_probe(cmd: Sequence[str], env: Mapping[str, str]) -> tuple[int, str]:
-    """Run *cmd* (an argument list, no shell) with *env*; (exit code, stdout + stderr)."""
-    # Fixed argument list, shell=False.
-    proc = subprocess.run(  # noqa: S603  # nosec B603
-        [str(part) for part in cmd],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=PROBE_TIMEOUT_S,
-        check=False,
-        shell=False,
-        env=dict(env),
-    )
+    """Run *cmd* (an argument list, no shell) with *env*; (exit code, stdout + stderr).
+
+    It runs in a fresh empty folder, not in the caller's current one (which may be writable by
+    others), and the folder is removed afterwards.
+    """
+    with tempfile.TemporaryDirectory(prefix="vc-probe-", ignore_cleanup_errors=True) as cwd:
+        # Fixed argument list, shell=False.
+        proc = subprocess.run(  # noqa: S603  # nosec B603
+            [str(part) for part in cmd],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_S,
+            check=False,
+            shell=False,
+            env=dict(env),
+            cwd=cwd,
+        )
     return proc.returncode, proc.stdout + proc.stderr
 
 
