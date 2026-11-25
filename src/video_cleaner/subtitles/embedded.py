@@ -21,7 +21,7 @@ from video_cleaner.config import Settings
 from video_cleaner.probe import MediaInfo, SubtitleStream
 from video_cleaner.progress import Reporter
 from video_cleaner.subtitles.textfmt import SubtitleRejected, cues_per_hour, normalise_subtitle
-from video_cleaner.tools import ToolOutputError, Tools, run_tool
+from video_cleaner.tools import ToolOutputError, Tools, ToolTimedOut, run_tool
 
 _log = logging.getLogger("video_cleaner.subtitles.embedded")
 
@@ -33,6 +33,9 @@ TEXT_SUBTITLE_CODECS = frozenset(
 _CLOSED_CAPTION_CODECS = frozenset({"eia_608", "eia_708", "cc_dec"})
 _ENGLISH_TAGS = frozenset({"eng", "en", "english"})
 _UNDETERMINED_TAG = "und"
+#: The longest one subtitle extraction may take; a hung ffmpeg is stopped (with its children)
+#: and the track counts as not measured, so it can never hang a survey.
+DENSITY_TIMEOUT_S = 600.0
 
 
 class EmbeddedVerdict(StrEnum):
@@ -148,12 +151,18 @@ def measure_cue_density(
     *,
     max_bytes: int = Settings.subtitle_max_bytes,
     min_cues: int = 1,
+    timeout_s: float = DENSITY_TIMEOUT_S,
 ) -> float:
     """Cues per hour of subtitle track *stream* in *path*, by extracting it as SRT.
 
-    Returns 0.0 when nothing usable comes out: ffmpeg fails, the text is rejected (too large,
-    empty, not a subtitle), or *duration_s* is not positive. A missing ffmpeg still raises
-    `ToolNotFound`.
+    Returns 0.0 when nothing usable comes out: ffmpeg fails or does not finish within
+    *timeout_s* (it is stopped), the text is rejected (too large, empty, not a subtitle), or
+    *duration_s* is not positive. A missing ffmpeg still raises
+    `ToolNotFound`. A caller should log a 0.0 it did not expect (the survey does).
+
+    Limitation: `run_tool` keeps only the last ~1 MB of stdout, so a track whose SRT text is
+    larger than that is cut to its tail before it is parsed; its cue count, and so its density,
+    is then an undercount (cues are counted over the full *duration_s*).
     """
     if not duration_s > 0:  # also true for NaN
         return 0.0
@@ -176,7 +185,10 @@ def measure_cue_density(
     ]
     label = f"extract subtitle stream {stream.index} of {path.name}"
     try:
-        result = run_tool(cmd, label=label, reporter=reporter, check=False)
+        result = run_tool(cmd, label=label, reporter=reporter, check=False, timeout_s=timeout_s)
+    except ToolTimedOut as exc:
+        _log.warning("%s: %s", label, exc)
+        return 0.0
     except ToolOutputError as exc:
         _log.warning("%s: output handling failed: %s", label, exc)
         return 0.0

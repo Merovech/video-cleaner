@@ -2,10 +2,11 @@
 
 import logging
 import os
+import sqlite3
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -21,7 +22,7 @@ from video_cleaner.config import ConfigError, Settings, default_config_path, loa
 from video_cleaner.consolefmt import Level, encodable, print_tagged
 from video_cleaner.decide import Action
 from video_cleaner.encode import X265_CRF_MAX
-from video_cleaner.instancelock import AlreadyRunning
+from video_cleaner.instancelock import AlreadyRunning, instance_lock, subs_lock_path_for
 from video_cleaner.logging_setup import register_secrets, setup_logging
 from video_cleaner.manifest import ManifestError, read_manifest
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
@@ -31,7 +32,18 @@ from video_cleaner.progress import (
     RichReporter,
     make_reporter,
 )
-from video_cleaner.state import State, StateError
+from video_cleaner.state import State, StateError, SubtitleStatus
+from video_cleaner.subtitles import job as _job
+from video_cleaner.subtitles.local import index_local_folders
+from video_cleaner.subtitles.models import QuotaInfo
+from video_cleaner.subtitles.opensubtitles import (
+    ApiEndpoint,
+    AuthError,
+    OpenSubtitlesClient,
+    UrllibTransport,
+)
+from video_cleaner.subtitles.quota import format_utc
+from video_cleaner.subtitles.resolve import ResolveContext
 from video_cleaner.tools import ToolNotFound, Tools, locate_tools
 
 app = typer.Typer(
@@ -42,6 +54,14 @@ app = typer.Typer(
     # A traceback must never print local variables: `auth` holds the values being stored.
     pretty_exceptions_show_locals=False,
 )
+subs_app = typer.Typer(
+    name="subs",
+    help="Look up, inspect and retry the subtitles of files that have none.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_show_locals=False,
+)
+app.add_typer(subs_app, name="subs")
 
 # Unprobeable files listed in the survey summary; the CSV has all of them.
 MAX_LISTED_UNPROBEABLE = 20
@@ -209,15 +229,19 @@ def survey(
     tools = _tools()
     with _open_reporter(settings, progress) as reporter:
         try:
-            with State.open(settings.state_db) as state:
+            # Under the lock of `subs resolve`: a survey replaces rows a lookup is working on.
+            with (
+                instance_lock(subs_lock_path_for(settings.state_db)),
+                State.open(settings.state_db) as state,
+            ):
                 result = _survey.run_survey(settings, tools, state, reporter, root=root)
-        except (_survey.SurveyError, ToolNotFound) as exc:
+        except (_survey.SurveyError, ToolNotFound, AlreadyRunning) as exc:
             _fail(str(exc))
         except KeyboardInterrupt:
             print_tagged(
                 Level.WARN,
-                "survey interrupted; files are recorded only once all of them are probed, so "
-                "nothing from this survey was recorded: run it again",
+                "survey interrupted; probing changes no records until the recording step, and "
+                "running the survey again is always safe",
                 stderr=True,
             )
             raise typer.Exit(code=EXIT_INTERRUPTED) from None
@@ -308,7 +332,10 @@ def plan(
             if ack:
                 current = planning.plan_hash(report)
                 if planning.read_plan_hash(hash_path) != current:
-                    _fail("run `plan` first and review it (the plan changed or was not written)")
+                    _fail(
+                        "run `plan` first and review it (the plan changed, for example because a "
+                        "subtitle was found or went stale, or it was not written)"
+                    )
                 if not report.rows:
                     _fail("the plan is empty: run `survey` first")
                 state.acknowledge_plan(current)
@@ -431,6 +458,20 @@ def _print_run_summary(summary: _runner.RunSummary) -> None:
         print_tagged(Level.INFO, "Run ended: deadline reached (the file in progress was finished)")
     else:
         print_tagged(Level.OK, "Run ended: queue finished")
+    if summary.changed_since_start:
+        n = summary.changed_since_start
+        print_tagged(
+            Level.WARN,
+            f"{n} {'file' if n == 1 else 'files'} changed after the run started (a subtitle was "
+            "found or the plan was updated): run `plan`, review it, then `plan --ack`",
+        )
+    if summary.waiting_on_subtitles:
+        n = summary.waiting_on_subtitles
+        print_tagged(
+            Level.INFO,
+            f"{n} {'file' if n == 1 else 'files'} waiting on subtitles were skipped "
+            "(`run --include-unresolved` runs them without one)",
+        )
 
 
 @app.command()
@@ -445,6 +486,13 @@ def run(
     path: Annotated[
         Path | None, typer.Option("--path", help="Only process this file or folder.")
     ] = None,
+    include_unresolved: Annotated[
+        bool,
+        typer.Option(
+            "--include-unresolved",
+            help="Also run files whose subtitle lookup is not finished, without a subtitle.",
+        ),
+    ] = False,
     config: ConfigOption = None,
     verbose: VerboseOption = 0,
     quiet: QuietOption = False,
@@ -471,6 +519,7 @@ def run(
                     deadline=deadline,
                     only=path,
                     current_log=log_path,
+                    include_unresolved=include_unresolved,
                 )
         except (
             _runner.PlanNotAcknowledged,
@@ -507,7 +556,8 @@ def status(config: ConfigOption = None) -> None:
         with State.open(settings.state_db) as state:
             counts, members = planning.status_counts(state)
             acknowledged = state.plan_acknowledged()
-            current = planning.plan_hash(planning.build_plan(state))
+            plan = planning.build_plan(state)
+            current = planning.plan_hash(plan)
             calibration = state.calibration()
             events = state.events(LAST_EVENTS)
     except StateError as exc:
@@ -516,14 +566,12 @@ def status(config: ConfigOption = None) -> None:
     for st, n in counts.items():
         _say(f"  {st.value:<12} {n}")
     _say(f"Multi-part members: {members} (counted with their group)")
+    waiting = plan.waiting_on_subtitles
+    _say(f"Files waiting on subtitles: {waiting} (`run` skips queued ones until one is found)")
     if acknowledged is None:
         _say("Plan acknowledged: no (run `plan`, review it, then `plan --ack`)")
     else:
-        match = (
-            "matches the current plan"
-            if acknowledged == current
-            else "the plan changed since: run `plan` and acknowledge it again"
-        )
+        match = "matches the current plan" if acknowledged == current else planning.PLAN_CHANGED
         _say(f"Plan acknowledged: yes ({acknowledged[:HASH_PREFIX]}), {match}")
     if calibration is None:
         _say("Calibration approved: no (run `calibrate`)")
@@ -538,6 +586,7 @@ def status(config: ConfigOption = None) -> None:
 def _print_results(results: planning.ResultsReport, csv_path: Path) -> None:
     _say(f"Completed: {len(results.entries)}")
     _say(f"Saved: {_gib(results.bytes_saved)}")
+    _say(f"Subtitles added: {sum(1 for e in results.entries if e.subtitle)}")
     if results.unchanged:
         tally = {v: results.unchanged.count(v) for v in planning.UNCHANGED_VERDICTS}
         _say(
@@ -668,3 +717,203 @@ def auth(
         _fail(f"credentials: {exc}")
     except Exception as exc:  # the store's own error type; its text could hold a value
         _fail(f"credentials: {type(exc).__name__}")
+
+
+# --- subs: subtitle lookups ------------------------------------------------------------------
+
+
+def _opensubtitles_client(settings: Settings, reporter: Reporter) -> OpenSubtitlesClient | None:
+    """The OpenSubtitles client, or None (with a notice) when no credentials are stored.
+
+    An unreadable credential store or a key that cannot be sent exits 2; the message names the
+    kind of error, never a value.
+    """
+    try:
+        store = _credentials.open_store()
+        creds = _credentials.load_credentials(store)
+    except _credentials.CredentialError as exc:
+        _fail(f"credentials: {exc}")
+    except Exception as exc:  # the store's own error type; its text could hold a value
+        _fail(f"credentials: {type(exc).__name__}")
+    if creds is None:
+        print_tagged(
+            Level.INFO,
+            "no OpenSubtitles credentials: sidecar and local folders only; run `auth` to add them",
+        )
+        return None
+    try:
+        return OpenSubtitlesClient(
+            creds,
+            store,
+            UrllibTransport(domain=settings.opensubtitles_domain),
+            reporter,
+            endpoint=ApiEndpoint.from_settings(settings),
+        )
+    except AuthError as exc:
+        _fail(f"credentials: {exc}")
+
+
+def _resolve_subtitles(
+    settings: Settings,
+    tools: Tools,
+    reporter: Reporter,
+    *,
+    limit: int | None,
+    deadline: datetime | None,
+    only: Path | None,
+) -> tuple[_job.JobSummary, str, bool]:
+    """Run the subtitle job under its own lock (a `run` may be active beside it); the summary,
+    the line about the wanted subtitles a run has already dealt with ("" for none) and whether
+    the plan (`planning.plan_hash`) differs from what it was before the job."""
+    with (
+        instance_lock(subs_lock_path_for(settings.state_db)),
+        State.open(settings.state_db) as state,
+    ):
+        client = _opensubtitles_client(settings, reporter)
+        local_index = index_local_folders(
+            settings.local_subtitle_dirs, max_bytes=settings.subtitle_max_bytes
+        )
+        if settings.local_subtitle_dirs:
+            print_tagged(Level.INFO, f"local subtitle folders: {len(local_index)} files indexed")
+        ctx = ResolveContext(
+            settings=settings,
+            tools=tools,
+            reporter=reporter,
+            local_index=local_index,
+            client=client,
+        )
+        before = planning.plan_hash(planning.build_plan(state))
+        summary = _job.run_resolve_job(
+            settings, state, ctx, limit=limit, deadline=deadline, only=only
+        )
+        changed = planning.plan_hash(planning.build_plan(state)) != before
+        return summary, _job.held_back_line(state), changed
+
+
+def _print_subs_summary(
+    summary: _job.JobSummary, held_back: str = "", plan_changed: bool = False
+) -> None:
+    print_tagged(
+        Level.INFO,
+        f"Subtitles: found {summary.resolved_found}, unavailable {summary.unavailable}, "
+        f"deferred {summary.deferred_quota} (allowance), skipped {summary.skipped}",
+    )
+    reason = summary.stopped_reason
+    if not reason:
+        print_tagged(Level.OK, "Finished: every wanted subtitle was looked up")
+    elif _job.is_failure(reason) or reason == _job.INTERRUPTED:
+        print_tagged(Level.WARN, f"Stopped: {reason}")
+    else:
+        print_tagged(Level.INFO, f"Stopped: {reason}")
+    if held_back:
+        print_tagged(Level.INFO, held_back)
+    if plan_changed:
+        print_tagged(
+            Level.INFO,
+            "The plan changed: run `plan`, review it, then `plan --ack` before the next `run`",
+        )
+
+
+@subs_app.command("resolve")
+def subs_resolve(
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="Look up at most N files this time.")
+    ] = None,
+    until: Annotated[
+        str | None,
+        typer.Option("--until", help="Start no new file after this time of day (HH:MM)."),
+    ] = None,
+    path: Annotated[Path | None, typer.Option("--path", help="Only this file or folder.")] = None,
+    config: ConfigOption = None,
+    verbose: VerboseOption = 0,
+    quiet: QuietOption = False,
+    log_file: LogFileOption = None,
+    progress: ProgressOption = ProgressMode.AUTO,
+) -> None:
+    """Look up a subtitle for every file that waits for one (sidecar, local, OpenSubtitles)."""
+    settings = _load_outside_library(config)
+    _require_state(settings)  # never creates an empty database
+    if limit is not None and limit < 1:
+        _fail(f"--limit must be at least 1, got {limit}")
+    try:
+        deadline = _runner.deadline_from(until, None, datetime.now())
+    except ValueError as exc:
+        _fail(str(exc))
+    _logging(settings, verbose, quiet, log_file)
+    tools = _tools()
+    with _open_reporter(settings, progress) as reporter, power.keep_awake():
+        try:
+            summary, held_back, plan_changed = _resolve_subtitles(
+                settings, tools, reporter, limit=limit, deadline=deadline, only=path
+            )
+        except (AlreadyRunning, StateError, ToolNotFound, sqlite3.Error) as exc:
+            _fail(str(exc))
+        except KeyboardInterrupt:
+            print_tagged(
+                Level.WARN, "subtitle lookup interrupted; what was stored stays", stderr=True
+            )
+            raise typer.Exit(code=EXIT_INTERRUPTED) from None
+    _print_subs_summary(summary, held_back, plan_changed)
+    if summary.stopped_reason == _job.INTERRUPTED:
+        raise typer.Exit(code=EXIT_INTERRUPTED)
+    if _job.is_failure(summary.stopped_reason):
+        raise typer.Exit(code=1)
+
+
+def _quota_line(quota: QuotaInfo | None, now: datetime) -> str:
+    if quota is None:
+        return "OpenSubtitles downloads left: unknown (no download has been counted yet)"
+    if now >= quota.reset_at:
+        return (
+            "OpenSubtitles downloads left: unknown (the stored allowance renewed at "
+            f"{format_utc(quota.reset_at)}; the next download shows the new one)"
+        )
+    return (
+        f"OpenSubtitles downloads left: {quota.remaining} (renews at {format_utc(quota.reset_at)})"
+    )
+
+
+@subs_app.command("status")
+def subs_status(config: ConfigOption = None) -> None:
+    """Show subtitle counts per status, the download allowance and the files waiting."""
+    settings = _load_outside_library(config)
+    if not settings.state_db.is_file():
+        _say(f"No state database at {settings.state_db} yet: run `survey` first.")
+        return
+    try:
+        with State.open(settings.state_db) as state:
+            counts = state.subtitle_counts()
+            quota = state.quota()
+            waiting = planning.build_plan(state).waiting_on_subtitles
+            held_back = _job.held_back_line(state)
+    except StateError as exc:
+        _fail(str(exc))
+    _say(f"Subtitle records: {sum(counts.values())}")
+    for st in SubtitleStatus:
+        _say(f"  {st.value:<12} {counts[st]}")
+    _say(_quota_line(quota, datetime.now(UTC)))
+    _say(f"Files waiting on subtitles: {waiting}")
+    if held_back:
+        _say(held_back)
+
+
+@subs_app.command("retry")
+def subs_retry(
+    path: Annotated[
+        Path,
+        typer.Option("--path", help="The file (or a part of a multi-part film) to look up again."),
+    ],
+    config: ConfigOption = None,
+) -> None:
+    """Make an unavailable or unclear subtitle wanted again, so `subs resolve` tries it afresh."""
+    settings = _load_outside_library(config)
+    _require_state(settings)
+    try:
+        with State.open(settings.state_db) as state:
+            changed, message = _job.retry_subtitle(state, path, settings.subtitle_cache_dir)
+    except StateError as exc:
+        _fail(str(exc))
+    if not changed:
+        print_tagged(Level.WARN, message)
+        raise typer.Exit(code=1)
+    _say(message)

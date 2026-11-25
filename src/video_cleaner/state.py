@@ -746,6 +746,16 @@ class State:
             ).fetchall()
         return [_subtitle_record(r) for r in rows]
 
+    def subtitles_with_status(self, status: SubtitleStatus) -> list[SubtitleRecord]:
+        """Every subtitle record with *status*, ordered by path (then size and mtime)."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT {_SUB_COLUMNS} FROM subtitles WHERE status = ? "  # noqa: S608  # nosec B608
+                "ORDER BY path, size, mtime",
+                (status.value,),
+            ).fetchall()
+        return [_subtitle_record(r) for r in rows]
+
     def subtitle_counts(self) -> dict[SubtitleStatus, int]:
         """Number of subtitle records per status, with every status present (zero when none)."""
         with self._tx() as conn:
@@ -778,6 +788,36 @@ class State:
             ).rowcount
             if changed:
                 self._event(conn, f"{key}: subtitle reset -> {SubtitleStatus.WANTED.value}")
+
+    def downgrade_stale_subtitle(self, path: Path, size: int, mtime: float, reason: str) -> bool:
+        """Turn a FOUND record whose cached file no longer verifies back into WANTED.
+
+        The caller has already found the cache file missing or changed; this does no file I/O.
+        Cache path, hash, provenance, provider and the exact-hash flag are cleared and *reason*
+        is stored; the tried ids and the attempt count stay, so the next search does not repeat
+        what was rejected. Any other status, or no row, is left alone (`set_subtitle` refuses
+        this transition on purpose and `reset_subtitle` only touches UNAVAILABLE and UNCLEAR).
+        Returns True when it changed a row.
+        """
+        key = _key(path)
+        with self._tx(write=True) as conn:
+            changed = conn.execute(
+                "UPDATE subtitles SET status = ?, provider = '', cache_path = NULL, sha256 = '', "
+                "provenance = '', hash_exact = 0, reason = ?, updated_at = ? "
+                "WHERE path = ? AND size = ? AND mtime = ? AND status = ?",
+                (
+                    SubtitleStatus.WANTED.value,
+                    reason,
+                    _now(),
+                    key,
+                    size,
+                    mtime,
+                    SubtitleStatus.FOUND.value,
+                ),
+            ).rowcount
+            if changed:
+                self._event(conn, f"{key}: subtitle found -> {SubtitleStatus.WANTED.value}")
+        return bool(changed)
 
     # -- subtitle download allowance --------------------------------------------------------
 

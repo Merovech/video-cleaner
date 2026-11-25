@@ -146,6 +146,51 @@ def test_index_keeps_english_and_untagged_files(tmp_path: Path, name: str) -> No
     assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == [name]
 
 
+HEARING_IMPAIRED_NAMES = [
+    "Movie.2010.en.hi.srt",
+    "Movie.2010.en.HI.srt",
+    "Movie.2010.eng.hi.srt",
+    "Movie.2010.English.HI.srt",
+    "Movie.2010.hi.en.srt",
+]
+
+
+@pytest.mark.parametrize("name", HEARING_IMPAIRED_NAMES)
+def test_index_keeps_a_hearing_impaired_english_file_at_the_plain_names_confidence(
+    tmp_path: Path, name: str
+) -> None:
+    write(tmp_path / "hi" / name)
+    write(tmp_path / "plain" / "Movie.2010.en.srt")
+    target = TitleYear("Movie", 2010)
+
+    hearing_impaired = match_local(index_local_folders([tmp_path / "hi"], max_bytes=MB), target)
+    baseline = match_local(index_local_folders([tmp_path / "plain"], max_bytes=MB), target)
+
+    assert hearing_impaired == LocalCandidate(tmp_path / "hi" / name, 1.0)
+    assert baseline is not None
+    assert hearing_impaired.confidence == baseline.confidence
+
+
+@pytest.mark.parametrize("name", ["Movie.2010.HI.srt", "Movie.2010.en.fr.srt"])
+def test_index_skips_a_bare_hi_file_and_an_english_plus_other_language_file(
+    tmp_path: Path, name: str
+) -> None:
+    write(tmp_path / name)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_a_title_with_the_word_hi_is_indexed_and_matched(tmp_path: Path) -> None:
+    write(tmp_path / "Hi.Mom.1970.en.srt")
+
+    index = index_local_folders([tmp_path], max_bytes=MB)
+
+    assert index[0].parsed.title == "Hi Mom"
+    assert match_local(index, TitleYear("Hi Mom", 1970)) == LocalCandidate(
+        tmp_path / "Hi.Mom.1970.en.srt", 1.0
+    )
+
+
 def test_a_french_sibling_does_not_make_the_english_file_ambiguous(tmp_path: Path) -> None:
     write(tmp_path / "Alien.1979.en.srt")
     write(tmp_path / "Alien.1979.fr.srt")
@@ -376,10 +421,10 @@ def test_a_windows_reparse_point_counts_as_a_link() -> None:
 
     symlink = types.SimpleNamespace(is_symlink=lambda: True)
 
-    assert local._is_link_like(cast("os.DirEntry[str]", symlink)) is True
-    assert local._is_link_like(cast("os.DirEntry[str]", reparse)) is True
-    assert local._is_link_like(cast("os.DirEntry[str]", plain)) is False
-    assert local._is_link_like(cast("os.DirEntry[str]", posix)) is False
+    assert local.is_link_like(cast("os.DirEntry[str]", symlink)) is True
+    assert local.is_link_like(cast("os.DirEntry[str]", reparse)) is True
+    assert local.is_link_like(cast("os.DirEntry[str]", plain)) is False
+    assert local.is_link_like(cast("os.DirEntry[str]", posix)) is False
 
 
 # ---------------------------------------------------------------- matching

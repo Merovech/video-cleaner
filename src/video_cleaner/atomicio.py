@@ -43,6 +43,21 @@ def write_text_atomic(
         raise
 
 
+def read_bytes_capped(path: Path, max_bytes: int) -> bytes | None:
+    """The bytes of *path* when it has at most *max_bytes* of them, else None.
+
+    At most ``max_bytes + 1`` bytes are ever read, so a file that is bigger than the caller
+    expected (or that grew after its size was checked) costs bounded memory. The caller treats
+    None as "too large". An empty file gives ``b""``. Raises `ValueError` when *max_bytes* is
+    below 1; `OSError` (a missing file, a permission problem, a directory) propagates.
+    """
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be at least 1")
+    with path.open("rb") as handle:
+        data = handle.read(max_bytes + 1)
+    return data if len(data) <= max_bytes else None
+
+
 # A spreadsheet treats a cell starting with one of these as a formula (CSV injection, CWE-1236).
 _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 _ESCAPE = "'"

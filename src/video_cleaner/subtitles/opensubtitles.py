@@ -28,7 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.client import HTTPMessage
@@ -108,6 +108,13 @@ class AuthError(Exception):
 
 class ProviderError(Exception):
     """The service failed, was unreachable or answered with something unusable."""
+
+
+class DownloadNotCounted(ProviderError):
+    """A download failed in a way that cannot have been counted against the allowance: the
+    request never reached the server (no connection, a failed login, every attempt refused
+    with 429). Any other `ProviderError` from `OpenSubtitlesClient.download` may have been
+    counted, so the id is not asked for again."""
 
 
 class QuotaExhausted(Exception):
@@ -518,6 +525,20 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+@contextlib.contextmanager
+def _before_the_request(counted: bool) -> Iterator[None]:
+    """For the steps that come before a request the server counts (a login): a `ProviderError`
+    from them is `DownloadNotCounted` when the request is *counted*, since it was not sent."""
+    try:
+        yield
+    except DownloadNotCounted:
+        raise
+    except ProviderError as exc:
+        if not counted:
+            raise
+        raise DownloadNotCounted(str(exc)) from None
+
+
 class OpenSubtitlesClient:
     """Search and download through the OpenSubtitles REST API.
 
@@ -586,7 +607,9 @@ class OpenSubtitlesClient:
     def download(self, result: SubtitleResult, *, max_bytes: int) -> bytes:
         """The subtitle file for *result*, at most *max_bytes* long.
 
-        Raises `QuotaExhausted` when the allowance is used up, `ProviderError` otherwise.
+        Raises `QuotaExhausted` when the allowance is used up, `DownloadNotCounted` when the
+        request provably never reached the server, `ProviderError` otherwise (the download may
+        have been counted).
         """
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
@@ -652,14 +675,16 @@ class OpenSubtitlesClient:
         payload: Mapping[str, object] | None,
         counted: bool,
     ) -> HttpResponse:
-        fresh = self._ensure_session()
+        with _before_the_request(counted):
+            fresh = self._ensure_session()
         resp = self._api_once(method, endpoint, label, query, payload, counted)
         if resp.status != 401:
             return resp
         self._forget_token()
         if fresh:
             raise AuthError("OpenSubtitles rejected a session token it had just issued")
-        self._login()
+        with _before_the_request(counted):  # the refused request was not counted
+            self._login()
         resp = self._api_once(method, endpoint, label, query, payload, counted)
         if resp.status == 401:
             raise AuthError("OpenSubtitles rejected the new session token")
@@ -802,9 +827,10 @@ class OpenSubtitlesClient:
                     )
                 if resp.status == 429 or resp.status >= 500:
                     if last:
-                        raise ProviderError(
-                            f"{label} failed: HTTP {resp.status} after {MAX_RETRIES} retries"
-                        )
+                        message = f"{label} failed: HTTP {resp.status} after {MAX_RETRIES} retries"
+                        if counted:  # only 429s and unsent requests got here: none was counted
+                            raise DownloadNotCounted(message)
+                        raise ProviderError(message)
                     self._sleep(self._retry_delay(resp, attempt))
                     continue
                 return resp
@@ -841,7 +867,10 @@ class OpenSubtitlesClient:
                     f"{label} failed: {what}; not retried, the server may have counted the download"
                 ) from None
         if last:
-            raise ProviderError(f"{label} failed: {what} after {MAX_RETRIES} retries")
+            message = f"{label} failed: {what} after {MAX_RETRIES} retries"
+            if counted:  # a counted request only gets here when it was never sent
+                raise DownloadNotCounted(message)
+            raise ProviderError(message)
         _log.debug("%s: %s, retrying", label, what)
         return None
 

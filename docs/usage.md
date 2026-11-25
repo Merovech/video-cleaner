@@ -197,7 +197,7 @@ and has the default shown.
 | `align_min_score` | `0.0` | Lowest alignment score accepted; `0` disables the check. Set after the review of the first results. |
 | `subtitle_max_bytes` | `2000000` | A downloaded subtitle larger than this is rejected. |
 | `subtitle_min_cues` | `20` | A subtitle with fewer cues is rejected. |
-| `subtitle_candidates_per_file` | `3` | How many candidate subtitles are tried per video. |
+| `subtitle_candidates_per_file` | `3` | How many OpenSubtitles downloads one video may use in total, across lookups (`subs retry` resets the count). |
 | `opensubtitles_domain` | `opensubtitles.com` | The service's domain. The credentials and every download go only to this domain and its subdomains; a login reply, a download link or a redirect that names another domain is refused. Change it only if the service moves, and only to a domain you trust: it is the trust boundary. Two or more DNS labels, no scheme, port or path. |
 | `opensubtitles_api_host` | `api.opensubtitles.com` | The API host used for the login. Must be `opensubtitles_domain` or a host under it, so changing the domain means changing this too. |
 | `opensubtitles_api_path` | `/api/v1` | Path prefix of the API on that host (no query, no `..`). |

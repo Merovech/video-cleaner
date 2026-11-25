@@ -987,6 +987,84 @@ def test_reset_subtitle_of_an_unknown_row_is_a_no_op(state: State) -> None:
     assert state.subtitle(SUB_PATH, SIZE, MTIME) is None
 
 
+def _found(**fields: Any) -> SubtitleRecord:
+    values: dict[str, Any] = {
+        "provider": "opensubtitles",
+        "cache_path": Path("/cache/a.srt"),
+        "sha256": "ab" * 32,
+        "provenance": "English (OpenSubtitles)",
+        "hash_exact": True,
+        "english_audio": True,
+        "tried_ids": (11, 12),
+        "attempts": 2,
+    }
+    values.update(fields)
+    return sub_rec(SubtitleStatus.FOUND, **values)
+
+
+def test_downgrade_stale_subtitle_makes_found_wanted_and_keeps_the_search_history(
+    state: State,
+) -> None:
+    state.set_subtitle(_found())
+    assert state.downgrade_stale_subtitle(SUB_PATH, SIZE, MTIME, "subtitle cache missing") is True
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == sub_rec(
+        SubtitleStatus.WANTED,
+        english_audio=True,
+        tried_ids=(11, 12),
+        attempts=2,
+        reason="subtitle cache missing",
+    )
+
+
+def test_downgrade_stale_subtitle_writes_an_event(state: State) -> None:
+    state.set_subtitle(_found())
+    state.downgrade_stale_subtitle(SUB_PATH, SIZE, MTIME, "gone")
+    assert any(
+        f"{SUB_PATH.as_posix()}: subtitle found -> wanted" in line for line in state.events(10)
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        SubtitleStatus.WANTED,
+        SubtitleStatus.NOT_NEEDED,
+        SubtitleStatus.UNAVAILABLE,
+        SubtitleStatus.UNCLEAR,
+    ],
+)
+def test_downgrade_stale_subtitle_leaves_other_statuses_alone(
+    state: State, status: SubtitleStatus
+) -> None:
+    rec = sub_rec(status, tried_ids=(5,), reason="kept", attempts=1)
+    state.set_subtitle(rec)
+    before = len(state.events(1000))
+    assert state.downgrade_stale_subtitle(SUB_PATH, SIZE, MTIME, "other") is False
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) == rec
+    assert len(state.events(1000)) == before
+
+
+def test_downgrade_stale_subtitle_of_an_unknown_row_changes_nothing(state: State) -> None:
+    assert state.downgrade_stale_subtitle(SUB_PATH, SIZE, MTIME, "x") is False
+    assert state.subtitle(SUB_PATH, SIZE, MTIME) is None
+
+
+def test_downgrade_stale_subtitle_only_touches_the_matching_size_and_mtime(state: State) -> None:
+    state.set_subtitle(_found())
+    assert state.downgrade_stale_subtitle(SUB_PATH, SIZE + 1, MTIME, "x") is False
+    assert state.downgrade_stale_subtitle(SUB_PATH, SIZE, MTIME + 1, "x") is False
+    found = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert found is not None and found.status is SubtitleStatus.FOUND
+
+
+def test_downgrade_stale_subtitle_lets_the_resolver_write_found_again(state: State) -> None:
+    state.set_subtitle(_found())
+    state.downgrade_stale_subtitle(SUB_PATH, SIZE, MTIME, "gone")
+    state.set_subtitle(_found(cache_path=Path("/cache/b.srt"), sha256="cd" * 32))
+    got = state.subtitle(SUB_PATH, SIZE, MTIME)
+    assert got is not None and got.cache_path == Path("/cache/b.srt")
+
+
 _CORRUPT_TRIED_IDS = [
     "not json",
     '{"a": 1}',

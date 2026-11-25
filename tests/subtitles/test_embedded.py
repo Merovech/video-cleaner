@@ -14,6 +14,7 @@ from media import RecordingReporter, make_clip
 from video_cleaner.probe import MediaInfo, SubtitleStream, probe
 from video_cleaner.subtitles import embedded
 from video_cleaner.subtitles.embedded import (
+    DENSITY_TIMEOUT_S,
     TEXT_SUBTITLE_CODECS,
     EmbeddedResult,
     EmbeddedVerdict,
@@ -22,7 +23,13 @@ from video_cleaner.subtitles.embedded import (
     is_english,
     measure_cue_density,
 )
-from video_cleaner.tools import ToolOutputError, ToolResult, Tools, locate_tools
+from video_cleaner.tools import (
+    ToolOutputError,
+    ToolResult,
+    Tools,
+    ToolTimedOut,
+    locate_tools,
+)
 
 THRESHOLD = 250.0
 TOOLS = Tools(ffmpeg=Path("ffmpeg"), ffprobe=Path("ffprobe"), mkvmerge=Path("mkvmerge"))
@@ -315,6 +322,30 @@ def test_broken_output_handling_gives_zero_density(monkeypatch: pytest.MonkeyPat
         TOOLS, Path("movie.mkv"), track(2, forced=True), HOUR_S, RecordingReporter()
     )
     assert density == 0.0
+
+
+def test_a_hung_extraction_times_out_and_gives_zero_density(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    patch_run_tool(monkeypatch, ToolTimedOut("extract", DENSITY_TIMEOUT_S))
+    with caplog.at_level("WARNING", logger="video_cleaner.subtitles.embedded"):
+        density = measure_cue_density(
+            TOOLS, Path("movie.mkv"), track(2, forced=True), HOUR_S, RecordingReporter()
+        )
+    assert density == 0.0
+    assert any("stopped after" in r.getMessage() for r in caplog.records)
+
+
+def test_the_extraction_is_given_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = patch_run_tool(monkeypatch, ok(srt(5)))
+    measure_cue_density(
+        TOOLS, Path("movie.mkv"), track(2, forced=True), HOUR_S, RecordingReporter()
+    )
+    assert fake.calls[0][1]["timeout_s"] == DENSITY_TIMEOUT_S == 600.0
+    measure_cue_density(
+        TOOLS, Path("movie.mkv"), track(2, forced=True), HOUR_S, RecordingReporter(), timeout_s=5.0
+    )
+    assert fake.calls[1][1]["timeout_s"] == 5.0
 
 
 def test_unusable_duration_gives_zero_density(monkeypatch: pytest.MonkeyPatch) -> None:

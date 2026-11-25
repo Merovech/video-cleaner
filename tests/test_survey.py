@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -20,6 +21,7 @@ from video_cleaner.cli import app
 from video_cleaner.config import Settings
 from video_cleaner.consolefmt import Level
 from video_cleaner.decide import Action
+from video_cleaner.instancelock import instance_lock, lock_path_for, subs_lock_path_for
 from video_cleaner.multipart import PartGroup
 from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
 from video_cleaner.progress import Progress
@@ -139,7 +141,7 @@ def _run(
     hash_fn: Callable[[Path], str | None] | None = None,
 ) -> tuple[SurveyResult, State]:
     state = State.open(settings.state_db)
-    extra = {} if hash_fn is None else {"hash_fn": hash_fn}
+    extra: dict[str, Any] = {} if hash_fn is None else {"hash_fn": hash_fn}
     result = run_survey(
         settings,
         FAKE_TOOLS,
@@ -828,9 +830,52 @@ def test_cli_survey_ctrl_c_exits_130(tmp_path: Path, monkeypatch: pytest.MonkeyP
     code, output = _cli_with_failing_survey(tmp_path, monkeypatch, KeyboardInterrupt())
     assert code == 130
     assert "interrupted" in output
-    assert "stay recorded" not in output  # nothing is recorded while files are being probed
-    assert "nothing from this survey was recorded" in " ".join(output.split())
+    text = " ".join(output.split())
+    # Records are written while the survey runs, so the old "nothing was recorded" is wrong.
+    assert "nothing from this survey was recorded" not in text
+    assert "files already surveyed are recorded" not in text  # probing records nothing
+    assert "probing changes no records until the recording step" in text
+    assert "running the survey again is always safe" in text
     assert "Traceback" not in output
+
+
+def test_cli_survey_is_refused_while_a_subs_resolve_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lib = tmp_path / "library"
+    lib.mkdir()
+    cfg = _write_config(tmp_path, lib)
+    monkeypatch.setattr("video_cleaner.cli.locate_tools", lambda: FAKE_TOOLS)
+    called: list[int] = []
+    real = survey_module.run_survey
+
+    def counting(*args: Any, **kwargs: Any) -> SurveyResult:
+        called.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("video_cleaner.survey.run_survey", counting)
+    with instance_lock(subs_lock_path_for(tmp_path / "appdata" / "state.db")):
+        result = CliRunner().invoke(app, ["survey", "--config", str(cfg), "-q"])
+    assert result.exit_code == 2
+    assert "another `subs resolve` is running" in " ".join(result.output.split())
+    assert called == []
+    assert not (tmp_path / "appdata" / "survey.csv").exists()
+    # Released with the holder: the survey runs.
+    again = CliRunner().invoke(app, ["survey", "--config", str(cfg), "-q"])
+    assert again.exit_code == 0, again.output
+    assert called == [1]
+
+
+def test_cli_survey_is_not_blocked_by_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lib = tmp_path / "library"
+    lib.mkdir()
+    cfg = _write_config(tmp_path, lib)
+    monkeypatch.setattr("video_cleaner.cli.locate_tools", lambda: FAKE_TOOLS)
+    with instance_lock(lock_path_for(tmp_path / "appdata" / "state.db")):
+        result = CliRunner().invoke(app, ["survey", "--config", str(cfg), "-q"])
+    assert result.exit_code == 0, result.output
 
 
 def test_cli_survey_csv_error_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

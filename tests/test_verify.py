@@ -19,6 +19,7 @@ from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.consolefmt import Level
 from video_cleaner.encode import encode_full
+from video_cleaner.mux import SubtitleInput
 from video_cleaner.probe import (
     AudioStream,
     MediaInfo,
@@ -204,6 +205,128 @@ def test_verify_rejects_missing_streams(changes: dict[str, Any], words: str) -> 
     assert words in result.reason
 
 
+NEW_TITLE = "English (OpenSubtitles)"
+
+
+def _with_new_subtitle(out: MediaInfo, **changes: Any) -> MediaInfo:
+    """*out* with one more subtitle stream (the added track) after its existing ones."""
+    values: dict[str, Any] = {
+        "index": 99,
+        "codec": "subrip",
+        "language": "eng",
+        "forced": False,
+        "sdh": False,
+        "is_image": False,
+        "default": False,
+        "title": NEW_TITLE,
+    }
+    values.update(changes)
+    return dataclasses.replace(out, subtitles=(*out.subtitles, SubtitleStream(**values)))
+
+
+def test_verify_accepts_one_new_subtitle() -> None:
+    out = _with_new_subtitle(_good_output())
+    assert len(out.subtitles) == 2
+    result = _verify(out, expected_new_subtitles=1, expected_subtitle_title=NEW_TITLE)
+    assert result == VerifyResult(ok=True, reason="")
+
+
+def test_verify_accepts_one_new_subtitle_on_a_remux() -> None:
+    out = _with_new_subtitle(_info(OUTPUT, size=4 * GIB))
+    assert _verify(out, encoded=False, expected_new_subtitles=1).ok
+
+
+def test_verify_rejects_the_missing_new_subtitle_naming_the_streams() -> None:
+    result = _verify(_good_output(), expected_new_subtitles=1)
+    assert not result.ok
+    assert (
+        "subtitle streams: 1 in the output, 2 expected (1 in the original + 1 new)" in result.reason
+    )
+
+
+def test_verify_without_expected_new_subtitles_rejects_an_extra_one() -> None:
+    result = _verify(_with_new_subtitle(_good_output()))
+    assert not result.ok and "subtitle streams: 2 in the output, 1 in the original" in result.reason
+
+
+def test_verify_rejects_two_new_subtitles_when_one_was_expected() -> None:
+    out = _with_new_subtitle(_with_new_subtitle(_good_output()))
+    result = _verify(out, expected_new_subtitles=1)
+    assert not result.ok and "subtitle streams: 3 in the output" in result.reason
+
+
+@pytest.mark.parametrize(
+    ("changes", "words"),
+    [
+        ({"language": "fre"}, "language fre, expected eng"),
+        ({"language": "und"}, "language und, expected eng"),
+        ({"default": True}, "default"),
+        ({"forced": True}, "forced"),
+    ],
+)
+def test_verify_rejects_a_new_track_with_the_wrong_language_or_flags(
+    changes: dict[str, Any], words: str
+) -> None:
+    out = _with_new_subtitle(_good_output(), **changes)
+    result = _verify(out, expected_new_subtitles=1, expected_subtitle_title=NEW_TITLE)
+    assert not result.ok
+    assert "new subtitle stream" in result.reason and words in result.reason
+
+
+@pytest.mark.parametrize("title", ["", "Some other title"])
+def test_verify_rejects_a_new_track_with_a_missing_or_wrong_title(title: str) -> None:
+    out = _with_new_subtitle(_good_output(), title=title)
+    result = _verify(out, expected_new_subtitles=1, expected_subtitle_title=NEW_TITLE)
+    assert not result.ok
+    assert f"title {title!r}, expected {NEW_TITLE!r}" in result.reason
+
+
+def test_verify_skips_the_title_check_when_the_probe_does_not_report_titles() -> None:
+    out = _with_new_subtitle(_good_output(), title=None)
+    assert _verify(out, expected_new_subtitles=1, expected_subtitle_title=NEW_TITLE).ok
+
+
+def test_verify_checks_the_last_subtitle_stream_as_the_new_one() -> None:
+    # an original eng track with default=True first is fine; only the last one is "new"
+    first = SubtitleStream(
+        index=5,
+        codec="subrip",
+        language="fre",
+        forced=True,
+        sdh=False,
+        is_image=False,
+        default=True,
+    )
+    out = _good_output()
+    out = dataclasses.replace(out, subtitles=(first,))
+    original = dataclasses.replace(ORIGINAL, subtitles=(first,))
+    out = _with_new_subtitle(out)
+    result = verify_output(
+        TOOLS,
+        original,
+        OUTPUT,
+        REPORTER,
+        encoded=True,
+        min_saving=0.10,
+        probe_fn=_probe_returning(out),
+        decode_fn=_clean_decode,
+        expected_new_subtitles=1,
+        expected_subtitle_title=NEW_TITLE,
+    )
+    assert result.ok, result.reason
+
+
+@pytest.mark.parametrize("bad", [-1, 2, 5])
+def test_verify_refuses_other_expected_counts(bad: int) -> None:
+    with pytest.raises(ValueError, match="expected_new_subtitles"):
+        _verify(_good_output(), expected_new_subtitles=bad)
+
+
+def test_verify_a_subtitle_problem_is_not_a_too_large_result() -> None:
+    result = _verify(_good_output(size=3 * GIB), expected_new_subtitles=1)
+    assert not result.ok and not result.too_large
+
+
 def test_verify_no_chapters_needed_when_original_had_none() -> None:
     original = dataclasses.replace(ORIGINAL, chapters=0)
     result = verify_output(
@@ -387,3 +510,36 @@ def test_real_encode_probes_as_10_bit_hevc_and_verifies(tmp_path: Path) -> None:
     assert out.cover_art == info.cover_art
     result = verify_output(tools, info, output, REPORTER, encoded=True, min_saving=0.1)
     assert result.ok, result.reason
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("title", ["English (OpenSubtitles)", '-He said "hi" & left'])
+def test_real_mux_with_a_subtitle_adds_one_english_track_that_verifies(
+    tmp_path: Path, title: str
+) -> None:
+    tools = locate_tools()
+    clip = make_clip(tools, tmp_path / "Rich [x] (2024).mkv", duration_s=3.0, rich=True)
+    srt = tmp_path / "staged.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello there.\n", encoding="utf-8")
+    out = tmp_path / "out.mkv"
+    runner_module.mux(tools, [clip], None, out, REPORTER, SubtitleInput(path=srt, title=title))
+
+    info = probe(clip, tools, REPORTER)
+    added = probe(out, tools, REPORTER)
+    assert len(added.subtitles) == len(info.subtitles) + 1
+    last = added.subtitles[-1]
+    assert (last.language, last.default, last.forced, last.title) == ("eng", False, False, title)
+    assert added.chapters == info.chapters and added.cover_art == info.cover_art
+    verdict = verify_output(
+        tools,
+        info,
+        out,
+        REPORTER,
+        encoded=False,
+        min_saving=0.1,
+        expected_new_subtitles=1,
+        expected_subtitle_title=title,
+    )
+    assert verdict.ok, verdict.reason
+    # without being told about the new track, verify rejects the output
+    assert not verify_output(tools, info, out, REPORTER, encoded=False, min_saving=0.1).ok

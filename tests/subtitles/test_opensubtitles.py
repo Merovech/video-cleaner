@@ -26,6 +26,7 @@ from video_cleaner.subtitles.opensubtitles import (
     ApiEndpoint,
     AuthError,
     ConnectTimeout,
+    DownloadNotCounted,
     HttpResponse,
     OpenSubtitlesClient,
     ProviderError,
@@ -1284,6 +1285,89 @@ def test_the_download_link_is_still_retried_after_a_lost_reply() -> None:
     assert h.client.download(a_result(), max_bytes=100) == b"data"
     assert h.transport.paths().count("/api/v1/download") == 1
     assert h.sleeps == [1.0, 2.0, 4.0]
+
+
+# --- which download failures are known not to have been counted -------------------------------
+
+
+def test_download_not_counted_is_a_provider_error() -> None:
+    assert issubclass(DownloadNotCounted, ProviderError)
+
+
+@pytest.mark.parametrize(
+    "error", [RequestNotSent("connect failed"), ConnectTimeout("connect timed out")]
+)
+def test_a_download_that_never_left_is_not_counted(error: TransportError) -> None:
+    h = Harness(fx("login_ok.json"), *[error for _ in range(MAX_RETRIES + 1)])
+    with pytest.raises(DownloadNotCounted):
+        h.client.download(a_result(), max_bytes=100)
+
+
+def test_a_download_refused_with_429_every_time_is_not_counted() -> None:
+    h = Harness(
+        fx("login_ok.json"),
+        *[reply(429, b"", {"Retry-After": "1"}) for _ in range(MAX_RETRIES + 1)],
+    )
+    with pytest.raises(DownloadNotCounted, match="429"):
+        h.client.download(a_result(), max_bytes=100)
+    assert h.transport.paths().count("/api/v1/download") == MAX_RETRIES + 1
+
+
+def test_a_download_whose_login_failed_is_not_counted() -> None:
+    h = Harness(*[reply(503) for _ in range(MAX_RETRIES + 1)])
+    with pytest.raises(DownloadNotCounted):
+        h.client.download(a_result(), max_bytes=100)
+    assert h.transport.paths().count("/api/v1/download") == 0
+
+
+def test_a_download_whose_second_login_failed_is_not_counted() -> None:
+    # The cached token is refused (401: nothing counted), and logging in again fails.
+    h = Harness(
+        fx("error_401.json", 401),
+        *[reply(503) for _ in range(MAX_RETRIES + 1)],
+        token=SESSION_TOKEN,
+    )
+    with pytest.raises(DownloadNotCounted):
+        h.client.download(a_result(), max_bytes=100)
+    assert h.transport.paths().count("/api/v1/download") == 1
+
+
+@pytest.mark.parametrize("error", [TransportTimeout("read timed out"), TransportError("reset")])
+def test_a_download_that_may_have_arrived_is_blamed(error: TransportError) -> None:
+    h = Harness(fx("login_ok.json"), error)
+    with pytest.raises(ProviderError) as caught:
+        h.client.download(a_result(), max_bytes=100)
+    assert not isinstance(caught.value, DownloadNotCounted)
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_a_download_answered_with_5xx_is_blamed(status: int) -> None:
+    h = Harness(fx("login_ok.json"), reply(status))
+    with pytest.raises(ProviderError) as caught:
+        h.client.download(a_result(), max_bytes=100)
+    assert not isinstance(caught.value, DownloadNotCounted)
+
+
+def test_a_failure_after_the_counted_request_is_blamed() -> None:
+    link_down = Harness(
+        fx("login_ok.json"), fx("download_ok.json"), *[reply(503) for _ in range(MAX_RETRIES + 1)]
+    )
+    empty = Harness(fx("login_ok.json"), fx("download_ok.json"), reply(200, b""))
+    odd = Harness(fx("login_ok.json"), reply(200, {"link": "https://evil.example.com/x"}))
+    for h in (link_down, empty, odd):
+        with pytest.raises(ProviderError) as caught:
+            h.client.download(a_result(), max_bytes=100)
+        assert not isinstance(caught.value, DownloadNotCounted)
+
+
+def test_a_search_that_is_refused_with_429_is_a_plain_provider_error() -> None:
+    h = Harness(
+        fx("login_ok.json"),
+        *[reply(429, b"", {"Retry-After": "1"}) for _ in range(MAX_RETRIES + 1)],
+    )
+    with pytest.raises(ProviderError) as caught:
+        h.client.search(moviehash=HASH, title=None, year=None)
+    assert not isinstance(caught.value, DownloadNotCounted)
 
 
 # --- a redirect that cannot be followed is final ----------------------------------------------

@@ -22,7 +22,7 @@ from video_cleaner.planning import (
     read_plan_hash,
     write_plan_report,
 )
-from video_cleaner.state import State, Status
+from video_cleaner.state import State, Status, SubtitleRecord, SubtitleStatus
 
 LIB = Path("/lib")
 ENC = LIB / "Heat (1995).avi"
@@ -204,6 +204,126 @@ def test_read_plan_hash_missing_or_blank(tmp_path: Path) -> None:
     assert read_plan_hash(tmp_path / "plan.hash") is None
 
 
+# --- subtitles -----------------------------------------------------------------------------
+
+MTIME = 1_700_000_000.0
+
+
+def _sub(state: State, path: Path, status: SubtitleStatus, *, size: int = 1000, **kw: Any) -> None:
+    state.set_subtitle(SubtitleRecord(path, size, MTIME, status, **kw))
+
+
+def test_plan_rows_carry_the_subtitle_status(state: State, tmp_path: Path) -> None:
+    _populate(state)
+    state.ensure_wanted(FLAG, 5000, MTIME, english_audio=True)
+    _sub(state, LEFT, SubtitleStatus.NOT_NEEDED, size=3000, provider="embedded")
+    report = build_plan(state)
+    assert {r.path: r.subtitle for r in report.rows} == {
+        ENC: "",
+        LEFT: "not_needed",
+        FLAG: "wanted",
+        REMUX: "",
+        PT1: "",
+    }
+    out = tmp_path / "plan.csv"
+    write_plan_report(report, out)
+    by_path = {r["path"]: r for r in _read_csv(out)}
+    assert by_path[str(FLAG)]["subtitle"] == "wanted"
+    assert by_path[str(LEFT)]["subtitle"] == "not_needed"
+    assert by_path[str(ENC)]["subtitle"] == ""
+
+
+def test_plan_counts_files_waiting_on_subtitle_lookups(state: State) -> None:
+    _populate(state)
+    assert build_plan(state).waiting_on_subtitles == 0
+    assert not any("subtitle lookups" in n for n in build_plan(state).notes)
+    state.ensure_wanted(FLAG, 5000, MTIME, english_audio=False)
+    state.ensure_wanted(ENC, 4000, MTIME, english_audio=True)
+    _sub(state, LEFT, SubtitleStatus.UNAVAILABLE, size=3000)
+    # A WANTED row of a file that changed since (no live record for its size) is not counted.
+    state.ensure_wanted(REMUX, 1234, MTIME, english_audio=True)
+    report = build_plan(state)
+    assert report.waiting_on_subtitles == 2
+    assert "2 files waiting on subtitle lookups" in report.notes
+
+
+def test_plan_notes_a_single_file_waiting_on_subtitle_lookups(state: State) -> None:
+    _populate(state)
+    state.ensure_wanted(FLAG, 5000, MTIME, english_audio=False)
+    assert "1 file waiting on subtitle lookups" in build_plan(state).notes
+
+
+def test_plan_hash_changes_when_a_subtitle_turns_found(state: State) -> None:
+    _populate(state)
+    state.ensure_wanted(FLAG, 5000, MTIME, english_audio=True)
+    wanted = plan_hash(build_plan(state))
+    assert plan_hash(build_plan(state)) == wanted  # stable across identical builds
+    _sub(
+        state, FLAG, SubtitleStatus.FOUND, size=5000, cache_path=Path("/c/a.srt"), sha256="aa" * 32
+    )
+    found = plan_hash(build_plan(state))
+    assert found != wanted
+    # Another subtitle file under the same status is another plan to acknowledge.
+    _sub(
+        state, FLAG, SubtitleStatus.FOUND, size=5000, cache_path=Path("/c/b.srt"), sha256="bb" * 32
+    )
+    assert plan_hash(build_plan(state)) not in {wanted, found}
+
+
+def test_plan_hash_ignores_a_rewrite_that_changes_nothing_the_user_reviews(state: State) -> None:
+    _populate(state)
+    _sub(
+        state,
+        FLAG,
+        SubtitleStatus.FOUND,
+        size=5000,
+        provider="opensubtitles",
+        cache_path=Path("/c/a.srt"),
+        sha256="aa" * 32,
+        reason="first",
+        attempts=1,
+    )
+    before = plan_hash(build_plan(state))
+    _sub(
+        state,
+        FLAG,
+        SubtitleStatus.FOUND,
+        size=5000,
+        provider="opensubtitles",
+        cache_path=Path("/c/a.srt"),
+        sha256="aa" * 32,
+        reason="second",
+        attempts=2,
+        tried_ids=(5,),
+    )
+    assert plan_hash(build_plan(state)) == before
+
+
+def test_plan_hash_does_not_depend_on_the_order_subtitles_were_written(tmp_path: Path) -> None:
+    hashes: list[str] = []
+    for order in ((ENC, FLAG), (FLAG, ENC)):
+        with State.open(tmp_path / f"{len(hashes)}.db") as st:
+            _populate(st)
+            sizes = {ENC: 4000, FLAG: 5000}
+            for path in order:
+                st.ensure_wanted(path, sizes[path], MTIME, english_audio=True)
+            hashes.append(plan_hash(build_plan(st)))
+    assert hashes[0] == hashes[1]
+
+
+def test_plan_hash_of_a_state_without_subtitle_rows_is_unchanged_by_them(
+    state: State, tmp_path: Path
+) -> None:
+    """With no subtitle row the subtitle part of a file's hash input is empty (a no-op)."""
+    _populate(state)
+    plain = plan_hash(build_plan(state))
+    state.ensure_wanted(ENC, 4000, MTIME, english_audio=False)
+    assert plan_hash(build_plan(state)) != plain  # a subtitle row is part of the plan
+    with State.open(tmp_path / "other.db") as other:
+        _populate(other)
+        assert plan_hash(build_plan(other)) == plain
+
+
 # --- CLI -----------------------------------------------------------------------------------
 
 
@@ -242,6 +362,7 @@ def test_ack_requires_matching_hash(tmp_path: Path) -> None:
     result = _invoke("plan", "--ack", "--config", str(cfg), "-q")
     assert result.exit_code == 2
     assert "run `plan` first and review it" in result.output
+    assert "a subtitle was found or went stale" in " ".join(result.output.split())
     with _cli_state(tmp_path) as st:
         assert st.plan_acknowledged() == digest  # unchanged
 

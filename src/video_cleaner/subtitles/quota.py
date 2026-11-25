@@ -34,3 +34,10 @@ def quota_usable(q: QuotaInfo | None, now: datetime) -> bool:
     if q is None:
         return True
     return moment >= q.reset_at or q.remaining > 0
+
+
+def format_utc(moment: datetime) -> str:
+    """*moment* as ``YYYY-MM-DD HH:MM UTC``, converted to UTC first (a naive time is taken to be
+    UTC already), so the zone named is always the one the time is in."""
+    utc = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    return f"{utc:%Y-%m-%d %H:%M} UTC"

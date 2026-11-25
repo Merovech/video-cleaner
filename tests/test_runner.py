@@ -8,6 +8,7 @@ copies small dummy sources and no ffmpeg, ffprobe or mkvmerge process is started
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import re
 import sqlite3
@@ -31,14 +32,16 @@ from video_cleaner import probe as probe_module
 from video_cleaner import quality as quality_module
 from video_cleaner import runner as runner_module
 from video_cleaner import scratch as scratch_module
+from video_cleaner import survey as survey_module
 from video_cleaner import verify as verify_module
 from video_cleaner.config import Settings
 from video_cleaner.consolefmt import Level
 from video_cleaner.encode import CrfSearchResult, EncodeError
 from video_cleaner.instancelock import AlreadyRunning, instance_lock, lock_path_for
 from video_cleaner.manifest import ManifestEntry, ManifestError, read_manifest, write_manifest
+from video_cleaner.mux import SubtitleInput
 from video_cleaner.planning import build_plan, plan_hash
-from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, VideoStream
+from video_cleaner.probe import AudioStream, MediaInfo, ProbeError, SubtitleStream, VideoStream
 from video_cleaner.progress import Progress, Reporter
 from video_cleaner.quality import VmafError
 from video_cleaner.runner import (
@@ -51,7 +54,7 @@ from video_cleaner.runner import (
     run_queue,
 )
 from video_cleaner.scratch import CopyResult, ScratchFull, SourceChanged, copy_with_progress
-from video_cleaner.state import FileRecord, State, Status
+from video_cleaner.state import FileRecord, State, Status, SubtitleRecord, SubtitleStatus
 from video_cleaner.tools import (
     ToolFailed,
     ToolNotFound,
@@ -107,6 +110,7 @@ def _settings(tmp_path: Path, **changes: Any) -> Settings:
         "completed_dir": tmp_path / "completed",
         "state_db": tmp_path / "appdata" / "state.db",
         "log_dir": tmp_path / "appdata" / "logs",
+        "subtitle_cache_dir": tmp_path / "appdata" / "subtitles",
     }
     values.update(changes)
     settings = Settings(**values)
@@ -241,6 +245,12 @@ class Fakes:
         self.encode_advances = timedelta(0)
         self.after_copy: Callable[[Path], None] | None = None
         self.codec = "h264"
+        self.transfer = "bt709"  # "smpte2084" makes every probed file HDR
+        # output path -> title of the subtitle muxed into it (what its probe then shows)
+        self.subtitled: dict[str, str] = {}
+        # the subtitle path and bytes each mux call was given, read at the time of the call
+        self.staged: list[tuple[Path, bytes]] = []
+        self.drop_subtitle = False  # a broken mux: accepts the subtitle, writes none
 
     def _check(self, stage: str, path: Path) -> None:
         rule = self.fail.get(stage)
@@ -262,7 +272,25 @@ class Fakes:
         self._check("probe", path)
         st = path.stat()
         duration = self.durations.get(str(path), 100.0)
-        return _info(path, st.st_size, st.st_mtime, duration, self.codec)
+        info = _info(path, st.st_size, st.st_mtime, duration, self.codec)
+        if self.transfer != "bt709" and info.video is not None:
+            info = dataclasses.replace(
+                info, video=dataclasses.replace(info.video, transfer=self.transfer)
+            )
+        title = self.subtitled.get(str(path))
+        if title is None:
+            return info
+        added = SubtitleStream(
+            index=9,
+            codec="subrip",
+            language="eng",
+            forced=False,
+            sdh=False,
+            is_image=False,
+            default=False,
+            title=title,
+        )
+        return dataclasses.replace(info, subtitles=(*info.subtitles, added))
 
     def search_crf(
         self, info: MediaInfo, tools: Tools, settings: Settings, workdir: Path, rep: Reporter
@@ -301,12 +329,19 @@ class Fakes:
         new_video: Path | None,
         output: Path,
         reporter: Reporter,
+        subtitle: SubtitleInput | None = None,
     ) -> None:
-        self.calls.append(("mux", list(sources), new_video, output))
+        self.calls.append(("mux", list(sources), new_video, output, subtitle))
         self._check("mux", output)
         size = sum(p.stat().st_size for p in sources)
         if new_video is not None:
             size = int(size * self.ratio)
+        if subtitle is not None:
+            data = subtitle.path.read_bytes()
+            self.staged.append((subtitle.path, data))
+            size += len(data)
+            if not self.drop_subtitle:
+                self.subtitled[str(output)] = subtitle.title
         output.write_bytes(b"m" * size)
         self.durations[str(output)] = self.durations.get(str(sources[0]), 100.0)
 
@@ -379,6 +414,7 @@ def _run(
     clock: Clock | None = None,
     current_log: Path | None = None,
     ack: bool = True,
+    include_unresolved: bool = False,
 ) -> RunSummary:
     """run_queue with the fakes; acknowledges the current plan first unless *ack* is False."""
     if ack:
@@ -393,6 +429,7 @@ def _run(
         now=clock if clock is not None else Clock(),
         pipeline=fakes.pipeline(),
         current_log=current_log,
+        include_unresolved=include_unresolved,
     )
 
 
@@ -1900,6 +1937,56 @@ def test_run_refused_when_plan_changed_since_ack(
     _plan(state, src)
     events = len(state.events(10_000))
     fakes = Fakes()
+    with pytest.raises(
+        PlanNotAcknowledged, match="plan changed since it was acknowledged"
+    ) as raised:
+        run_queue(
+            settings,
+            TOOLS,
+            state,
+            RecordingReporter(),
+            deadline=None,
+            now=Clock(),
+            pipeline=fakes.pipeline(),
+        )
+    message = str(raised.value)
+    assert "a subtitle was found or went stale" in message
+    assert "run `plan`, review it, then `plan --ack`" in message
+    assert fakes.calls == []
+    assert len(state.events(10_000)) == events
+    assert not settings.scratch_dir.exists()
+    assert not settings.completed_dir.exists()
+
+
+def test_a_change_between_the_plan_check_and_the_snapshot_is_refused(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `subs resolve` that finishes a file after the early plan check, before the run takes
+    its snapshot, must not smuggle an unacknowledged plan into the run."""
+    a = _source(settings, "a.avi")
+    b = _source(settings, "b.avi")
+    _plan(state, a, est=900)
+    rec_b = _plan(state, b, est=100)
+    _want_subtitle(state, rec_b)
+    _ack(state)
+    real = runner_module.refuse_outputs_in_library
+    fired: list[int] = []
+
+    def with_a_resolve_in_between(checked: Settings) -> None:
+        real(checked)  # the early plan check has passed by now
+        fired.append(1)
+        state.set_subtitle(
+            SubtitleRecord(
+                path=rec_b.path,
+                size=rec_b.size,
+                mtime=rec_b.mtime,
+                status=SubtitleStatus.UNAVAILABLE,
+                reason="none found",
+            )
+        )
+
+    monkeypatch.setattr(runner_module, "refuse_outputs_in_library", with_a_resolve_in_between)
+    fakes = Fakes()
     with pytest.raises(PlanNotAcknowledged, match="plan changed since it was acknowledged"):
         run_queue(
             settings,
@@ -1910,10 +1997,24 @@ def test_run_refused_when_plan_changed_since_ack(
             now=Clock(),
             pipeline=fakes.pipeline(),
         )
-    assert fakes.calls == []
-    assert len(state.events(10_000)) == events
-    assert not settings.scratch_dir.exists()
+    assert fired and fakes.calls == []
     assert not settings.completed_dir.exists()
+    assert _status(state, a).status is Status.PENDING
+
+
+def test_a_run_is_not_blocked_by_a_subs_resolve(settings: Settings, state: State) -> None:
+    from video_cleaner.instancelock import instance_lock, subs_lock_path_for
+
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    with instance_lock(subs_lock_path_for(settings.state_db)):
+        assert _run(settings, state, Fakes()).completed == 1
+
+
+def test_an_unchanged_plan_passes_the_second_check(settings: Settings, state: State) -> None:
+    a = _source(settings, "a.avi")
+    _plan(state, a)
+    assert _run(settings, state, Fakes()).completed == 1
 
 
 def test_stale_found_by_a_run_needs_a_new_ack(settings: Settings, state: State) -> None:
@@ -2391,6 +2492,838 @@ def test_cli_run_without_state_database_exits_2_and_creates_nothing(
     assert result.exit_code == 2
     assert "survey" in result.output
     assert not (tmp_path / "appdata").exists()
+
+
+# --- subtitles: deferral, verification, staging, mux, verify and delivery --------------------
+
+SRT_BYTES = b"1\n00:00:01,000 --> 00:00:02,000\nHello there.\n"
+SUB_TITLE = "English (OpenSubtitles)"
+STALE_NOTE = "subtitle cache missing or changed"
+
+
+def _want_subtitle(state: State, rec: FileRecord) -> None:
+    state.ensure_wanted(rec.path, rec.size, rec.mtime, english_audio=True)
+
+
+def _found_subtitle(
+    settings: Settings,
+    state: State,
+    rec: FileRecord,
+    *,
+    data: bytes = SRT_BYTES,
+    title: str = SUB_TITLE,
+    name: str = "0123456789abcdef-opensubtitles-1.srt",
+) -> Path:
+    """Cache *data* as the resolver does, record the file as FOUND; returns the cache file."""
+    settings.subtitle_cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = settings.subtitle_cache_dir / name
+    cache.write_bytes(data)
+    state.set_subtitle(
+        SubtitleRecord(
+            path=rec.path,
+            size=rec.size,
+            mtime=rec.mtime,
+            status=SubtitleStatus.FOUND,
+            provider="opensubtitles",
+            cache_path=cache,
+            sha256=hashlib.sha256(data).hexdigest(),
+            provenance=title,
+            hash_exact=True,
+            english_audio=True,
+            tried_ids=(7,),
+            attempts=1,
+        )
+    )
+    return cache
+
+
+def _subtitle_of(state: State, rec: FileRecord) -> SubtitleRecord:
+    sub = state.subtitle(rec.path, rec.size, rec.mtime)
+    assert sub is not None
+    return sub
+
+
+def _is_under_scratch(settings: Settings, path: Path) -> bool:
+    return paths_module.is_under(path, settings.scratch_dir)
+
+
+def test_a_file_still_waiting_for_its_subtitle_is_deferred_and_counted(
+    settings: Settings, state: State
+) -> None:
+    waiting = _source(settings, "wait.avi")
+    other = _source(settings, "other.avi")
+    _want_subtitle(state, _plan(state, waiting, est=900))
+    _plan(state, other, est=100)
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1
+    assert summary.waiting_on_subtitles == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [other]
+    record = _status(state, waiting)
+    assert record.status is Status.PENDING and record.note == ""
+    assert not (settings.completed_dir / "wait.mkv").exists()
+
+
+def test_a_deferred_retry_file_is_counted_too(settings: Settings, state: State) -> None:
+    src = _source(settings, "wait.avi")
+    _want_subtitle(state, _plan(state, src))
+    state.set_status(src, Status.RETRY, "scratch full")
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert fakes.calls == [] and summary.waiting_on_subtitles == 1 and summary.completed == 0
+
+
+def test_deferred_files_outside_the_path_scope_are_not_counted(
+    settings: Settings, state: State
+) -> None:
+    inside = _source(settings, "Films/in.avi")
+    outside = _source(settings, "Shows/out.avi")
+    _want_subtitle(state, _plan(state, inside))
+    _want_subtitle(state, _plan(state, outside))
+    summary = _run(settings, state, Fakes(), only=settings.library_root / "Films")
+    assert summary.waiting_on_subtitles == 1
+
+
+def test_include_unresolved_runs_a_waiting_file_without_a_subtitle(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "wait.avi")
+    _want_subtitle(state, _plan(state, src))
+    fakes = Fakes()
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert summary.completed == 1 and summary.waiting_on_subtitles == 0
+    (mux,) = [c for c in fakes.calls if c[0] == "mux"]
+    assert mux[4] is None
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert entry.subtitle == ""
+    (verify,) = [c for c in fakes.calls if c[0] == "verify"]
+    assert "expected_new_subtitles" not in verify[3]
+    assert _subtitle_of(state, _status(state, src)).status is SubtitleStatus.WANTED
+
+
+@pytest.mark.parametrize(
+    "status", [SubtitleStatus.UNAVAILABLE, SubtitleStatus.NOT_NEEDED, SubtitleStatus.UNCLEAR]
+)
+def test_other_subtitle_outcomes_do_not_defer_a_file(
+    settings: Settings, state: State, status: SubtitleStatus
+) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    state.set_subtitle(SubtitleRecord(path=rec.path, size=rec.size, mtime=rec.mtime, status=status))
+    summary = _run(settings, state, Fakes())
+    assert summary.completed == 1 and summary.waiting_on_subtitles == 0
+
+
+def test_a_found_subtitle_is_muxed_into_a_remux_and_the_file_is_delivered(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/clip.mp4", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    cache = _found_subtitle(settings, state, rec)
+    cache_before = (cache.read_bytes(), cache.stat().st_mtime_ns)
+    fakes = Fakes()
+    fakes.codec = "hevc"  # already efficient: it is only in the queue for its subtitle
+    summary = _run(settings, state, fakes)
+
+    assert summary.completed == 1 and summary.waiting_on_subtitles == 0
+    (mux,) = [c for c in fakes.calls if c[0] == "mux"]
+    assert mux[2] is None  # remux: no new video
+    subtitle = mux[4]
+    assert isinstance(subtitle, SubtitleInput)
+    assert (subtitle.title, subtitle.language) == (SUB_TITLE, "eng")
+    # the muxer got a private copy under the file's scratch work folder, with the cached bytes
+    assert subtitle.path != cache
+    assert _is_under_scratch(settings, subtitle.path)
+    assert subtitle.path.parent.name.startswith("work-")
+    assert fakes.staged == [(subtitle.path, SRT_BYTES)]
+    assert not subtitle.path.exists()  # released with the work folder
+    assert (cache.read_bytes(), cache.stat().st_mtime_ns) == cache_before
+
+    (verify,) = [c for c in fakes.calls if c[0] == "verify"]
+    assert verify[3]["encoded"] is False
+    assert verify[3]["expected_new_subtitles"] == 1
+    assert verify[3]["expected_subtitle_title"] == SUB_TITLE
+    # delivered although the output is not smaller: a subtitle-only remux
+    out = settings.completed_dir / "Films" / "clip.mkv"
+    assert out.stat().st_size == 3000 + len(SRT_BYTES)
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert (entry.action, entry.subtitle, entry.verified) == ("remux", SUB_TITLE, True)
+    record = _status(state, src)
+    assert record.status is Status.COMPLETED
+    assert "subtitle" in record.note and SUB_TITLE in record.note
+    assert _scratch_files(settings) == []
+
+
+def test_a_found_subtitle_is_muxed_into_an_encode(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1
+    (mux,) = [c for c in fakes.calls if c[0] == "mux"]
+    assert mux[2] is not None and isinstance(mux[4], SubtitleInput)
+    assert fakes.staged[0][1] == SRT_BYTES
+    (verify,) = [c for c in fakes.calls if c[0] == "verify"]
+    assert verify[3]["encoded"] is True and verify[3]["expected_new_subtitles"] == 1
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert (entry.action, entry.subtitle, entry.crf) == ("encode", SUB_TITLE, 20)
+
+
+def test_a_multi_part_group_is_appended_then_muxed_again_with_the_subtitle(
+    settings: Settings, state: State
+) -> None:
+    pt1 = _source(settings, "Epic cd1.mkv", size=1000)
+    pt2 = _source(settings, "Epic cd2.mkv", size=1000)
+    rec = _plan(state, pt1, decision="remux", parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    fakes.codec = "hevc"
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1, _status(state, pt1).note
+    names = [n for n in fakes.names() if n not in ("probe", "copy")]
+    assert names == ["append_parts", "mux", "verify"]
+    combined = fakes.calls[fakes.names().index("append_parts")][2]
+    (mux,) = [c for c in fakes.calls if c[0] == "mux"]
+    assert mux[1] == [combined] and mux[2] is None and isinstance(mux[4], SubtitleInput)
+    (verify,) = [c for c in fakes.calls if c[0] == "verify"]
+    assert verify[3]["expected_new_subtitles"] == 1 and verify[3]["original_size"] == 2000
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert entry.original == (pt1, pt2) and entry.subtitle == SUB_TITLE
+    assert (settings.completed_dir / "Epic.mkv").stat().st_size == 2000 + len(SRT_BYTES)
+    assert _scratch_files(settings) == []
+
+
+def _break_cache(kind: str, cache: Path, tmp_path: Path) -> Path | None:
+    """Damage the cache file as *kind* says; returns a new cache path for the record, if any."""
+    if kind == "missing":
+        cache.unlink()
+    elif kind == "changed":
+        cache.write_bytes(SRT_BYTES + b"tampered")
+    elif kind == "outside":
+        # the record points at an identical file that lives outside the cache folder
+        elsewhere = tmp_path / "elsewhere.srt"
+        elsewhere.write_bytes(SRT_BYTES)
+        return elsewhere
+    elif kind == "directory":
+        cache.unlink()
+        cache.mkdir()
+    elif kind == "symlink":
+        real = cache.with_name("real.srt")
+        real.write_bytes(SRT_BYTES)
+        cache.unlink()
+        try:
+            os.symlink(real, cache)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks cannot be created here")
+    return None
+
+
+@pytest.mark.parametrize(
+    "kind", ["missing", "changed", "outside", "directory", "symlink", "oversize"]
+)
+def test_a_stale_subtitle_cache_sends_the_file_to_retry_and_the_subtitle_back_to_wanted(
+    tmp_path: Path, kind: str
+) -> None:
+    settings = _settings(tmp_path)
+    with _open_state(settings) as state:
+        src = _source(settings, "a.avi")
+        rec = _plan(state, src)
+        cache = _found_subtitle(settings, state, rec)
+        moved = _break_cache(kind, cache, tmp_path)
+        if moved is not None:
+            state.set_subtitle(dataclasses.replace(_subtitle_of(state, rec), cache_path=moved))
+        if kind == "oversize":
+            settings = dataclasses.replace(settings, subtitle_max_bytes=len(SRT_BYTES) - 1)
+        fakes = Fakes()
+        summary = _run(settings, state, fakes)
+
+        assert fakes.calls == []  # nothing was copied, probed or muxed
+        assert summary.retry == 1 and summary.completed == 0
+        assert summary.waiting_on_subtitles == 0  # it was tried, not skipped
+        record = _status(state, src)
+        assert record.status is Status.RETRY and record.note == STALE_NOTE
+        assert record.attempts == 0  # not the file's fault
+        sub = _subtitle_of(state, rec)
+        assert sub.status is SubtitleStatus.WANTED
+        assert (sub.cache_path, sub.sha256, sub.provenance) == (None, "", "")
+        assert (sub.tried_ids, sub.attempts) == ((7,), 1)
+        assert STALE_NOTE in sub.reason
+        assert not (settings.completed_dir / "a.mkv").exists()
+        assert _scratch_files(settings) == []
+
+        # and the next run leaves it alone until the resolver finds a subtitle again
+        again = Fakes()
+        summary = _run(settings, state, again)
+        assert again.calls == [] and summary.waiting_on_subtitles == 1
+
+
+def test_a_stale_cache_of_the_next_file_is_not_prefetched(
+    settings: Settings, state: State, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _source(settings, "first.avi")
+    second = _source(settings, "second.avi")
+    _plan(state, first, est=900)
+    rec = _plan(state, second, est=100)
+    cache = _found_subtitle(settings, state, rec)
+    cache.unlink()
+    started: list[Path] = []
+    real_start = scratch_module.Prefetcher.start
+
+    def recording_start(self: scratch_module.Prefetcher, src: Path) -> None:
+        started.append(src)
+        real_start(self, src)
+
+    monkeypatch.setattr(scratch_module.Prefetcher, "start", recording_start)
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1 and summary.retry == 1
+    assert started == []  # `second` was never copied from the library, not even in advance
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+
+
+def test_a_cache_file_changed_between_the_check_and_the_staging_is_caught(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    cache = _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+
+    def swap(_src: Path) -> None:
+        cache.write_bytes(b"swapped after the first check")
+
+    fakes.after_copy = swap
+    summary = _run(settings, state, fakes)
+    assert "copy" in fakes.names()  # the first check had passed
+    assert "mux" not in fakes.names() and "verify" not in fakes.names()
+    assert summary.retry == 1 and summary.completed == 0
+    record = _status(state, src)
+    assert record.status is Status.RETRY and record.note == STALE_NOTE
+    assert _subtitle_of(state, rec).status is SubtitleStatus.WANTED
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert _scratch_files(settings) == []
+
+
+def test_an_unusable_subtitle_title_flags_the_file(settings: Settings, state: State) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec, title="bad\ntitle")
+    fakes = Fakes()
+    summary = _run(settings, state, fakes)
+    assert summary.flagged == 1 and "mux" not in fakes.names()
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED and "subtitle title" in record.note
+    assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
+    assert _scratch_files(settings) == []
+
+
+def test_an_output_that_lost_the_subtitle_is_flagged_and_never_delivered(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    fakes.drop_subtitle = True
+    summary = _run(settings, state, fakes)
+    assert summary.flagged == 1 and summary.completed == 0
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED and "subtitle streams" in record.note
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert _scratch_files(settings) == []
+
+
+def test_a_mux_failure_keeps_the_subtitle_found_and_retries_the_file(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    fakes.fail["mux"] = lambda p: ToolFailed(2, "mkvmerge ...", None)
+    summary = _run(settings, state, fakes)
+    assert summary.retry == 1
+    assert _status(state, src).status is Status.RETRY
+    assert _status(state, src).attempts == 1
+    assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
+    assert _scratch_files(settings) == []
+
+
+def test_ctrl_c_during_the_mux_leaves_no_staged_subtitle_behind(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    cache = _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    fakes.fail["mux"] = lambda p: KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        _run(settings, state, fakes)
+    assert _scratch_files(settings) == []
+    assert cache.read_bytes() == SRT_BYTES
+    assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
+    assert not (settings.completed_dir / "a.mkv").exists()
+
+
+# --- a remux that existed only for its subtitle ends when the subtitle is gone -----------------
+
+GONE_NOTE = "subtitle no longer available; nothing left to do for this file"
+
+
+def _delivered_nothing(settings: Settings, fakes: Fakes) -> None:
+    assert "mux" not in fakes.names() and "verify" not in fakes.names()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert (
+        not list(settings.completed_dir.rglob("*.mkv")) if settings.completed_dir.exists() else True
+    )
+    assert _scratch_files(settings) == []
+
+
+def test_a_remux_whose_subtitle_went_stale_and_ended_unavailable_delivers_nothing(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/clip.mp4", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    cache = _found_subtitle(settings, state, rec)
+    cache.unlink()  # the cache was cleared
+    first = Fakes()
+    first.codec = "hevc"
+    summary = _run(settings, state, first)
+    assert summary.retry == 1 and first.calls == []
+    assert _subtitle_of(state, rec).status is SubtitleStatus.WANTED
+
+    # `subs resolve` finds nothing, the user acknowledges the plan, and runs again.
+    state.set_subtitle(
+        dataclasses.replace(
+            _subtitle_of(state, rec), status=SubtitleStatus.UNAVAILABLE, reason="none found"
+        )
+    )
+    library_before = _tree(settings.library_root)
+    again = Fakes()
+    again.codec = "hevc"
+    summary = _run(settings, state, again)
+    assert (summary.completed, summary.left_alone, summary.flagged) == (0, 1, 0)
+    record = _status(state, src)
+    assert record.status is Status.LEFT_ALONE and record.note == GONE_NOTE
+    _delivered_nothing(settings, again)
+    assert _tree(settings.library_root) == library_before
+
+
+def test_include_unresolved_on_a_wanted_remux_delivers_nothing(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/clip.mp4", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    fakes.codec = "hevc"
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert (summary.completed, summary.left_alone) == (0, 1)
+    record = _status(state, src)
+    assert record.status is Status.LEFT_ALONE and record.note == GONE_NOTE
+    _delivered_nothing(settings, fakes)
+
+
+def test_an_hdr_remux_that_lost_its_subtitle_is_flagged_with_its_reasons(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/hdr.avi", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    fakes.transfer = "smpte2084"
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert (summary.completed, summary.flagged) == (0, 1)
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED
+    assert record.note == "HDR (transfer smpte2084)"
+    _delivered_nothing(settings, fakes)
+
+
+def test_a_single_remux_that_the_probe_still_wants_encoded_or_remuxed_goes_on(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Show/clip.mp4", size=3000)
+    _plan(state, src, decision="remux", est=0)  # no subtitle record; h264 would be encoded
+    fakes = Fakes()
+    assert _run(settings, state, fakes).completed == 1
+    assert fakes.names().count("mux") == 1
+
+
+def test_a_multi_part_join_without_a_subtitle_still_delivers(
+    settings: Settings, state: State
+) -> None:
+    pt1 = _source(settings, "Epic cd1.mkv", size=1000)
+    pt2 = _source(settings, "Epic cd2.mkv", size=1000)
+    rec = _plan(state, pt1, decision="remux", parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    fakes.codec = "hevc"
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert summary.completed == 1 and summary.left_alone == 0
+    assert (settings.completed_dir / "Epic.mkv").stat().st_size == 2000
+
+
+def _abandon_by_projection(fakes: Fakes) -> None:
+    fakes.crf = CrfSearchResult(crf=24, projected_saving=0.05, points=())
+
+
+def _abandon_by_guard(fakes: Fakes) -> None:
+    fakes.scores = [94.0, 86.0, 95.0]
+
+
+def _abandon_by_size(fakes: Fakes) -> None:
+    fakes.ratio = 0.95  # the encode is only 5% smaller: verify says too large
+
+
+ABANDONED = {
+    "projection": (_abandon_by_projection, "projected saving 5.0%", 0, 1),
+    "guard": (_abandon_by_guard, "quality guard failed", 1, 1),
+    "too_large": (_abandon_by_size, "output not kept", 1, 2),
+}
+
+
+@pytest.mark.parametrize("path", list(ABANDONED))
+def test_an_abandoned_encode_delivers_a_subtitle_only_remux_instead(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, why, encodes, verifies = ABANDONED[path]
+    src = _source(settings, "Films/a.avi", size=3000)
+    rec = _plan(state, src)
+    cache = _found_subtitle(settings, state, rec)
+    library_before = _tree(settings.library_root)
+    fakes = Fakes()
+    abandon(fakes)
+    summary = _run(settings, state, fakes)
+
+    assert (summary.completed, summary.left_alone, summary.flagged) == (1, 0, 0)
+    assert fakes.names().count("encode_full") == encodes
+    muxes = [c for c in fakes.calls if c[0] == "mux"]
+    assert muxes[-1][2] is None  # the delivered file is a remux: the video is the original's
+    assert isinstance(muxes[-1][4], SubtitleInput)
+    assert fakes.staged[-1][1] == SRT_BYTES
+    verifies_made = [c for c in fakes.calls if c[0] == "verify"]
+    assert len(verifies_made) == verifies
+    assert verifies_made[-1][3]["encoded"] is False  # no size gate for a remux
+    assert verifies_made[-1][3]["expected_new_subtitles"] == 1
+    out = settings.completed_dir / "Films" / "a.mkv"
+    assert out.stat().st_size == 3000 + len(SRT_BYTES)
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert (entry.action, entry.subtitle, entry.crf) == ("remux", SUB_TITLE, None)
+    assert (entry.vmaf_mean, entry.vmaf_worst, entry.verified) == (None, None, True)
+    record = _status(state, src)
+    assert record.status is Status.COMPLETED
+    assert why in record.note and "subtitle-only remux" in record.note
+    assert _subtitle_of(state, rec).status is SubtitleStatus.FOUND
+    assert _scratch_files(settings) == []
+    assert _tree(settings.library_root) == library_before
+    assert cache.read_bytes() == SRT_BYTES
+
+
+@pytest.mark.parametrize("path", ["projection", "guard"])
+def test_an_abandoned_encode_whose_remux_fails_verify_is_flagged_and_delivers_nothing(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, _, _, _ = ABANDONED[path]
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    abandon(fakes)
+    fakes.drop_subtitle = True  # the fallback mux loses the subtitle
+    summary = _run(settings, state, fakes)
+    assert (summary.flagged, summary.completed, summary.left_alone) == (1, 0, 0)
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED and "subtitle streams" in record.note
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert _scratch_files(settings) == []
+
+
+def test_a_too_large_encode_whose_fallback_remux_fails_verify_is_flagged_and_delivers_nothing(
+    settings: Settings, state: State
+) -> None:
+    """The size gate rejects the encode (its subtitle is fine), then the subtitle-only remux
+    that replaces it loses the subtitle: nothing may be delivered."""
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    _abandon_by_size(fakes)
+    real_mux = fakes.mux
+    muxes: list[int] = []
+
+    def mux_then_lose_the_subtitle(*args: Any, **kwargs: Any) -> None:
+        muxes.append(1)
+        fakes.drop_subtitle = len(muxes) > 1  # only the fallback remux is broken
+        fakes.subtitled.clear()  # the fallback writes the same output path as the encode did
+        real_mux(*args, **kwargs)
+
+    fakes.mux = mux_then_lose_the_subtitle  # type: ignore[method-assign]
+    summary = _run(settings, state, fakes)
+
+    assert len(muxes) == 2 and fakes.names().count("encode_full") == 1
+    verifies = [c for c in fakes.calls if c[0] == "verify"]
+    assert [v[3]["encoded"] for v in verifies] == [True, False]
+    assert (summary.flagged, summary.completed, summary.left_alone) == (1, 0, 0)
+    record = _status(state, src)
+    assert record.status is Status.FLAGGED and "subtitle streams" in record.note
+    assert not (settings.completed_dir / "a.mkv").exists()
+    assert not (settings.completed_dir / "manifest.csv").exists()
+    assert _scratch_files(settings) == []
+
+
+@pytest.mark.parametrize("path", list(ABANDONED))
+def test_an_abandoned_multi_part_encode_muxes_the_combined_file_with_the_subtitle(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, why, _, _ = ABANDONED[path]
+    pt1 = _source(settings, "Epic cd1.avi", size=2000)
+    pt2 = _source(settings, "Epic cd2.avi", size=3000)
+    rec = _plan(state, pt1, parts=(pt1, pt2))
+    _plan(state, pt2, decision="leave_alone", est=0)
+    _found_subtitle(settings, state, rec)
+    fakes = Fakes()
+    abandon(fakes)
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1, _status(state, pt1).note
+    combined = fakes.calls[fakes.names().index("append_parts")][2]
+    last = [c for c in fakes.calls if c[0] == "mux"][-1]
+    assert last[1] == [combined] and last[2] is None and isinstance(last[4], SubtitleInput)
+    assert (settings.completed_dir / "Epic.mkv").stat().st_size == 5000 + len(SRT_BYTES)
+    (entry,) = read_manifest(settings.completed_dir / "manifest.csv")
+    assert (entry.action, entry.original, entry.subtitle) == ("remux", (pt1, pt2), SUB_TITLE)
+    assert why in _status(state, pt1).note
+    assert _scratch_files(settings) == []
+
+
+@pytest.mark.parametrize("path", list(ABANDONED))
+def test_an_abandoned_encode_without_a_found_subtitle_is_left_alone_as_before(
+    settings: Settings, state: State, path: str
+) -> None:
+    abandon, why, encodes, _ = ABANDONED[path]
+    src = _source(settings, "a.avi")
+    rec = _plan(state, src)
+    _want_subtitle(state, rec)
+    fakes = Fakes()
+    abandon(fakes)
+    summary = _run(settings, state, fakes, include_unresolved=True)
+    assert (summary.left_alone, summary.completed) == (1, 0)
+    record = _status(state, src)
+    assert record.status is Status.LEFT_ALONE and why in record.note
+    assert "subtitle" not in record.note
+    assert fakes.names().count("encode_full") == encodes
+    assert fakes.names().count("mux") == encodes  # no extra remux
+    assert not (settings.completed_dir / "manifest.csv").exists()
+
+
+def test_the_remux_reservation_leaves_room_for_the_subtitle(tmp_path: Path) -> None:
+    # room for the copy and an output of the video's size (1000 each) but not for the subtitle
+    settings = _settings(tmp_path, scratch_cap_bytes=3200, subtitle_max_bytes=5000)
+    src = _source(settings, "a.mp4", size=1000)
+    with _open_state(settings) as state:
+        rec = _plan(state, src, decision="remux", est=0)
+        _found_subtitle(settings, state, rec)
+        fakes = Fakes()
+        summary = _run(settings, state, fakes)
+        assert summary.stop_reason == "scratch full" and summary.completed == 0
+        assert "mux" not in fakes.names()
+        assert _status(state, src).status is Status.RETRY
+        assert _scratch_files(settings) == []
+
+
+def test_the_library_and_the_cache_are_never_written_when_a_subtitle_is_muxed(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "Films/a.mp4", size=3000)
+    rec = _plan(state, src, decision="remux", est=0)
+    _found_subtitle(settings, state, rec)
+    library_before = _tree(settings.library_root)
+    cache_before = _tree(settings.subtitle_cache_dir)
+    fakes = Fakes()
+    fakes.codec = "hevc"
+    assert _run(settings, state, fakes).completed == 1
+    assert _tree(settings.library_root) == library_before
+    assert _tree(settings.subtitle_cache_dir) == cache_before
+    for call in fakes.calls:
+        if call[0] == "mux":
+            for written in (call[3], call[4].path):
+                assert not paths_module.is_under(written, settings.library_root)
+                assert not paths_module.is_under(written, settings.subtitle_cache_dir)
+
+
+def test_the_nas_write_guard_still_refuses_a_cache_folder_inside_the_library(
+    tmp_path: Path,
+) -> None:
+    base = _settings(tmp_path)
+    settings = _settings(tmp_path, subtitle_cache_dir=base.library_root / "subs")
+    with _open_state(base) as state, pytest.raises(RunRefused, match="library root"):
+        _run(settings, state, Fakes())
+
+
+def test_cli_run_passes_include_unresolved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, calls = _invoke_run(tmp_path, monkeypatch, _summary())
+    assert calls[0]["include_unresolved"] is False
+    _, calls = _invoke_run(tmp_path, monkeypatch, _summary(), "--include-unresolved")
+    assert calls[0]["include_unresolved"] is True
+
+
+def test_cli_run_summary_says_how_many_files_wait_on_subtitles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary(waiting_on_subtitles=3))
+    assert "3 files waiting on subtitles" in result.output
+    assert "--include-unresolved" in result.output
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary())
+    assert "waiting on subtitles" not in result.output
+
+
+# --- a run ignores what changed after it started (a `subs resolve` beside it) --------------
+
+
+def _mid_run(fakes: Fakes, trigger: Path, change: Callable[[], object]) -> list[int]:
+    """Run *change* once, right after the copy of *trigger* (between two files of a run)."""
+    done: list[int] = []
+
+    def after_copy(src: Path) -> None:
+        if src == trigger and not done:
+            done.append(1)
+            change()
+
+    fakes.after_copy = after_copy
+    return done
+
+
+def test_a_file_that_turns_found_after_the_run_started_is_not_processed(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    later = _source(settings, "later.avi")
+    _plan(state, first, est=900)
+    later_rec = _plan(state, later, decision="remux", est=100)
+    fakes = Fakes()
+    done = _mid_run(fakes, first, lambda: _found_subtitle(settings, state, later_rec))
+    summary = _run(settings, state, fakes)
+    assert done and summary.completed == 1
+    assert summary.changed_since_start == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+    assert _status(state, later).status is Status.PENDING
+    assert not (settings.completed_dir / "later.mkv").exists()
+
+
+def test_a_left_alone_file_the_job_decides_again_mid_run_is_not_processed(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    later = _source(settings, "later.avi")
+    _plan(state, first, est=900)
+    later_rec = _plan(state, later, decision="leave_alone", est=0)
+    assert later_rec.status is Status.LEFT_ALONE
+
+    def job_turns_it_into_a_remux() -> None:
+        _found_subtitle(settings, state, later_rec)
+        survey_module.redecide_found(
+            _info(later, later_rec.size, later_rec.mtime, codec="hevc"),
+            settings,
+            state,
+            movie_hash=None,
+        )
+
+    fakes = Fakes()
+    _mid_run(fakes, first, job_turns_it_into_a_remux)
+    summary = _run(settings, state, fakes)
+    assert _status(state, later).decision == "remux"  # the change really happened
+    assert summary.completed == 1 and summary.changed_since_start == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+    assert _status(state, later).status is Status.PENDING
+
+
+def test_a_file_that_was_found_at_the_start_is_processed_as_before(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    found = _source(settings, "found.avi", size=3000)
+    other = _source(settings, "other.avi")
+    _plan(state, first, est=900)
+    found_rec = _plan(state, found, decision="remux", est=0)
+    other_rec = _plan(state, other, est=100)
+    _found_subtitle(settings, state, found_rec)
+    fakes = Fakes()
+    # An unrelated change mid-run (another file's subtitle row) does not touch the found one.
+    _mid_run(fakes, first, lambda: _want_subtitle(state, other_rec))
+    summary = _run(settings, state, fakes)
+    assert summary.changed_since_start == 0
+    assert summary.completed == 2  # `other` waits for its (new) subtitle lookup
+    assert (settings.completed_dir / "found.mkv").is_file()
+    assert _subtitle_of(state, _status(state, found)).status is SubtitleStatus.FOUND
+    (entry,) = [e for e in read_manifest(settings.completed_dir / "manifest.csv") if e.subtitle]
+    assert entry.original == (found,)
+
+
+def test_a_file_that_was_waiting_at_the_start_stays_deferred_when_it_turns_found(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    waiting = _source(settings, "wait.avi")
+    _plan(state, first, est=900)
+    waiting_rec = _plan(state, waiting, est=100)
+    _want_subtitle(state, waiting_rec)
+    fakes = Fakes()
+    _mid_run(fakes, first, lambda: _found_subtitle(settings, state, waiting_rec))
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1 and summary.changed_since_start == 1
+    assert summary.waiting_on_subtitles == 0  # it is no longer WANTED, only unreviewed
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+    assert _status(state, waiting).status is Status.PENDING
+
+
+def test_a_new_record_for_a_changed_file_is_not_picked_up_mid_run(
+    settings: Settings, state: State
+) -> None:
+    first = _source(settings, "first.avi")
+    other = _source(settings, "other.avi")
+    _plan(state, first, est=900)
+    _plan(state, other, est=100)
+
+    def resurvey() -> None:
+        other.write_bytes(b"y" * 2000)  # the file changed and a survey recorded the new one
+        _plan(state, other, est=100)
+
+    fakes = Fakes()
+    _mid_run(fakes, first, resurvey)
+    summary = _run(settings, state, fakes)
+    assert summary.completed == 1 and summary.changed_since_start == 1
+    assert [c[1] for c in fakes.calls if c[0] == "copy"] == [first]
+
+
+def test_a_retry_inside_the_same_run_is_still_not_repeated(
+    settings: Settings, state: State
+) -> None:
+    src = _source(settings, "a.avi")
+    _plan(state, src)
+    fakes = Fakes()
+    fakes.fail["search_crf"] = lambda p: OSError("disk")
+    summary = _run(settings, state, fakes)
+    assert summary.retry == 1 and summary.changed_since_start == 0
+    assert len([c for c in fakes.calls if c[0] == "copy"]) == 1
+
+
+def test_cli_run_summary_says_how_many_files_changed_after_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary(changed_since_start=2))
+    text = " ".join(result.output.split())
+    assert "2 files changed after the run started" in text
+    assert "a subtitle was found or the plan was updated" in text
+    assert "run `plan`, review it, then `plan --ack`" in text
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary(changed_since_start=1))
+    assert "1 file changed after the run started" in " ".join(result.output.split())
+    result, _ = _invoke_run(tmp_path, monkeypatch, _summary())
+    assert "changed after the run started" not in result.output
 
 
 # --- integration: the real pipeline on a tiny clip -----------------------------------------

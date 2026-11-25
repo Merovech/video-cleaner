@@ -83,6 +83,47 @@ def test_a_name_is_non_english_unless_english_is_its_only_language(
     assert parse_release_name(name).non_english is non_english
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Movie.2010.en.hi",
+        "Movie.2010.EN.HI",
+        "Movie.2010.eng.hi",
+        "Movie.2010.English.HI",
+        "Movie.2010.hi.en",
+    ],
+)
+def test_hi_beside_an_english_tag_is_the_hearing_impaired_flag_not_hindi(name: str) -> None:
+    parsed = parse_release_name(name)
+
+    assert parsed.languages == ("en",)
+    assert parsed.non_english is False
+    assert (parsed.title, parsed.year) == ("Movie", 2010)
+
+
+@pytest.mark.parametrize(
+    ("name", "non_english"),
+    [
+        ("Movie.2010.HI", True),  # bare: ambiguous, so it fails safe
+        ("Movie.2010.hi", True),
+        ("Movie.2010.hi.fr", True),
+        ("Movie.2010.en.fr", True),
+        ("Movie.2010.en.hi.fr", True),  # English and a real language
+    ],
+)
+def test_hi_without_english_or_with_another_language_stays_non_english(
+    name: str, non_english: bool
+) -> None:
+    assert parse_release_name(name).non_english is non_english
+
+
+def test_a_title_containing_hi_is_unaffected_by_the_hearing_impaired_rule() -> None:
+    parsed = parse_release_name("Hi.Mom.1970.en")
+
+    assert (parsed.title, parsed.year, parsed.languages) == ("Hi Mom", 1970, ("en",))
+    assert parse_release_name("Hi.Mom.1970.en.hi").title == "Hi Mom"
+
+
 def test_the_languages_of_a_name_are_not_part_of_its_identity() -> None:
     assert parse_release_name("Alien.1979.fr") == TitleYear("Alien", 1979)
 

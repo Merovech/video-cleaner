@@ -2,15 +2,77 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from video_cleaner.cmdline import flatten
 from video_cleaner.tools import Tools
 
+MAX_TITLE_CHARS = 200
+_LANGUAGE = re.compile(r"[a-z]{3}")
+# Controls (Cc), line and paragraph separators (Zl, Zp) and invisible format characters such as
+# U+200B or the right-to-left override U+202E (Cf): none belongs in a track name.
+_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Zl", "Zp", "Cf"})
+
+
+@dataclass(frozen=True)
+class SubtitleInput:
+    """One subtitle file to add as a new track: its path, track name and ISO 639-2 language.
+
+    The title and language reach mkvmerge as command-line arguments (never a shell string), but
+    they are still checked here: a title is 1 to 200 characters with at least one visible one and
+    no control, line-separator or invisible format characters (the resolver writes constants, so
+    anything else is a damaged record), a language is three lowercase letters.
+    """
+
+    path: Path
+    title: str
+    language: str = "eng"
+
+    def __post_init__(self) -> None:
+        if not _LANGUAGE.fullmatch(self.language):
+            raise ValueError(
+                f"subtitle language must be three lowercase letters: {self.language!r}"
+            )
+        if not 1 <= len(self.title) <= MAX_TITLE_CHARS:
+            raise ValueError(f"subtitle title must be 1 to {MAX_TITLE_CHARS} characters")
+        if any(unicodedata.category(ch) in _FORBIDDEN_CATEGORIES for ch in self.title):
+            raise ValueError(
+                "subtitle title must not contain control, format or line-separator characters"
+            )
+        if not self.title.strip():
+            raise ValueError("subtitle title must contain a visible character")
+
+
+def _subtitle_args(subtitle: SubtitleInput) -> tuple[str, ...]:
+    """The options for the subtitle file, then the file: every other track stays untouched.
+
+    mkvmerge options apply to the file that follows them. The new track is neither default nor
+    forced, so a player keeps choosing its audio and subtitles as it did before. ``0:<title>``
+    is one argument whatever the title holds, a leading ``-`` included.
+    """
+    return (
+        "--language",
+        f"0:{subtitle.language}",
+        "--track-name",
+        f"0:{subtitle.title}",
+        "--default-track-flag",
+        "0:0",
+        "--forced-display-flag",
+        "0:0",
+        str(subtitle.path),
+    )
+
 
 def build_mux_cmd(
-    tools: Tools, output: Path, sources: Sequence[Path], new_video: Path | None
+    tools: Tools,
+    output: Path,
+    sources: Sequence[Path],
+    new_video: Path | None,
+    subtitle: SubtitleInput | None = None,
 ) -> list[str]:
     """mkvmerge argument list (no shell). ``--gui-mode`` makes progress print ``#GUI#progress N%``.
 
@@ -29,10 +91,14 @@ def build_mux_cmd(
     Without *new_video*: the sources are appended in order; mkvmerge's append syntax prefixes
     the second and later files with ``+``. The first source keeps its chapters and
     attachments.
+
+    With *subtitle*, its options and file come after the source options, so it is added as one
+    new last track (language, name, no default or forced flag) and nothing else changes.
     """
     if not sources:
         raise ValueError("at least one source file is required")
     cmd = [str(tools.mkvmerge), "--gui-mode", "-o", str(output)]
+    extra = () if subtitle is None else _subtitle_args(subtitle)
     if new_video is not None:
         if len(sources) > 1:
             raise ValueError("new_video can be combined with exactly one source file")
@@ -48,7 +114,8 @@ def build_mux_cmd(
                 # The original contributes everything but its video:
                 ("--no-video",),
                 (str(sources[0]),),
+                extra,
             ),
         ]
     first, *rest = sources
-    return [*cmd, str(first), *(f"+{part}" for part in rest)]
+    return [*cmd, str(first), *(f"+{part}" for part in rest), *extra]

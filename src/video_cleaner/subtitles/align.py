@@ -24,12 +24,16 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_cleaner.atomicio import write_text_atomic
+from video_cleaner.atomicio import read_bytes_capped, write_text_atomic
 from video_cleaner.cmdline import flatten
 from video_cleaner.config import Settings
 from video_cleaner.logging_setup import redact
 from video_cleaner.progress import Reporter
-from video_cleaner.subtitles.textfmt import SubtitleRejected, normalise_subtitle
+from video_cleaner.subtitles.textfmt import (
+    SubtitleRejected,
+    normalise_newlines,
+    normalise_subtitle,
+)
 from video_cleaner.tools import (
     ToolFailed,
     ToolOutputError,
@@ -63,7 +67,7 @@ _SPEECH_FRAMES_PER_S = 100.0
 _EXCERPT_LINES = 10
 _CONSOLE_COLUMNS = "1000"
 _EXCERPT_LINE_CHARS = 300
-_WORK_PREFIX = ".align-"
+WORK_PREFIX = ".align-"
 # Environment variables that are not passed to ffsubsync: this tool's OpenSubtitles credentials
 # and, as a net for others, any name with one of these words in it (compared in upper case).
 _OPENSUBTITLES_ENV_PREFIX = "VC_OPENSUBTITLES_"
@@ -126,7 +130,7 @@ def parse_ffsubsync_log(text: str) -> tuple[float | None, float | None, float | 
     ``framerate scale factor: 1.000`` as INFO messages on stderr. Each is None when it is not
     there or not a finite number; when a number is reported more than once the last one wins.
     """
-    lines = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalise_newlines(text)
     return (
         _last_number(_OFFSET_RE, lines),
         _last_number(_SCALE_RE, lines),
@@ -139,7 +143,7 @@ def parse_reference_speech_s(text: str) -> float | None:
 
     It logs ``total of speech segments: 3022.0``, the number of 10 ms frames with speech.
     """
-    frames = _last_number(_SPEECH_RE, text.replace("\r\n", "\n").replace("\r", "\n"))
+    frames = _last_number(_SPEECH_RE, normalise_newlines(text))
     return None if frames is None else frames / _SPEECH_FRAMES_PER_S
 
 
@@ -277,7 +281,7 @@ def _log_excerpt(label: str, text: str) -> None:
     The work folder and the log in it are removed when the run ends, so this is the only place
     the cause (a traceback, a missing module) is kept.
     """
-    lines = [line.rstrip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
+    lines = [line.rstrip() for line in normalise_newlines(text).split("\n") if line.strip()]
     kept = [redact(line)[:_EXCERPT_LINE_CHARS] for line in lines[-_EXCERPT_LINES:]]
     if kept:
         _log.warning("%s: the end of ffsubsync's output:\n%s", label, "\n".join(kept))
@@ -292,13 +296,14 @@ def _failure_reason(text: str, what: str) -> str:
 def _validated_srt(path: Path, settings: Settings) -> tuple[str | None, str]:
     """(clean SRT text, "") for ffsubsync's output, or (None, why it is unusable)."""
     try:
-        with path.open("rb") as handle:
-            # One byte past the limit is enough for `normalise_subtitle` to refuse it.
-            raw = handle.read(settings.subtitle_max_bytes + 1)
+        raw = read_bytes_capped(path, settings.subtitle_max_bytes)
     except FileNotFoundError:
         return None, "ffsubsync produced no subtitle"
     except OSError:
         return None, "the subtitle ffsubsync produced could not be read"
+    if raw is None:
+        limit = settings.subtitle_max_bytes
+        return None, f"ffsubsync output rejected: subtitle is larger than {limit} bytes"
     if not raw:
         return None, "ffsubsync wrote an empty subtitle"
     try:
@@ -377,7 +382,7 @@ def align_subtitle(
             ok=True, reason="matched this file by hash; no alignment needed", output=subtitle
         )
     out.parent.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=_WORK_PREFIX, dir=out.parent))
+    work = Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=out.parent))
     try:
         shutil.copyfile(subtitle, work / _STAGED_INPUT)
         result, text, why = _run(tools, media, work, media.name, settings, reporter, timeout_s)

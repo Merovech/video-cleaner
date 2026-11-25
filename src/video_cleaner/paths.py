@@ -16,12 +16,25 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from video_cleaner.config import Settings
 
 _resolve = os.path.realpath
+
+
+class _HasFileKey(Protocol):
+    """What identifies one surveyed file: a `FileRecord` or a `SubtitleRecord`."""
+
+    @property
+    def path(self) -> Path: ...
+
+    @property
+    def size(self) -> int: ...
+
+    @property
+    def mtime(self) -> float: ...
 
 
 class OutputInLibrary(Exception):
@@ -31,6 +44,17 @@ class OutputInLibrary(Exception):
 def name_key(path: Path | str) -> str:
     """String-only identity of *path*: absolute, ``..`` collapsed, case- and separator-folded."""
     return os.path.normcase(os.path.abspath(path))
+
+
+def file_key(path: Path | str, size: int, mtime: float) -> tuple[str, int, float]:
+    """Identity of one surveyed file (its path by `name_key`, its size and mtime): the key the
+    state database uses for a file record and its subtitle record, as a hashable tuple."""
+    return (name_key(path), size, mtime)
+
+
+def record_key(rec: _HasFileKey) -> tuple[str, int, float]:
+    """`file_key` of a file or subtitle record."""
+    return file_key(rec.path, rec.size, rec.mtime)
 
 
 def name_under(path: Path | str, root: Path | str) -> bool:

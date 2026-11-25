@@ -35,7 +35,10 @@ MANIFEST_COLUMNS: tuple[str, ...] = (
     "crf",
     "verified",
     "action",
+    "subtitle",
 )
+# Manifests written before the subtitle column existed have no such column; it reads as "".
+_OPTIONAL_COLUMNS = frozenset({"subtitle"})
 # Columns that describe the completed file; every row of a multi-part entry repeats them.
 _SHARED_COLUMNS = MANIFEST_COLUMNS[3:]
 _TRUE = "true"
@@ -65,6 +68,8 @@ class ManifestEntry:
     crf: int | None
     verified: bool
     action: str
+    # Provenance title of the subtitle muxed in ("" when none was added).
+    subtitle: str = ""
 
     def __post_init__(self) -> None:
         count = len(self.original)
@@ -174,6 +179,7 @@ def _rows(entries: Sequence[ManifestEntry]) -> list[list[str]]:
             _optional(entry.crf),
             _TRUE if entry.verified else _FALSE,
             entry.action,
+            entry.subtitle,
         ]
         for path, size, mtime in zip(
             entry.original, entry.original_sizes, entry.original_mtimes, strict=True
@@ -245,6 +251,7 @@ class _Group:
     crf: int | None
     verified: bool
     action: str
+    subtitle: str
     originals: list[Path]
     sizes: list[int]
     mtimes: list[float]
@@ -261,6 +268,7 @@ class _Group:
             crf=self.crf,
             verified=self.verified,
             action=self.action,
+            subtitle=self.subtitle,
         )
 
 
@@ -274,6 +282,7 @@ def _new_group(row: Mapping[str, str]) -> _Group:
         crf=_parse_int("crf", row["crf"]) if row["crf"] else None,
         verified=_parse_bool("verified", row["verified"]),
         action=row["action"],
+        subtitle=row["subtitle"],
         originals=[],
         sizes=[],
         mtimes=[],
@@ -292,15 +301,17 @@ def read_manifest(path: Path) -> list[ManifestEntry]:
         reader = csv.DictReader(fh, strict=True)
         try:
             header = reader.fieldnames or []
-            missing = [c for c in MANIFEST_COLUMNS if c not in header]
+            missing = [
+                c for c in MANIFEST_COLUMNS if c not in header and c not in _OPTIONAL_COLUMNS
+            ]
             if missing:
                 raise ManifestError(f"{path}: missing column(s): {', '.join(missing)}")
             for row in reader:
                 line = reader.line_num
                 try:
-                    if None in row or any(row[c] is None for c in MANIFEST_COLUMNS):
+                    if None in row or any(row[c] is None for c in header):
                         raise ManifestError(f"expected {len(header)} fields")
-                    row = {c: csv_cell_value(row[c]) for c in MANIFEST_COLUMNS}
+                    row = {c: csv_cell_value(row.get(c) or "") for c in MANIFEST_COLUMNS}
                     original = _parse_path("original", row["original"])
                     size = _parse_int("original_size", row["original_size"])
                     mtime = _parse_float("original_mtime", row["original_mtime"])

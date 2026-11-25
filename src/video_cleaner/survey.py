@@ -1,9 +1,17 @@
 """Survey: walk the library read-only, probe every video file, decide, record and report.
 
-Nothing is ever written under the library root: files are only opened by ffprobe, and the CSV
-goes next to the state database (refused if that lies under the root). A file that cannot be
-probed, or whose path cannot be stored in the state database, is flagged in the CSV and the
-result and the survey carries on.
+Nothing is ever written under the library root: files are only opened by ffprobe (and, for a
+forced-only English subtitle track, read by ffmpeg to count its cues), and the CSV goes next to
+the state database (refused if that lies under the root). A file that cannot be probed, or whose
+path cannot be stored in the state database, is flagged in the CSV and the result and the survey
+carries on.
+
+Each file's own subtitles are classified too (`subtitles.embedded`) and the outcome stored as its
+subtitle record: English already there (NOT_NEEDED), none (WANTED, for the resolver to look up),
+or unclear (UNCLEAR, and the file is flagged). A file is only a remux candidate on account of
+subtitles when its record is FOUND, so a re-survey reproduces the decision made after the
+resolver ran. A file that no output can come from (no video stream, unprobeable, parts that do not
+fit together) gets no subtitle record, so no download allowance is ever spent on it.
 """
 
 from __future__ import annotations
@@ -13,19 +21,28 @@ import os
 import tempfile
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from video_cleaner.atomicio import write_csv_atomic
 from video_cleaner.config import Settings
-from video_cleaner.decide import Action, decide
+from video_cleaner.decide import Action, Decision, decide
 from video_cleaner.moviehash import movie_hash
 from video_cleaner.multipart import PartGroup, find_part_groups, parts_compatible
 from video_cleaner.paths import OutputInLibrary, outputs_outside_library
-from video_cleaner.probe import MediaInfo, ProbeError, probe
+from video_cleaner.probe import MediaInfo, ProbeError, SubtitleStream, probe
 from video_cleaner.progress import Progress, Reporter
-from video_cleaner.state import State, UnrepresentablePath
+from video_cleaner.state import State, SubtitleRecord, SubtitleStatus, UnrepresentablePath
+from video_cleaner.subtitles.embedded import (
+    EmbeddedVerdict,
+    classify_embedded,
+    density_candidates,
+    is_english,
+    measure_cue_density,
+)
+from video_cleaner.subtitles.resolve import MULTI_PART_PREFIX
 from video_cleaner.tools import ToolNotFound, Tools
 
 _log = logging.getLogger("video_cleaner.survey")
@@ -53,6 +70,8 @@ CSV_COLUMNS = (
     "est_saving_bytes",
     "parts",
     "movie_hash",
+    "english_subtitle",
+    "subtitle_status",
 )
 LIST_SEPARATOR = "; "
 # Placeholder until calibration: an encode is assumed to save half of the source size.
@@ -60,8 +79,34 @@ EST_SAVING_FRACTION = 0.5
 
 INCOMPATIBLE_PARTS_REASON = "multi-part parts have different stream layouts"
 
+# What the CSV says about a file's own English subtitles.
+EMBEDDED = "embedded"
+RECLASSIFIED = "reclassified"
+NONE_EMBEDDED = "none"
+UNCLEAR_EMBEDDED = "unclear"
+EMBEDDED_PROVIDER = "embedded"
+
 ProbeFn = Callable[[Path, Tools, Reporter], MediaInfo]
 HashFn = Callable[[Path], str | None]
+
+
+class DensityFn(Protocol):
+    """Cues per hour of one subtitle stream (`subtitles.embedded.measure_cue_density`)."""
+
+    def __call__(
+        self,
+        tools: Tools,
+        path: Path,
+        stream: SubtitleStream,
+        duration_s: float,
+        reporter: Reporter,
+        *,
+        max_bytes: int,
+        min_cues: int,
+    ) -> float: ...
+
+
+DEFAULT_DENSITY_FN: DensityFn = measure_cue_density
 
 
 class SurveyError(Exception):
@@ -80,6 +125,20 @@ class SurveyResult:
 
 
 @dataclass(frozen=True)
+class _Subtitles:
+    """What survey found out about one file's subtitles, and what it will store.
+
+    The default (nothing found) is for a file that gets no subtitle record.
+    """
+
+    english: str = ""  # the CSV's english_subtitle
+    needs_subs: bool = False  # a FOUND subtitle is waiting to be muxed in
+    unclear_reason: str = ""  # set: the file is flagged for this reason
+    store: SubtitleRecord | None = None  # written with `State.set_subtitle`
+    want_english_audio: bool | None = None  # not None: `State.ensure_wanted` with this flag
+
+
+@dataclass(frozen=True)
 class _Row:
     """One CSV line: a file, what was decided for it and why."""
 
@@ -92,6 +151,12 @@ class _Row:
     parts: tuple[Path, ...] = ()
     unrepresentable: bool = False
     movie_hash: str | None = None
+    subtitles: _Subtitles | None = None
+    # The CSV's subtitle_status, known once the subtitle record has been stored.
+    subtitle_status: str = ""
+
+
+Classify = Callable[[MediaInfo], _Subtitles]
 
 
 def discover_files(root: Path) -> list[Path]:
@@ -193,11 +258,134 @@ def _encode_saving(action: Action, size: int) -> int:
     return int(size * EST_SAVING_FRACTION) if action is Action.ENCODE else 0
 
 
+def _measure_densities(
+    info: MediaInfo,
+    settings: Settings,
+    tools: Tools,
+    reporter: Reporter,
+    density_fn: DensityFn,
+) -> dict[int, float]:
+    """Cues per hour of the forced English text tracks of *info*; nothing else is measured."""
+    densities: dict[int, float] = {}
+    for stream in density_candidates(info):
+        density = density_fn(
+            tools,
+            info.path,
+            stream,
+            info.duration_s,
+            reporter,
+            max_bytes=settings.subtitle_max_bytes,
+            min_cues=settings.subtitle_min_cues,
+        )
+        if not density > 0:
+            # Counts as a sparse forced track: the file is then looked up like one with no English.
+            _log.warning(
+                "%s: cue density could not be measured for subtitle stream %d",
+                info.path,
+                stream.index,
+            )
+        densities[stream.index] = density
+    return densities
+
+
+def _classify_subtitles(
+    info: MediaInfo,
+    settings: Settings,
+    tools: Tools,
+    reporter: Reporter,
+    density_fn: DensityFn,
+    state: State,
+) -> _Subtitles:
+    """Classify the subtitles *info* has; see `_Subtitles` for what comes back.
+
+    A file with no video stream gets nothing (no output can come from it, so no record, no
+    measuring). A file whose subtitle is already FOUND is not classified again: the record stays
+    as it is and the file is a remux candidate (the file is checked by the run, not here).
+    `ToolNotFound` from the density measurement aborts the survey.
+    """
+    if info.video is None:
+        return _Subtitles()
+    try:
+        existing = state.subtitle(info.path, info.size, info.mtime)
+    except UnrepresentablePath:
+        return _Subtitles()  # the file is flagged for its path; `_record` will say so
+    if existing is not None and existing.status is SubtitleStatus.FOUND and existing.cache_path:
+        return _Subtitles(english=NONE_EMBEDDED, needs_subs=True)
+
+    densities = _measure_densities(info, settings, tools, reporter, density_fn)
+    verdict = classify_embedded(info, densities, threshold=settings.forced_full_cues_per_hour)
+    english_audio = any(is_english(a.language) for a in info.audio)
+    if verdict.verdict is EmbeddedVerdict.HAS_ENGLISH:
+        record = SubtitleRecord(
+            info.path,
+            info.size,
+            info.mtime,
+            SubtitleStatus.NOT_NEEDED,
+            provider=EMBEDDED_PROVIDER,
+            english_audio=english_audio,
+            reason=verdict.reason,
+        )
+        english = RECLASSIFIED if verdict.reclassified else EMBEDDED
+        return _Subtitles(english=english, store=record)
+    if verdict.verdict is EmbeddedVerdict.UNCLEAR:
+        record = SubtitleRecord(
+            info.path,
+            info.size,
+            info.mtime,
+            SubtitleStatus.UNCLEAR,
+            english_audio=english_audio,
+            reason=verdict.reason,
+        )
+        return _Subtitles(english=UNCLEAR_EMBEDDED, unclear_reason=verdict.reason, store=record)
+    return _Subtitles(english=NONE_EMBEDDED, want_english_audio=english_audio)
+
+
+def _decide(
+    info: MediaInfo, settings: Settings, subtitles: _Subtitles, *, multipart: bool = False
+) -> Decision:
+    """`decide` plus the subtitle outcome: an unclear subtitle set flags the file."""
+    decision = decide(info, settings, needs_subs=subtitles.needs_subs, multipart=multipart)
+    if not subtitles.unclear_reason:
+        return decision
+    reasons = (
+        (*decision.reasons, subtitles.unclear_reason)
+        if decision.action is Action.FLAG
+        else (subtitles.unclear_reason,)
+    )
+    return Decision(Action.FLAG, reasons, encode=False, remux=False)
+
+
+def redecide_found(
+    info: MediaInfo, settings: Settings, state: State, *, movie_hash: str | None
+) -> Decision:
+    """Decide *info* again now that its subtitle is FOUND, and store the result like survey does.
+
+    The same decision a re-survey would reach (`_decide` with ``needs_subs``): a left-alone file
+    becomes a remux, a file flagged for HDR, Dolby Vision or interlacing becomes a remux that
+    keeps its video, an encode stays an encode. `State.upsert_file` applies it only to a record
+    that is still as survey left it (never to one a run has decided on). For a single file only:
+    a multi-part group keeps the decision made for it. The subtitle record is not touched.
+    """
+    decision = _decide(info, settings, _Subtitles(english=NONE_EMBEDDED, needs_subs=True))
+    row = _Row(
+        info.path,
+        info.size,
+        info,
+        decision.action,
+        decision.reasons,
+        _encode_saving(decision.action, info.size),
+        movie_hash=movie_hash,
+    )
+    _record(row, state)
+    return decision
+
+
 def _plan_group(
     group: PartGroup,
     infos: dict[Path, MediaInfo],
     hashes: dict[Path, str | None],
     settings: Settings,
+    classify: Classify,
 ) -> list[_Row]:
     probed = [infos[p] for p in group.parts if p in infos]
 
@@ -212,7 +400,9 @@ def _plan_group(
     first, *others = probed
     if not all(parts_compatible(first, other) for other in others):
         return flag_all(INCOMPATIBLE_PARTS_REASON)
-    decision = decide(first, settings, multipart=True)
+    # The first part stands for the group: its subtitle row is the one that counts.
+    subtitles = classify(first)
+    decision = _decide(first, settings, subtitles, multipart=True)
     group_size = sum(i.size for i in probed)
     rows = [
         _Row(
@@ -224,6 +414,7 @@ def _plan_group(
             _encode_saving(decision.action, group_size),
             group.parts,
             movie_hash=hashes.get(first.path),
+            subtitles=subtitles,
         )
     ]
     member = (f"part of group {group.output_name}",)
@@ -234,8 +425,60 @@ def _plan_group(
     return rows
 
 
+def _survey_unclear(existing: SubtitleRecord) -> bool:
+    """Whether *existing* is an UNCLEAR row survey wrote (a track with no language tag, English
+    only as closed captions), as opposed to the resolver's multi-part one."""
+    return existing.status is SubtitleStatus.UNCLEAR and not existing.reason.startswith(
+        MULTI_PART_PREFIX
+    )
+
+
+def _store_wanted(info: MediaInfo, state: State, *, english_audio: bool) -> SubtitleRecord:
+    """The WANTED record for *info*: a new one, or the stored one.
+
+    A stored NOT_NEEDED row, or UNCLEAR one that survey itself wrote, no longer matches what
+    the file's own tracks say (the threshold for a full forced track was calibrated, or a
+    track was retagged), so it is replaced by a fresh WANTED row; the drift is logged. A
+    WANTED, UNAVAILABLE or FOUND row, and the resolver's UNCLEAR one for a multi-part film, are
+    kept as they are (`State.ensure_wanted`).
+    """
+    existing = state.subtitle(info.path, info.size, info.mtime)
+    if existing is not None and (
+        existing.status is SubtitleStatus.NOT_NEEDED or _survey_unclear(existing)
+    ):
+        _log.info(
+            "%s: the subtitle was %s but the file's own tracks now need an English one; "
+            "looking it up again",
+            info.path.name,
+            existing.status.value,
+        )
+        wanted = SubtitleRecord(
+            info.path,
+            info.size,
+            info.mtime,
+            SubtitleStatus.WANTED,
+            english_audio=english_audio,
+        )
+        state.set_subtitle(wanted)
+        return wanted
+    return state.ensure_wanted(info.path, info.size, info.mtime, english_audio=english_audio)
+
+
+def _store_subtitles(subtitles: _Subtitles, info: MediaInfo, state: State) -> str:
+    """Write the subtitle record *subtitles* calls for; the status now stored, for the CSV."""
+    if subtitles.store is not None:
+        state.set_subtitle(subtitles.store)
+        stored = state.subtitle(info.path, info.size, info.mtime)
+        return (stored or subtitles.store).status.value  # a FOUND row is never replaced
+    if subtitles.want_english_audio is not None:
+        wanted = _store_wanted(info, state, english_audio=subtitles.want_english_audio)
+        return wanted.status.value
+    return SubtitleStatus.FOUND.value if subtitles.needs_subs else ""
+
+
 def _record(row: _Row, state: State) -> _Row:
-    """Store *row* in *state*; an unrepresentable path becomes a flag row instead."""
+    """Store *row* and its subtitle record in *state*; an unrepresentable path becomes a flag
+    row instead (and gets no subtitle record)."""
     if row.info is None:
         return row
     try:
@@ -258,7 +501,15 @@ def _record(row: _Row, state: State) -> _Row:
             unrepresentable=True,
             movie_hash=row.movie_hash,
         )
-    return row
+    if row.subtitles is None:
+        return row
+    status = _store_subtitles(row.subtitles, row.info, state)
+    subtitles = row.subtitles
+    if subtitles.store is not None and status != subtitles.store.status.value:
+        # The stored row differs from what the tracks say (a FOUND one was kept): the two CSV
+        # columns must not contradict each other.
+        subtitles = replace(subtitles, english=NONE_EMBEDDED)
+    return replace(row, subtitles=subtitles, subtitle_status=status)
 
 
 def _size_or_none(path: Path) -> int | None:
@@ -309,6 +560,8 @@ def _csv_line(row: _Row) -> list[str]:
         str(row.est_saving_bytes),
         LIST_SEPARATOR.join(str(p) for p in row.parts),
         _cell(row.movie_hash),
+        "" if row.subtitles is None else row.subtitles.english,
+        row.subtitle_status,
     ]
 
 
@@ -374,6 +627,7 @@ def run_survey(
     workers: int = 4,
     probe_fn: ProbeFn = probe,
     hash_fn: HashFn = movie_hash,
+    density_fn: DensityFn = DEFAULT_DENSITY_FN,
 ) -> SurveyResult:
     """Probe every video file under *root* (default ``settings.library_root``), read-only.
 
@@ -385,6 +639,11 @@ def run_survey(
     already upserted stay. Every probed file also gets its OpenSubtitles movie hash
     (`moviehash`, read-only, 128 KiB per file), stored on its record; a file whose hash cannot
     be computed is surveyed without one.
+
+    Subtitles: each file's own tracks are classified and its subtitle record written (see the
+    module docstring); only forced English text tracks are measured, with *density_fn*, here
+    and nowhere else. A multi-part group's record is the first part's. `ToolNotFound` from
+    *density_fn* aborts the survey like one from the probe.
     """
     if workers < 1:
         raise ValueError(f"workers must be at least 1, got {workers}")
@@ -397,21 +656,35 @@ def run_survey(
     _log.info("survey of %s: %d video files", root, len(paths))
     infos, failures, hashes = _probe_all(paths, tools, reporter, workers, probe_fn, hash_fn)
 
+    def classify(info: MediaInfo) -> _Subtitles:
+        return _classify_subtitles(info, settings, tools, reporter, density_fn, state)
+
     groups = tuple(find_part_groups(paths))
     rows: list[_Row] = []
     grouped: set[Path] = set()
     for group in groups:
         grouped.update(group.parts)
-        rows.extend(_record(r, state) for r in _plan_group(group, infos, hashes, settings))
+        planned = _plan_group(group, infos, hashes, settings, classify)
+        rows.extend(_record(r, state) for r in planned)
     for path in paths:
         if path in failures:
             reason = f"unprobeable: {failures[path]}"
             rows.append(_Row(path, _size_or_none(path), None, Action.FLAG, (reason,)))
         elif path not in grouped:
             info = infos[path]
-            d = decide(info, settings)
+            subtitles = classify(info)
+            d = _decide(info, settings, subtitles)
             saving = _encode_saving(d.action, info.size)
-            row = _Row(path, info.size, info, d.action, d.reasons, saving, movie_hash=hashes[path])
+            row = _Row(
+                path,
+                info.size,
+                info,
+                d.action,
+                d.reasons,
+                saving,
+                movie_hash=hashes[path],
+                subtitles=subtitles,
+            )
             rows.append(_record(row, state))
     rows.sort(key=lambda r: r.path)
 
