@@ -72,15 +72,143 @@ def test_index_lists_subtitle_files_with_their_parsed_names(tmp_path: Path) -> N
     assert (index[0].parsed.title, index[0].parsed.year) == ("Alien", 1979)
 
 
-def test_index_takes_only_text_subtitle_extensions_case_insensitively(tmp_path: Path) -> None:
+SRT = b"1\r\n00:00:01,000 --> 00:00:02,500\r\nHello there.\r\n"
+ASS = (
+    b"[Script Info]\n[V4+ Styles]\n[Events]\n"
+    b"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello there.\n"
+)
+VTT = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello there.\n"
+
+
+def put(path: Path, content: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_index_takes_text_subtitle_extensions_case_insensitively_without_reading_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     for name in ("a.2001.srt", "b.2002.ASS", "c.2003.ssa", "d.2004.vtt", "e.2005.SRT"):
-        write(tmp_path / name)
-    for name in ("f.2006.sub", "g.2007.idx", "h.2008.txt", "i.2009", "j.2010.mkv"):
-        write(tmp_path / name)
+        write(tmp_path / name)  # the content is judged later, by the resolver
+
+    def refuse(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("a file with a subtitle extension was read")
+
+    monkeypatch.setattr(local, "read_bytes_capped", refuse)
 
     index = index_local_folders([tmp_path], max_bytes=MB)
 
     assert names_of(index) == ["a.2001.srt", "b.2002.ASS", "c.2003.ssa", "d.2004.vtt", "e.2005.SRT"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Movie.2010.en.264-EVO",
+        "Movie (2010).en.AC3-EVO",
+        "Movie (2010).en.MX]",
+        "Movie (2010).en.The Movie - 4K Disc Eng",
+        "Movie (2010)",
+        "Movie.2010.txt",
+    ],
+)
+def test_index_takes_a_file_with_any_other_name_when_it_holds_a_subtitle(
+    tmp_path: Path, name: str
+) -> None:
+    put(tmp_path / name, SRT)
+
+    index = index_local_folders([tmp_path], max_bytes=MB)
+
+    assert match_local(index, TitleYear("Movie", 2010)) == LocalCandidate(tmp_path / name, 1.0)
+
+
+@pytest.mark.parametrize("content", [ASS, VTT, b"\xef\xbb\xbf" + SRT])
+def test_index_recognises_each_format_by_content(tmp_path: Path, content: bytes) -> None:
+    put(tmp_path / "Movie (2010).en.DTS-GRP", content)
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == ["Movie (2010).en.DTS-GRP"]
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("Movie.2010.sub", b"{1}{25}Hello there."),
+        ("Movie.2010.nfo", b"Movie (2010), a film. Enjoy."),
+        ("Movie.2010.jpg", bytes(range(256)) * 4),
+        ("Movie.2010.html", b"<html><body>00:00:01,000 --> 00:00:02,000</body></html>"),
+        ("Movie.2010", b"x" * 10),
+    ],
+)
+def test_index_skips_a_file_with_another_name_that_holds_no_subtitle(
+    tmp_path: Path, name: str, content: bytes
+) -> None:
+    put(tmp_path / name, content)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_other_files_beside_a_subtitle_do_not_make_it_ambiguous(tmp_path: Path) -> None:
+    put(tmp_path / "Movie (2010).nfo", b"Movie (2010), a film. Enjoy.")
+    put(tmp_path / "Movie (2010).en.264-EVO", SRT)
+
+    result = match_local(index_local_folders([tmp_path], max_bytes=MB), TitleYear("Movie", 2010))
+
+    assert result == LocalCandidate(tmp_path / "Movie (2010).en.264-EVO", 1.0)
+
+
+@pytest.mark.parametrize("name", ["Show.S01E08.en.264-EVO", "Movie.2010.fr.264-EVO"])
+def test_index_filters_a_file_with_another_name_by_its_name_too(tmp_path: Path, name: str) -> None:
+    put(tmp_path / name, SRT)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_index_never_reads_a_file_over_the_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path / "Movie (2010).mkv", size=2 * MB)
+
+    def refuse(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("an oversized file was read")
+
+    monkeypatch.setattr(local, "read_bytes_capped", refuse)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_index_reads_another_name_only_as_the_regular_file_it_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put(tmp_path / "Movie (2010).en.264-EVO", SRT)
+    calls: list[tuple[int, bool]] = []
+
+    def swapped(path: Path, max_bytes: int, *, regular_only: bool = False) -> bytes:
+        calls.append((max_bytes, regular_only))
+        raise OSError("not the regular file the path names")
+
+    monkeypatch.setattr(local, "read_bytes_capped", swapped)
+    write(tmp_path / "Other (2011).srt")
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == ["Other (2011).srt"]
+    assert calls == [(MB, True)]
+
+
+def test_index_stops_reading_other_names_at_the_cap_with_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for number in range(4):
+        put(tmp_path / f"Movie{number} (2010).en.264-EVO", SRT)
+    put(tmp_path / "Plain (2011).srt", SRT)
+    monkeypatch.setattr(local, "MAX_FILES_READ", 2)
+    caplog.set_level(logging.WARNING, logger="video_cleaner.subtitles.local")
+
+    index = index_local_folders([tmp_path], max_bytes=MB)
+
+    assert len(index) == 3  # two of the others, and the one that needs no reading
+    assert tmp_path / "Plain (2011).srt" in [item.path for item in index]
+    assert sum("opened 2 files" in record.getMessage() for record in caplog.records) == 1
 
 
 def test_index_skips_a_file_over_the_size_limit_and_keeps_one_at_the_limit(

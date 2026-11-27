@@ -263,19 +263,26 @@ local_subtitle_dirs = ['D:\subs', 'E:\more\subs']
 ```
 
 `subs resolve` indexes them each time and prints how many files it found. They are searched to
-8 folder levels (at most 100,000 entries), links and junctions found while listing are skipped
-(and a file that turns into a link before it is read is refused), and only `.srt`,
-`.ass`, `.ssa` and `.vtt` files are looked at. The subtitle is matched by name: the library file's
-name is read as `Title (2010)` (the folder's name fills in a missing year when its title is the
-same, or gives the whole title and year of a generic name such as `movie.mkv`), and the subtitle's name is read the way a release name is, so
-`Title (2010).srt` and `Title.2010.1080p.BluRay.en.srt` both count. A subtitle matches when its
-year is the same and its title is near-identical, when the years differ by one and the title is
-closer still, or, when either side has no year, when the title is near-exact. A match counts only
-if it is clearly the best one; two similar candidates are ambiguous and both ignored (so are two
-copies of the same film's subtitle in different folders). Ignored as well: names that read as TV
-episodes or give no title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`,
-`en.fr`), empty files, files above `subtitle_max_bytes`, links and anything that is not a regular
-file. A name with no language tag is kept; its text is checked for English like any other.
+8 folder levels (at most 100,000 entries), and links and junctions found while listing are skipped
+(and a file that turns into a link before it is read is refused). A `.srt`, `.ass`, `.ssa` or
+`.vtt` file is listed by its name. Downloaded subtitles often lose their extension to a release
+tag (`Title (2010).en.264-GRP`), so a file with any other name is opened and listed if its content
+is a subtitle in one of those formats (at most 2,000 such files are opened; a warning says when
+there were more).
+
+The subtitle is matched by name, and a library file's name and a subtitle's name are read the same
+way. With the year in brackets, the title is everything before it, as written
+(`Title - Second Part (2010)`; a leading site or picture-size tag such as `[1080p]` is dropped).
+Any other name is read as a release name (`Title.2010.1080p.BluRay.en`). For a library file, the
+folder's name also fills in a missing year when its title is the same, or gives the whole title and
+year of a generic name such as `movie.mkv`. A subtitle matches when its year is the same and its
+title is near-identical, when the years differ by one and the title is closer still, or, when
+either side has no year, when the title is near-exact. A match counts only if it is clearly the
+best one; two similar candidates are ambiguous and both ignored (so are two copies of the same
+film's subtitle in different folders). Ignored as well: names that read as TV episodes or give no
+title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`, `en.fr`), empty
+files, files above `subtitle_max_bytes`, links and anything that is not a regular file. A name
+with no language tag is kept; its text is checked for English like any other.
 
 ### Statuses
 
