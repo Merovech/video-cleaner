@@ -33,9 +33,15 @@ _MAX_YEAR = 2100
 # A name that writes its year in brackets, "Title (2010)": the title is everything before the
 # year, as written, and what follows the closing bracket is not part of it.
 _TITLE_YEAR_NAME = re.compile(r"(?P<title>.*?)\s*\((?P<year>(?:18|19|20)[0-9]{2})\)", re.DOTALL)
-# A leading "[...]" that is a site ("[YTS.MX]") or a picture size ("[1080p]"), not the title.
-# A bracket without either can be the film's name ("[REC]").
-_LEADING_TAG = re.compile(r"\s*\[[^\[\]]{0,64}(?:\.[A-Za-z]{2,6}|[0-9]{3,4}[pi])\]\s*")
+# A leading tag that is not the title: a "[...]" naming a site ("[YTS.MX]") or a picture size
+# ("[1080p BluRay]", "[4K]"), or "www.site.com -". A bracket without either can be the film's
+# name ("[REC]"). Every repeat is bounded.
+_LEADING_TAG = re.compile(
+    r"\s*(?:\[[^\[\]]{0,64}?"
+    r"(?:\.[a-z]{2,6}|(?:[0-9]{3,4}[pi]|(?<![a-z0-9])4k)[^\[\]]{0,32})\]"
+    r"|www\.\S{1,64}\s+-)\s*",
+    re.IGNORECASE,
+)
 # What a short extension looks like; "Dr. Mabuse the Gambler" has a dot but no extension.
 _EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,5}")
 # File names that say nothing about the film, so the folder's name is used instead.

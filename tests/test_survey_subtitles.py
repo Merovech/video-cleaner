@@ -911,3 +911,25 @@ def test_redecide_found_leaves_a_record_a_run_has_decided_on(tmp_path: Path) -> 
         )
     finally:
         state.close()
+
+
+@pytest.mark.parametrize(
+    ("cues_per_hour", "status"),
+    [(186.0, SubtitleStatus.NOT_NEEDED), (92.0, SubtitleStatus.WANTED)],
+)
+def test_the_default_threshold_tells_intertitles_from_signs(
+    tmp_path: Path, cues_per_hour: float, status: SubtitleStatus
+) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Silent.mkv")
+
+    _result, state = _survey(
+        settings,
+        {"Silent.mkv": lambda p: _with(p, _sub(3, forced=True))},
+        FakeDensity({3: cues_per_hour}),
+    )
+    try:
+        sub = _sub_row(state, film)
+        assert sub is not None and sub.status is status
+    finally:
+        state.close()

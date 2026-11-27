@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -37,6 +38,30 @@ MAX_ENTRIES_EXAMINED = 100_000
 MAX_DEPTH = 8
 # Most files with another name that are opened to see whether they hold a subtitle.
 MAX_FILES_READ = 2_000
+
+# Endings of unfinished downloads and backups: such a file may hold only part of a subtitle,
+# or repeat one that is there.
+_LEFTOVER_ENDINGS = (
+    ".part",
+    ".partial",
+    ".crdownload",
+    ".download",
+    ".!ut",
+    ".tmp",
+    ".bak",
+    ".old",
+    ".orig",
+    ".disabled",
+    "~",
+)
+# Endings of files that are never text subtitles, so not worth opening.
+_NEVER_SUBTITLE_ENDINGS = (".nfo", ".jpg", ".jpeg", ".png", ".gif", ".idx", ".zip", ".rar", ".7z")
+# A subtitle's name with a copy mark after it: "Film.srt.1", "Film.srt.txt", "Film.srt (1)".
+# Only at the very end, so a title that spells an extension ("The.Smart.Ass.2010") is not one.
+_COPY_NAME = re.compile(
+    r"\.(?:srt|ass|ssa|vtt)"
+    r"(?:\.(?:[0-9]{1,3}|txt|bk|save|backup)| ?\([0-9]{1,3}\)| - copy(?: \([0-9]{1,3}\))?)\Z"
+)
 
 # A title must be at least this similar to match when both years agree...
 SIMILARITY_SAME_YEAR = 0.90
@@ -109,6 +134,14 @@ def _walk(roots: Sequence[str]) -> Iterator[os.DirEntry[str]]:
             _log.warning("cannot list %r: %s", directory, err)
 
 
+def _worth_opening(name: str) -> bool:
+    """Whether a file without a subtitle extension could be a whole subtitle, by its name."""
+    lowered = name.lower()
+    return not (
+        lowered.endswith(_LEFTOVER_ENDINGS + _NEVER_SUBTITLE_ENDINGS) or _COPY_NAME.search(lowered)
+    )
+
+
 def _holds_subtitle(path: Path, max_bytes: int) -> bool:
     """Whether the content of *path* reads as a text subtitle. A file that cannot be read, or
     that is no longer the regular file that was listed, does not."""
@@ -127,7 +160,10 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
     """Index the text subtitle files under *dirs*, parsed by their release names.
 
     A file with a subtitle extension is taken on its name; any other file only if its content
-    is a subtitle, and at most `MAX_FILES_READ` of those are opened (a warning says so).
+    is a subtitle. Unfinished downloads, backups and copies (`_worth_opening`) are never taken
+    that way. When more than `MAX_FILES_READ` such files would have to be opened, none of them
+    is used (and a warning says so): judged on part of the list, one film's subtitle could go
+    to its neighbour.
 
     Skipped without error: anything that is not a regular file, empty files, files over
     *max_bytes*, entries that cannot be read or listed, symlinks and junctions, names that parse
@@ -139,10 +175,13 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
         root = os.path.abspath(folder)
         roots.setdefault(os.path.normcase(root), root)
     found: dict[str, LocalSubtitle] = {}
+    by_content: set[str] = set()  # the keys of `found` that were taken for what they hold
     files_read = 0
-    capped = False
+    too_many = False
     for entry in _walk(list(roots.values())):
         extension = _subtitle_extension(entry.name)
+        if extension is None and (too_many or not _worth_opening(entry.name)):
+            continue
         try:
             size = entry.stat(follow_symlinks=False).st_size
         except OSError:
@@ -150,13 +189,6 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
             continue
         if not 0 < size <= max_bytes:
             continue
-        if extension is None:
-            if files_read >= MAX_FILES_READ:
-                capped = True
-                continue
-            files_read += 1
-            if not _holds_subtitle(Path(entry.path), max_bytes):
-                continue
         # A mangled "extension" stays: `parse_release_name` reads the whole name.
         stem = entry.name if extension is None else entry.name[: -len(extension)]
         parsed = parse_release_name(stem)
@@ -167,11 +199,25 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
         # content language is not known here, the resolver checks the content.
         if parsed.non_english:
             continue
-        found.setdefault(os.path.normcase(entry.path), LocalSubtitle(Path(entry.path), parsed))
-    if capped:
+        key = os.path.normcase(entry.path)
+        # Opened last, so that only a file the name leaves usable counts toward the cap.
+        if extension is None:
+            if files_read >= MAX_FILES_READ:
+                too_many = True
+                continue
+            files_read += 1
+            if not _holds_subtitle(Path(entry.path), max_bytes):
+                continue
+            by_content.add(key)
+        found.setdefault(key, LocalSubtitle(Path(entry.path), parsed))
+    if too_many:
         _log.warning(
-            "opened %d files without a subtitle extension; the rest were not looked at", files_read
+            "more than %d files without a subtitle extension: none of them is used "
+            "(point local_subtitle_dirs at folders that hold only subtitles)",
+            MAX_FILES_READ,
         )
+        for key in by_content:
+            del found[key]
     return sorted(found.values(), key=lambda item: str(item.path))
 
 

@@ -601,3 +601,10 @@ def test_library_names_keep_a_decimal_or_fractional_number() -> None:
         (half, "The Naked Gun"),
     ):
         assert title_similarity(parsed.title, original) <= 0.5
+
+
+def test_a_library_name_without_a_year_keeps_the_text_after_a_dash() -> None:
+    # This is also the title the OpenSubtitles title search sends.
+    parsed = parse_library_name(Path("Harbour - Tidal Wake.mkv"))
+
+    assert (parsed.title, parsed.year) == ("Harbour Tidal Wake", None)

@@ -267,12 +267,17 @@ local_subtitle_dirs = ['D:\subs', 'E:\more\subs']
 (and a file that turns into a link before it is read is refused). A `.srt`, `.ass`, `.ssa` or
 `.vtt` file is listed by its name. Downloaded subtitles often lose their extension to a release
 tag (`Title (2010).en.264-GRP`), so a file with any other name is opened and listed if its content
-is a subtitle in one of those formats (at most 2,000 such files are opened; a warning says when
-there were more).
+is a subtitle in one of those formats. Never listed that way: unfinished downloads and backups
+(ending `.part`, `.partial`, `.crdownload`, `.download`, `.!ut`, `.tmp`, `.bak`, `.old`, `.orig`,
+`.disabled` or `~`), copies (`Title.srt.1`, `Title.srt.txt`, `Title.srt (1)`), pictures, archives,
+`.nfo` and `.idx` files. If more than 2,000 files would have to be opened, none of them is used (a
+warning says so), so point `local_subtitle_dirs` at folders that hold subtitles.
 
 The subtitle is matched by name, and a library file's name and a subtitle's name are read the same
 way. With the year in brackets, the title is everything before it, as written
-(`Title - Second Part (2010)`; a leading site or picture-size tag such as `[1080p]` is dropped).
+(`Title - Second Part (2010)`; a leading site or picture-size tag such as `[1080p]` or
+`www.site.com -` is dropped). An edition written before the year (`Title - Director's Cut (2010)`)
+is therefore part of the title, and that subtitle does not match the plain `Title (2010)`.
 Any other name is read as a release name (`Title.2010.1080p.BluRay.en`). For a library file, the
 folder's name also fills in a missing year when its title is the same, or gives the whole title and
 year of a generic name such as `movie.mkv`. A subtitle matches when its year is the same and its
@@ -477,7 +482,7 @@ and has the default shown.
 | `log_file_level` | `DEBUG` | Level of the run log file (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 | `subtitle_cache_dir` | `%LOCALAPPDATA%\video-cleaner\subtitles` | Local folder for the subtitles found for your files (see [The cache](#the-cache)). Refused (like every other output) when it is inside `library_root` or contains it. |
 | `local_subtitle_dirs` | `[]` | Folders searched for subtitles you already have (see [Where subtitles come from](#where-subtitles-come-from)): a TOML array of absolute paths (`['D:\subs', 'E:\more']`), or in `VC_LOCAL_SUBTITLE_DIRS` several paths separated by `;` on Windows. |
-| `forced_full_cues_per_hour` | `150.0` | Cues per hour of video at or above which an English text track marked forced counts as a full subtitle rather than forced-only (more than 0). |
+| `forced_full_cues_per_hour` | `150.0` | Cues per hour of video at or above which an English text track marked forced counts as a full subtitle rather than forced-only (more than 0). Tune it if your library has forced tracks with long foreign-language stretches. |
 | `align_max_offset_s` | `120.0` | Largest shift in seconds the alignment may apply to a subtitle; an alignment that lands on this limit (within 0.05 s) is rejected as a cut-off search. |
 | `align_scale_tolerance` | `0.05` | Largest frame-rate change the alignment may apply (the scale factor may differ from 1 by this fraction, `0` to below `1`). |
 | `align_min_score` | `0.0` | Lowest alignment score accepted (not negative). `0` sets no minimum, but a score of zero or less is always refused. A starting value; raise it after reviewing the scores in the first run logs. |
