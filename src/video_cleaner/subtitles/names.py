@@ -39,7 +39,7 @@ _TITLE_YEAR_NAME = re.compile(r"(?P<title>.*?)\s*\((?P<year>(?:18|19|20)[0-9]{2}
 _LEADING_TAG = re.compile(
     r"\s*(?:\[[^\[\]]{0,64}?"
     r"(?:\.[a-z]{2,6}|(?:[0-9]{3,4}[pi]|(?<![a-z0-9])4k)[^\[\]]{0,32})\]"
-    r"|www\.\S{1,64}\s+-)\s*",
+    r"|www\.(?:[a-z0-9-]{1,63}\.){1,2}[a-z]{2,6}\s+-)\s*",
     re.IGNORECASE,
 )
 # What a short extension looks like; "Dr. Mabuse the Gambler" has a dot but no extension.

@@ -268,10 +268,11 @@ local_subtitle_dirs = ['D:\subs', 'E:\more\subs']
 `.vtt` file is listed by its name. Downloaded subtitles often lose their extension to a release
 tag (`Title (2010).en.264-GRP`), so a file with any other name is opened and listed if its content
 is a subtitle in one of those formats. Never listed that way: unfinished downloads and backups
-(ending `.part`, `.partial`, `.crdownload`, `.download`, `.!ut`, `.tmp`, `.bak`, `.old`, `.orig`,
-`.disabled` or `~`), copies (`Title.srt.1`, `Title.srt.txt`, `Title.srt (1)`), pictures, archives,
-`.nfo` and `.idx` files. If more than 2,000 files would have to be opened, none of them is used (a
-warning says so), so point `local_subtitle_dirs` at folders that hold subtitles.
+(ending `.part`, `.partial`, `.crdownload`, `.download`, `.!ut`, `.!qB`, `.tmp`, `.bak`, `.old`,
+`.orig`, `.disabled` or `~`), copies (`Title.srt.1`, `Title.srt.txt`, `Title.srt (1)`), and files
+ending `.nfo`, `.idx`, `.jpg`, `.jpeg`, `.png`, `.gif`, `.zip`, `.rar` or `.7z`. If more than 2,000
+files would have to be opened, no local subtitle is used in that run (a warning says so), so point
+`local_subtitle_dirs` at folders that hold subtitles.
 
 The subtitle is matched by name, and a library file's name and a subtitle's name are read the same
 way. With the year in brackets, the title is everything before it, as written

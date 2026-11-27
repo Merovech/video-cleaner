@@ -52,6 +52,7 @@ _LEFTOVER_ENDINGS = (
     ".old",
     ".orig",
     ".disabled",
+    ".!qb",
     "~",
 )
 # Endings of files that are never text subtitles, so not worth opening.
@@ -161,9 +162,9 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
 
     A file with a subtitle extension is taken on its name; any other file only if its content
     is a subtitle. Unfinished downloads, backups and copies (`_worth_opening`) are never taken
-    that way. When more than `MAX_FILES_READ` such files would have to be opened, none of them
-    is used (and a warning says so): judged on part of the list, one film's subtitle could go
-    to its neighbour.
+    that way. When more than `MAX_FILES_READ` such files would have to be opened, the result is
+    empty (and a warning says so): judged on part of the list, one film's subtitle could go to
+    its neighbour.
 
     Skipped without error: anything that is not a regular file, empty files, files over
     *max_bytes*, entries that cannot be read or listed, symlinks and junctions, names that parse
@@ -175,12 +176,10 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
         root = os.path.abspath(folder)
         roots.setdefault(os.path.normcase(root), root)
     found: dict[str, LocalSubtitle] = {}
-    by_content: set[str] = set()  # the keys of `found` that were taken for what they hold
     files_read = 0
-    too_many = False
     for entry in _walk(list(roots.values())):
         extension = _subtitle_extension(entry.name)
-        if extension is None and (too_many or not _worth_opening(entry.name)):
+        if extension is None and not _worth_opening(entry.name):
             continue
         try:
             size = entry.stat(follow_symlinks=False).st_size
@@ -203,21 +202,16 @@ def index_local_folders(dirs: Sequence[Path], *, max_bytes: int) -> list[LocalSu
         # Opened last, so that only a file the name leaves usable counts toward the cap.
         if extension is None:
             if files_read >= MAX_FILES_READ:
-                too_many = True
-                continue
+                _log.warning(
+                    "more than %d files without a subtitle extension: no local subtitle is "
+                    "used (point local_subtitle_dirs at folders that hold only subtitles)",
+                    MAX_FILES_READ,
+                )
+                return []
             files_read += 1
             if not _holds_subtitle(Path(entry.path), max_bytes):
                 continue
-            by_content.add(key)
         found.setdefault(key, LocalSubtitle(Path(entry.path), parsed))
-    if too_many:
-        _log.warning(
-            "more than %d files without a subtitle extension: none of them is used "
-            "(point local_subtitle_dirs at folders that hold only subtitles)",
-            MAX_FILES_READ,
-        )
-        for key in by_content:
-            del found[key]
     return sorted(found.values(), key=lambda item: str(item.path))
 
 

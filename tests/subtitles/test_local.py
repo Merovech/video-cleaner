@@ -195,20 +195,18 @@ def test_index_reads_another_name_only_as_the_regular_file_it_listed(
     assert calls == [(MB, True)]
 
 
-def test_index_uses_no_other_names_when_there_are_too_many_to_open(
+def test_index_uses_no_local_file_at_all_when_there_are_too_many_to_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # With part of the list missing, the film of one year could take the subtitle of the next.
-    put(tmp_path / "Harbour (2010).en.x264-GRP", SRT)
+    # With any part of the list missing, a neighbouring year's file could win: here the 2010
+    # file, listed by name, would be given to the 2011 film once the 2011 file is dropped.
+    put(tmp_path / "Harbour (2010).en.srt", SRT)
     put(tmp_path / "Harbour (2011).en.x264-GRP", SRT)
-    put(tmp_path / "Plain (2012).srt", SRT)
+    put(tmp_path / "Plain (2012).en.x264-GRP", SRT)
     monkeypatch.setattr(local, "MAX_FILES_READ", 1)
     caplog.set_level(logging.WARNING, logger="video_cleaner.subtitles.local")
 
-    index = index_local_folders([tmp_path], max_bytes=MB)
-
-    assert names_of(index) == ["Plain (2012).srt"]
-    assert match_local(index, TitleYear("Harbour", 2011)) is None
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
     assert sum("more than 1 files" in record.getMessage() for record in caplog.records) == 1
 
 
@@ -257,6 +255,7 @@ def test_files_that_cannot_be_used_do_not_count_toward_the_cap(
         "Movie (2010).en.srt~",
         "Movie (2010).en.264-GRP.part",
         "Movie (2010).en.264-GRP.!ut",
+        "Movie (2010).en.srt.!qB",
         "Movie (2010).partial",
         "Movie (2010).tmp",
         "Movie (2010).download",
@@ -1006,6 +1005,7 @@ def test_a_subtitle_named_like_its_film_matches_it(stem: str) -> None:
         ("[4K] Harbour (2010)", "Harbour (2010).mkv"),
         ("[1080p BluRay] Harbour (2010)", "Harbour (2010).mkv"),
         ("www.site.com - Harbour (2010).en", "Harbour (2010).mkv"),
+        ("www.site.co.uk - Harbour (2010)", "Harbour (2010).mkv"),
         ("Harbour (2010) - English", "Harbour (2010).mkv"),
     ],
 )
@@ -1029,6 +1029,8 @@ def test_text_after_a_dash_and_site_tags_do_not_hide_the_right_film(
         # Another cut of a film has other timings and lines: its subtitle is not the film's.
         ("Harbour - Director's Cut (1979).en", "Harbour (1979).mkv"),
         ("Harbour (Extended Edition) (2002).en", "Harbour (2002).mkv"),
+        # "www." followed by words is a title, not a site to drop.
+        ("www.What.A.Wonderful.World - Part 2 (2006)", "Part 2 (2006).mkv"),
     ],
 )
 def test_a_sequels_subtitle_never_matches_the_shorter_titled_film(
