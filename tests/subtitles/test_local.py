@@ -750,3 +750,64 @@ def test_legitimate_releases_with_numbers_still_match_their_own_library_name(
 
     assert result is not None
     assert result.path == Path("subs") / f"{release}.srt"
+
+
+@pytest.mark.parametrize(
+    "stem",
+    [
+        "Harbour - Tidal Wake (2013)",
+        "Harbour - Part III - The Long Night - Ends (2014)",
+        "Harbour - Tidal Wake (Extended Edition) (2002)",
+        "Harbour - Director's Cut (2001)",
+        "Harbour Special Edition (1989)",
+        "Silver Ultra (2015)",
+        "VHS 94 (2021)",
+        "12-12-12 (2011)",
+        "[REC] (2007)",
+        "[REC] 2 (2009)",
+    ],
+)
+def test_a_subtitle_named_like_its_film_matches_it(stem: str) -> None:
+    result = match_local([subtitle(f"{stem}.en")], parse_library_name(Path(f"{stem}.mkv")))
+
+    assert result is not None
+    assert result.path == Path("subs") / f"{stem}.en.srt"
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Harbour - Tidal Wake.en", "Harbour - Tidal Wake (2018).avi"),
+        ("Harbour - Tidal Wake 2013", "Harbour - Tidal Wake (2013).mkv"),
+        ("Harbour.-.Tidal.Wake.2013.1080p.BluRay.x264-GRP", "Harbour - Tidal Wake (2013).mkv"),
+        ("Harbour - Tidal Wake.en", "Harbour - Tidal Wake.mkv"),
+        ("[YTS.MX] Harbour (2010).en", "Harbour (2010).mkv"),
+        ("[1080p] Harbour (2010)", "Harbour (2010).mkv"),
+        ("Harbour (2010) - English", "Harbour (2010).mkv"),
+    ],
+)
+def test_text_after_a_dash_and_site_tags_do_not_hide_the_right_film(
+    release: str, library: str
+) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is not None
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Harbour - Tidal Wake (2013).en", "Harbour (2012).mkv"),
+        ("Harbour - For Good (2025).en", "Harbour (2024).mkv"),
+        ("Harbour - Tidal Wake 2013", "Harbour (2012).mkv"),
+        ("Harbour.-.Tidal.Wake.2013.1080p.BluRay.x264-GRP", "Harbour (2012).mkv"),
+        ("Harbour - Tidal Wake.en", "Harbour.mkv"),
+        ("Harbour.en", "Harbour - Tidal Wake.mkv"),
+    ],
+)
+def test_a_sequels_subtitle_never_matches_the_shorter_titled_film(
+    release: str, library: str
+) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is None
