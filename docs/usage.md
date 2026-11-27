@@ -280,8 +280,8 @@ title is near-identical, when the years differ by one and the title is closer st
 either side has no year, when the title is near-exact. A match counts only if it is clearly the
 best one; two similar candidates are ambiguous and both ignored (so are two copies of the same
 film's subtitle in different folders). Ignored as well: names that read as TV episodes or give no
-title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`, `en.fr`), empty
-files, files above `subtitle_max_bytes`, links and anything that is not a regular file. A name
+title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`, `en.fr`; a `hi` tag
+means hearing impaired, not Hindi), empty files, files above `subtitle_max_bytes`, links and anything that is not a regular file. A name
 with no language tag is kept; its text is checked for English like any other.
 
 ### Statuses

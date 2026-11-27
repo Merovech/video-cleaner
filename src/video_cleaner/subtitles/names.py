@@ -69,9 +69,10 @@ _YEAR_AT_END = re.compile(r"\((?:18|19|20)[0-9]{2}\)\s*\Z")
 _NUMBER_MISMATCH_CAP = 0.5
 _LATIN_LIMIT = 0x250  # end of Latin Extended-B: accents are stripped from these letters only
 _ENGLISH_CODES = frozenset({"en", "eng"})
-# guessit reads the bare token "hi", the usual tag for hearing-impaired subtitles (Bazarr,
-# Subliminal, Jellyfin), as Hindi.
-_HEARING_IMPAIRED_CODE = "hi"
+# The usual tag for hearing-impaired subtitles (release names, Bazarr, Subliminal, Jellyfin),
+# which guessit reads as Hindi.
+_HEARING_IMPAIRED_TAG = "hi"
+_TAG_SEPARATORS = " ._-()[]"
 # guessit reports the language of a name as "language" and, for "VOSTFR"-style tags, as
 # "subtitle_language".
 _LANGUAGE_KEYS = ("language", "subtitle_language")
@@ -187,18 +188,19 @@ def _alternative_titles(guess: dict[str, list[Any]], length: int) -> list[str]:
 def _language_codes(guess: dict[str, list[Any]]) -> tuple[str, ...]:
     """The languages guessit found in the name, as lower-case codes, in name order.
 
-    A "hi" code beside an English one is the hearing-impaired flag, not Hindi, and is dropped.
-    Without an English tag it stays: a bare ".hi" is ambiguous, so the file counts as non-English.
+    The tag "hi" is the hearing-impaired flag, not Hindi, and is not a language. Hindi written
+    any other way ("hin", "Hindi") is one. A subtitle's text is checked for English whatever
+    its name says, so a Hindi file tagged "hi" is still refused.
     """
     found = [match for key in _LANGUAGE_KEYS for match in guess.get(key, [])]
     found.sort(key=lambda match: match.span)
     codes: list[str] = []
     for match in found:
+        if str(match.raw).strip(_TAG_SEPARATORS).lower() == _HEARING_IMPAIRED_TAG:
+            continue
         code = str(match.value).strip().lower()
         if code and code not in codes:
             codes.append(code)
-    if _HEARING_IMPAIRED_CODE in codes and any(_primary_subtag(c) in _ENGLISH_CODES for c in codes):
-        codes.remove(_HEARING_IMPAIRED_CODE)
     return tuple(codes)
 
 

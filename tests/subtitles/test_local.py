@@ -280,6 +280,8 @@ HEARING_IMPAIRED_NAMES = [
     "Movie.2010.eng.hi.srt",
     "Movie.2010.English.HI.srt",
     "Movie.2010.hi.en.srt",
+    "Movie.2010.HI.srt",
+    "Movie.2010.1080p.WEB-DL.H.264-GRP-HI.srt",
 ]
 
 
@@ -299,8 +301,8 @@ def test_index_keeps_a_hearing_impaired_english_file_at_the_plain_names_confiden
     assert hearing_impaired.confidence == baseline.confidence
 
 
-@pytest.mark.parametrize("name", ["Movie.2010.HI.srt", "Movie.2010.en.fr.srt"])
-def test_index_skips_a_bare_hi_file_and_an_english_plus_other_language_file(
+@pytest.mark.parametrize("name", ["Movie.2010.Hindi.srt", "Movie.2010.en.fr.srt"])
+def test_index_skips_a_hindi_file_and_an_english_plus_other_language_file(
     tmp_path: Path, name: str
 ) -> None:
     write(tmp_path / name)
