@@ -74,7 +74,9 @@ class Settings:
     plain_progress_s: float = 30.0
     log_file_level: str = "DEBUG"
     local_subtitle_dirs: tuple[Path, ...] = ()
-    forced_full_cues_per_hour: float = 250.0  # placeholder, calibrated against the real library
+    # Measured on real films: tracks of signs and foreign dialogue stay under about 100 cues per
+    # hour, a silent film's intertitles reach about 185, spoken dialogue 300 and more.
+    forced_full_cues_per_hour: float = 150.0
     align_max_offset_s: float = 120.0
     align_scale_tolerance: float = 0.05
     align_min_score: float = 0.0  # 0: no minimum (a score of zero or less is always refused)

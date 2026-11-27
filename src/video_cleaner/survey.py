@@ -275,7 +275,9 @@ def _measure_densities(
             info.duration_s,
             reporter,
             max_bytes=settings.subtitle_max_bytes,
-            min_cues=settings.subtitle_min_cues,
+            # A track of a few signs is a real, low density. `subtitle_min_cues` judges
+            # subtitles to be added, not the file's own tracks.
+            min_cues=1,
         )
         if not density > 0:
             # Counts as a sparse forced track: the file is then looked up like one with no English.

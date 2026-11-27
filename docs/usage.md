@@ -428,10 +428,12 @@ until one of those two commands has noticed.
 - English only: the language checks, the matching of embedded tracks and the alignment assume
   English (see `subtitle_language`).
 - The alignment listens to the video's first audio track.
-- `align_min_score` (default `0`, so only a score of zero or less is refused) and
-  `forced_full_cues_per_hour` (default `250`) are starting values. Tune them against your own
-  library: the run log (at its default `DEBUG` level) has the offset, frame-rate scale and score of
-  every alignment and the reason for every rejection.
+- `align_min_score` (default `0`, so only a score of zero or less is refused) is a starting value.
+  Tune it against your own library: the run log (at its default `DEBUG` level) has the offset,
+  frame-rate scale and score of every alignment and the reason for every rejection.
+  `forced_full_cues_per_hour` (default `150`) comes from measurements of one library: forced
+  tracks of signs and foreign dialogue stayed under about 100 cues per hour, a silent film's
+  intertitles reached about 185, and spoken dialogue 300 or more.
 - A hash-exact OpenSubtitles match is not aligned, since the service says it was made for this
   file; the length check still applies to it.
 - A download that was counted but whose link fetch still fails after its retries is not tried
@@ -475,7 +477,7 @@ and has the default shown.
 | `log_file_level` | `DEBUG` | Level of the run log file (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 | `subtitle_cache_dir` | `%LOCALAPPDATA%\video-cleaner\subtitles` | Local folder for the subtitles found for your files (see [The cache](#the-cache)). Refused (like every other output) when it is inside `library_root` or contains it. |
 | `local_subtitle_dirs` | `[]` | Folders searched for subtitles you already have (see [Where subtitles come from](#where-subtitles-come-from)): a TOML array of absolute paths (`['D:\subs', 'E:\more']`), or in `VC_LOCAL_SUBTITLE_DIRS` several paths separated by `;` on Windows. |
-| `forced_full_cues_per_hour` | `250.0` | Cues per hour of video at or above which an English text track marked forced counts as a full subtitle rather than forced-only (more than 0). A starting value to tune against your library. |
+| `forced_full_cues_per_hour` | `150.0` | Cues per hour of video at or above which an English text track marked forced counts as a full subtitle rather than forced-only (more than 0). |
 | `align_max_offset_s` | `120.0` | Largest shift in seconds the alignment may apply to a subtitle; an alignment that lands on this limit (within 0.05 s) is rejected as a cut-off search. |
 | `align_scale_tolerance` | `0.05` | Largest frame-rate change the alignment may apply (the scale factor may differ from 1 by this fraction, `0` to below `1`). |
 | `align_min_score` | `0.0` | Lowest alignment score accepted (not negative). `0` sets no minimum, but a score of zero or less is always refused. A starting value; raise it after reviewing the scores in the first run logs. |
