@@ -263,19 +263,32 @@ local_subtitle_dirs = ['D:\subs', 'E:\more\subs']
 ```
 
 `subs resolve` indexes them each time and prints how many files it found. They are searched to
-8 folder levels (at most 100,000 entries), links and junctions found while listing are skipped
-(and a file that turns into a link before it is read is refused), and only `.srt`,
-`.ass`, `.ssa` and `.vtt` files are looked at. The subtitle is matched by name: the library file's
-name is read as `Title (2010)` (the folder's name fills in a missing year when its title is the
-same, or gives the whole title and year of a generic name such as `movie.mkv`), and the subtitle's name is read the way a release name is, so
-`Title (2010).srt` and `Title.2010.1080p.BluRay.en.srt` both count. A subtitle matches when its
-year is the same and its title is near-identical, when the years differ by one and the title is
-closer still, or, when either side has no year, when the title is near-exact. A match counts only
-if it is clearly the best one; two similar candidates are ambiguous and both ignored (so are two
-copies of the same film's subtitle in different folders). Ignored as well: names that read as TV
-episodes or give no title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`,
-`en.fr`), empty files, files above `subtitle_max_bytes`, links and anything that is not a regular
-file. A name with no language tag is kept; its text is checked for English like any other.
+8 folder levels (at most 100,000 entries), and links and junctions found while listing are skipped
+(and a file that turns into a link before it is read is refused). A `.srt`, `.ass`, `.ssa` or
+`.vtt` file is listed by its name. Downloaded subtitles often lose their extension to a release
+tag (`Title (2010).en.264-GRP`), so a file with any other name is opened and listed if its content
+is a subtitle in one of those formats. Never listed that way: unfinished downloads and backups
+(ending `.part`, `.partial`, `.crdownload`, `.download`, `.!ut`, `.!qB`, `.tmp`, `.bak`, `.old`,
+`.orig`, `.disabled` or `~`), copies (`Title.srt.1`, `Title.srt.txt`, `Title.srt (1)`), and files
+ending `.nfo`, `.idx`, `.jpg`, `.jpeg`, `.png`, `.gif`, `.zip`, `.rar` or `.7z`. If more than 2,000
+files would have to be opened, no local subtitle is used in that run (a warning says so), so point
+`local_subtitle_dirs` at folders that hold subtitles.
+
+The subtitle is matched by name, and a library file's name and a subtitle's name are read the same
+way. With the year in brackets, the title is everything before it, as written
+(`Title - Second Part (2010)`; a leading site or picture-size tag such as `[1080p]` or
+`www.site.com -` is dropped). An edition written before the year (`Title - Director's Cut (2010)`)
+is therefore part of the title, and that subtitle does not match the plain `Title (2010)`.
+Any other name is read as a release name (`Title.2010.1080p.BluRay.en`). For a library file, the
+folder's name also fills in a missing year when its title is the same, or gives the whole title and
+year of a generic name such as `movie.mkv`. A subtitle matches when its year is the same and its
+title is near-identical, when the years differ by one and the title is closer still, or, when
+either side has no year, when the title is near-exact. A match counts only if it is clearly the
+best one; two similar candidates are ambiguous and both ignored (so are two copies of the same
+film's subtitle in different folders). Ignored as well: names that read as TV episodes or give no
+title, names tagged with a language other than English (`fr`, `spa`, `pt-BR`, `en.fr`; a `hi` tag
+means hearing impaired, not Hindi), empty files, files above `subtitle_max_bytes`, links and anything that is not a regular file. A name
+with no language tag is kept; its text is checked for English like any other.
 
 ### Statuses
 
@@ -421,10 +434,12 @@ until one of those two commands has noticed.
 - English only: the language checks, the matching of embedded tracks and the alignment assume
   English (see `subtitle_language`).
 - The alignment listens to the video's first audio track.
-- `align_min_score` (default `0`, so only a score of zero or less is refused) and
-  `forced_full_cues_per_hour` (default `250`) are starting values. Tune them against your own
-  library: the run log (at its default `DEBUG` level) has the offset, frame-rate scale and score of
-  every alignment and the reason for every rejection.
+- `align_min_score` (default `0`, so only a score of zero or less is refused) is a starting value.
+  Tune it against your own library: the run log (at its default `DEBUG` level) has the offset,
+  frame-rate scale and score of every alignment and the reason for every rejection.
+  `forced_full_cues_per_hour` (default `150`) comes from measurements of one library: forced
+  tracks of signs and foreign dialogue stayed under about 100 cues per hour, a silent film's
+  intertitles reached about 185, and spoken dialogue 300 or more.
 - A hash-exact OpenSubtitles match is not aligned, since the service says it was made for this
   file; the length check still applies to it.
 - A download that was counted but whose link fetch still fails after its retries is not tried
@@ -468,7 +483,7 @@ and has the default shown.
 | `log_file_level` | `DEBUG` | Level of the run log file (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 | `subtitle_cache_dir` | `%LOCALAPPDATA%\video-cleaner\subtitles` | Local folder for the subtitles found for your files (see [The cache](#the-cache)). Refused (like every other output) when it is inside `library_root` or contains it. |
 | `local_subtitle_dirs` | `[]` | Folders searched for subtitles you already have (see [Where subtitles come from](#where-subtitles-come-from)): a TOML array of absolute paths (`['D:\subs', 'E:\more']`), or in `VC_LOCAL_SUBTITLE_DIRS` several paths separated by `;` on Windows. |
-| `forced_full_cues_per_hour` | `250.0` | Cues per hour of video at or above which an English text track marked forced counts as a full subtitle rather than forced-only (more than 0). A starting value to tune against your library. |
+| `forced_full_cues_per_hour` | `150.0` | Cues per hour of video at or above which an English text track marked forced counts as a full subtitle rather than forced-only (more than 0). Tune it if your library has forced tracks with long foreign-language stretches. |
 | `align_max_offset_s` | `120.0` | Largest shift in seconds the alignment may apply to a subtitle; an alignment that lands on this limit (within 0.05 s) is rejected as a cut-off search. |
 | `align_scale_tolerance` | `0.05` | Largest frame-rate change the alignment may apply (the scale factor may differ from 1 by this fraction, `0` to below `1`). |
 | `align_min_score` | `0.0` | Lowest alignment score accepted (not negative). `0` sets no minimum, but a score of zero or less is always refused. A starting value; raise it after reviewing the scores in the first run logs. |

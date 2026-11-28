@@ -306,7 +306,7 @@ def test_subtitle_defaults(tmp_path: Path) -> None:
     s = load_settings(None, _env(tmp_path))
     assert s.subtitle_cache_dir == tmp_path / "local" / "video-cleaner" / "subtitles"
     assert s.local_subtitle_dirs == ()
-    assert s.forced_full_cues_per_hour == 250.0
+    assert s.forced_full_cues_per_hour == 150.0
     assert s.align_max_offset_s == 120.0
     assert s.align_scale_tolerance == 0.05
     assert s.align_min_score == 0.0

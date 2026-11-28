@@ -72,15 +72,231 @@ def test_index_lists_subtitle_files_with_their_parsed_names(tmp_path: Path) -> N
     assert (index[0].parsed.title, index[0].parsed.year) == ("Alien", 1979)
 
 
-def test_index_takes_only_text_subtitle_extensions_case_insensitively(tmp_path: Path) -> None:
+SRT = b"1\r\n00:00:01,000 --> 00:00:02,500\r\nHello there.\r\n"
+ASS = (
+    b"[Script Info]\n[V4+ Styles]\n[Events]\n"
+    b"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    b"Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello there.\n"
+)
+VTT = b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello there.\n"
+
+
+def put(path: Path, content: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_index_takes_text_subtitle_extensions_case_insensitively_without_reading_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     for name in ("a.2001.srt", "b.2002.ASS", "c.2003.ssa", "d.2004.vtt", "e.2005.SRT"):
-        write(tmp_path / name)
-    for name in ("f.2006.sub", "g.2007.idx", "h.2008.txt", "i.2009", "j.2010.mkv"):
-        write(tmp_path / name)
+        write(tmp_path / name)  # the content is judged later, by the resolver
+
+    def refuse(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("a file with a subtitle extension was read")
+
+    monkeypatch.setattr(local, "read_bytes_capped", refuse)
 
     index = index_local_folders([tmp_path], max_bytes=MB)
 
     assert names_of(index) == ["a.2001.srt", "b.2002.ASS", "c.2003.ssa", "d.2004.vtt", "e.2005.SRT"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Movie.2010.en.264-EVO",
+        "Movie (2010).en.AC3-EVO",
+        "Movie (2010).en.MX]",
+        "Movie (2010).en.The Movie - 4K Disc Eng",
+        "Movie (2010)",
+        "Movie.2010.txt",
+    ],
+)
+def test_index_takes_a_file_with_any_other_name_when_it_holds_a_subtitle(
+    tmp_path: Path, name: str
+) -> None:
+    put(tmp_path / name, SRT)
+
+    index = index_local_folders([tmp_path], max_bytes=MB)
+
+    assert match_local(index, TitleYear("Movie", 2010)) == LocalCandidate(tmp_path / name, 1.0)
+
+
+@pytest.mark.parametrize("content", [ASS, VTT, b"\xef\xbb\xbf" + SRT])
+def test_index_recognises_each_format_by_content(tmp_path: Path, content: bytes) -> None:
+    put(tmp_path / "Movie (2010).en.DTS-GRP", content)
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == ["Movie (2010).en.DTS-GRP"]
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        ("Movie.2010.sub", b"{1}{25}Hello there."),
+        ("Movie.2010.nfo", b"Movie (2010), a film. Enjoy."),
+        ("Movie.2010.jpg", bytes(range(256)) * 4),
+        ("Movie.2010.html", b"<html><body>00:00:01,000 --> 00:00:02,000</body></html>"),
+        ("Movie.2010", b"x" * 10),
+    ],
+)
+def test_index_skips_a_file_with_another_name_that_holds_no_subtitle(
+    tmp_path: Path, name: str, content: bytes
+) -> None:
+    put(tmp_path / name, content)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_other_files_beside_a_subtitle_do_not_make_it_ambiguous(tmp_path: Path) -> None:
+    put(tmp_path / "Movie (2010).nfo", b"Movie (2010), a film. Enjoy.")
+    put(tmp_path / "Movie (2010).en.264-EVO", SRT)
+
+    result = match_local(index_local_folders([tmp_path], max_bytes=MB), TitleYear("Movie", 2010))
+
+    assert result == LocalCandidate(tmp_path / "Movie (2010).en.264-EVO", 1.0)
+
+
+@pytest.mark.parametrize("name", ["Show.S01E08.en.264-EVO", "Movie.2010.fr.264-EVO"])
+def test_index_filters_a_file_with_another_name_by_its_name_too(tmp_path: Path, name: str) -> None:
+    put(tmp_path / name, SRT)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_index_never_reads_a_file_over_the_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(tmp_path / "Movie (2010).mkv", size=2 * MB)
+
+    def refuse(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("an oversized file was read")
+
+    monkeypatch.setattr(local, "read_bytes_capped", refuse)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+def test_index_reads_another_name_only_as_the_regular_file_it_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    put(tmp_path / "Movie (2010).en.264-EVO", SRT)
+    calls: list[tuple[int, bool]] = []
+
+    def swapped(path: Path, max_bytes: int, *, regular_only: bool = False) -> bytes:
+        calls.append((max_bytes, regular_only))
+        raise OSError("not the regular file the path names")
+
+    monkeypatch.setattr(local, "read_bytes_capped", swapped)
+    write(tmp_path / "Other (2011).srt")
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == ["Other (2011).srt"]
+    assert calls == [(MB, True)]
+
+
+def test_index_uses_no_local_file_at_all_when_there_are_too_many_to_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # With any part of the list missing, a neighbouring year's file could win: here the 2010
+    # file, listed by name, would be given to the 2011 film once the 2011 file is dropped.
+    put(tmp_path / "Harbour (2010).en.srt", SRT)
+    put(tmp_path / "Harbour (2011).en.x264-GRP", SRT)
+    put(tmp_path / "Plain (2012).en.x264-GRP", SRT)
+    monkeypatch.setattr(local, "MAX_FILES_READ", 1)
+    caplog.set_level(logging.WARNING, logger="video_cleaner.subtitles.local")
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+    assert sum("more than 1 files" in record.getMessage() for record in caplog.records) == 1
+
+
+def test_index_uses_every_other_name_when_they_just_fit_under_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    put(tmp_path / "Harbour (2010).en.x264-GRP", SRT)
+    put(tmp_path / "Harbour (2011).en.x264-GRP", SRT)
+    monkeypatch.setattr(local, "MAX_FILES_READ", 2)
+    caplog.set_level(logging.WARNING, logger="video_cleaner.subtitles.local")
+
+    assert len(index_local_folders([tmp_path], max_bytes=MB)) == 2
+    assert caplog.records == []
+
+
+def test_files_that_cannot_be_used_do_not_count_toward_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in (
+        "Show.S01E08.en.264-GRP",
+        "Other.2010.fr.264-GRP",
+        "Movie (2010).nfo",
+        "Movie (2010).jpg",
+        "Movie (2010).en.srt.part",
+    ):
+        put(tmp_path / name, SRT)
+    put(tmp_path / "Movie (2010).en.264-GRP", SRT)
+    monkeypatch.setattr(local, "MAX_FILES_READ", 1)
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == ["Movie (2010).en.264-GRP"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Movie (2010).en.srt.part",
+        "Movie (2010).en.srt.crdownload",
+        "Movie (2010).en.srt.bak",
+        "Movie (2010).en.srt.orig",
+        "Movie (2010).en.ASS.old",
+        "Movie (2010).en.srt.disabled",
+        "Movie (2010).en.srt.1",
+        "Movie (2010).en.srt.txt",
+        "Movie (2010).en.srt (1)",
+        "Movie (2010).en.srt - Copy",
+        "Movie (2010).en.srt~",
+        "Movie (2010).en.264-GRP.part",
+        "Movie (2010).en.264-GRP.!ut",
+        "Movie (2010).en.srt.!qB",
+        "Movie (2010).partial",
+        "Movie (2010).tmp",
+        "Movie (2010).download",
+    ],
+)
+def test_index_skips_unfinished_downloads_and_backup_copies(tmp_path: Path, name: str) -> None:
+    put(tmp_path / name, SRT)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
+
+
+@pytest.mark.parametrize("name", ["Kick.Ass.2010", "The.Smart.Ass.2010.en.x264-GRP"])
+def test_a_title_that_spells_an_extension_is_not_taken_for_a_copy(
+    tmp_path: Path, name: str
+) -> None:
+    put(tmp_path / name, SRT)
+
+    assert names_of(index_local_folders([tmp_path], max_bytes=MB)) == [name]
+
+
+def test_a_leftover_copy_does_not_make_the_real_subtitle_ambiguous(tmp_path: Path) -> None:
+    put(tmp_path / "Movie (2010).en.srt", SRT)
+    put(tmp_path / "Movie (2010).en.srt.bak", SRT)
+
+    result = match_local(index_local_folders([tmp_path], max_bytes=MB), TitleYear("Movie", 2010))
+
+    assert result == LocalCandidate(tmp_path / "Movie (2010).en.srt", 1.0)
+
+
+@pytest.mark.parametrize("suffix", [".nfo", ".jpg", ".png", ".idx", ".zip"])
+def test_index_never_opens_a_file_that_cannot_be_a_subtitle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    write(tmp_path / f"Movie (2010){suffix}")
+
+    def refuse(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("a file that cannot be a subtitle was read")
+
+    monkeypatch.setattr(local, "read_bytes_capped", refuse)
+
+    assert index_local_folders([tmp_path], max_bytes=MB) == []
 
 
 def test_index_skips_a_file_over_the_size_limit_and_keeps_one_at_the_limit(
@@ -152,6 +368,8 @@ HEARING_IMPAIRED_NAMES = [
     "Movie.2010.eng.hi.srt",
     "Movie.2010.English.HI.srt",
     "Movie.2010.hi.en.srt",
+    "Movie.2010.HI.srt",
+    "Movie.2010.1080p.WEB-DL.H.264-GRP-HI.srt",
 ]
 
 
@@ -171,8 +389,8 @@ def test_index_keeps_a_hearing_impaired_english_file_at_the_plain_names_confiden
     assert hearing_impaired.confidence == baseline.confidence
 
 
-@pytest.mark.parametrize("name", ["Movie.2010.HI.srt", "Movie.2010.en.fr.srt"])
-def test_index_skips_a_bare_hi_file_and_an_english_plus_other_language_file(
+@pytest.mark.parametrize("name", ["Movie.2010.Hindi.srt", "Movie.2010.en.fr.srt"])
+def test_index_skips_a_hindi_file_and_an_english_plus_other_language_file(
     tmp_path: Path, name: str
 ) -> None:
     write(tmp_path / name)
@@ -750,3 +968,74 @@ def test_legitimate_releases_with_numbers_still_match_their_own_library_name(
 
     assert result is not None
     assert result.path == Path("subs") / f"{release}.srt"
+
+
+@pytest.mark.parametrize(
+    "stem",
+    [
+        "Harbour - Tidal Wake (2013)",
+        "Harbour - Part III - The Long Night - Ends (2014)",
+        "Harbour - Tidal Wake (Extended Edition) (2002)",
+        "Harbour - Director's Cut (2001)",
+        "Harbour Special Edition (1989)",
+        "Silver Ultra (2015)",
+        "VHS 94 (2021)",
+        "12-12-12 (2011)",
+        "[REC] (2007)",
+        "[REC] 2 (2009)",
+    ],
+)
+def test_a_subtitle_named_like_its_film_matches_it(stem: str) -> None:
+    result = match_local([subtitle(f"{stem}.en")], parse_library_name(Path(f"{stem}.mkv")))
+
+    assert result is not None
+    assert result.path == Path("subs") / f"{stem}.en.srt"
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Harbour - Tidal Wake.en", "Harbour - Tidal Wake (2018).avi"),
+        ("Harbour - Tidal Wake 2013", "Harbour - Tidal Wake (2013).mkv"),
+        ("Harbour.-.Tidal.Wake.2013.1080p.BluRay.x264-GRP", "Harbour - Tidal Wake (2013).mkv"),
+        ("Harbour - Tidal Wake.en", "Harbour - Tidal Wake.mkv"),
+        ("[YTS.MX] Harbour (2010).en", "Harbour (2010).mkv"),
+        ("[1080p] Harbour (2010)", "Harbour (2010).mkv"),
+        ("[1080P] Harbour (2010)", "Harbour (2010).mkv"),
+        ("[4K] Harbour (2010)", "Harbour (2010).mkv"),
+        ("[1080p BluRay] Harbour (2010)", "Harbour (2010).mkv"),
+        ("www.site.com - Harbour (2010).en", "Harbour (2010).mkv"),
+        ("www.site.co.uk - Harbour (2010)", "Harbour (2010).mkv"),
+        ("Harbour (2010) - English", "Harbour (2010).mkv"),
+    ],
+)
+def test_text_after_a_dash_and_site_tags_do_not_hide_the_right_film(
+    release: str, library: str
+) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is not None
+
+
+@pytest.mark.parametrize(
+    ("release", "library"),
+    [
+        ("Harbour - Tidal Wake (2013).en", "Harbour (2012).mkv"),
+        ("Harbour - For Good (2025).en", "Harbour (2024).mkv"),
+        ("Harbour - Tidal Wake 2013", "Harbour (2012).mkv"),
+        ("Harbour.-.Tidal.Wake.2013.1080p.BluRay.x264-GRP", "Harbour (2012).mkv"),
+        ("Harbour - Tidal Wake.en", "Harbour.mkv"),
+        ("Harbour.en", "Harbour - Tidal Wake.mkv"),
+        # Another cut of a film has other timings and lines: its subtitle is not the film's.
+        ("Harbour - Director's Cut (1979).en", "Harbour (1979).mkv"),
+        ("Harbour (Extended Edition) (2002).en", "Harbour (2002).mkv"),
+        # "www." followed by words is a title, not a site to drop.
+        ("www.What.A.Wonderful.World - Part 2 (2006)", "Part 2 (2006).mkv"),
+    ],
+)
+def test_a_sequels_subtitle_never_matches_the_shorter_titled_film(
+    release: str, library: str
+) -> None:
+    result = match_local([subtitle(release)], parse_library_name(Path(library)))
+
+    assert result is None

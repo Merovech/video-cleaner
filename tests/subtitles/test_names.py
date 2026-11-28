@@ -102,19 +102,37 @@ def test_hi_beside_an_english_tag_is_the_hearing_impaired_flag_not_hindi(name: s
 
 
 @pytest.mark.parametrize(
-    ("name", "non_english"),
+    "name",
     [
-        ("Movie.2010.HI", True),  # bare: ambiguous, so it fails safe
-        ("Movie.2010.hi", True),
-        ("Movie.2010.hi.fr", True),
-        ("Movie.2010.en.fr", True),
-        ("Movie.2010.en.hi.fr", True),  # English and a real language
+        "Movie.2010.HI",
+        "Movie.2010.hi",
+        "Movie (2010).hi",
+        "Movie.2010.1080p.WEB-DL.H.264-GRP-HI",
     ],
 )
-def test_hi_without_english_or_with_another_language_stays_non_english(
-    name: str, non_english: bool
-) -> None:
-    assert parse_release_name(name).non_english is non_english
+def test_a_bare_hi_tag_is_the_hearing_impaired_flag_too(name: str) -> None:
+    # The text of every candidate is checked for English, so a Hindi file named this way is
+    # still refused, by its content.
+    parsed = parse_release_name(name)
+
+    assert parsed.languages == ()
+    assert parsed.non_english is False
+    assert (parsed.title, parsed.year) == ("Movie", 2010)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Movie.2010.Hindi",
+        "Movie.2010.hin",
+        "Movie.2010.hi.fr",
+        "Movie.2010.en.fr",
+        "Movie.2010.en.hi.fr",  # English and a real language
+        "Movie.2010.en.Hindi",
+    ],
+)
+def test_hindi_written_out_and_other_languages_stay_non_english(name: str) -> None:
+    assert parse_release_name(name).non_english is True
 
 
 def test_a_title_containing_hi_is_unaffected_by_the_hearing_impaired_rule() -> None:
@@ -583,3 +601,10 @@ def test_library_names_keep_a_decimal_or_fractional_number() -> None:
         (half, "The Naked Gun"),
     ):
         assert title_similarity(parsed.title, original) <= 0.5
+
+
+def test_a_library_name_without_a_year_keeps_the_text_after_a_dash() -> None:
+    # This is also the title the OpenSubtitles title search sends.
+    parsed = parse_library_name(Path("Harbour - Tidal Wake.mkv"))
+
+    assert (parsed.title, parsed.year) == ("Harbour Tidal Wake", None)

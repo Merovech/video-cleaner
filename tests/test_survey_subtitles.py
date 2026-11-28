@@ -158,10 +158,9 @@ def test_forced_english_track_with_many_cues_is_reclassified_as_full(tmp_path: P
         state.close()
     row = _by_name(_csv_rows(result.csv_path))["Mislabelled.mkv"]
     assert (row["english_subtitle"], row["subtitle_status"]) == ("reclassified", "not_needed")
-    # Measured once, for the forced English track only, with the configured limits.
-    assert density.calls == [
-        (film, 3, 3600.0, settings.subtitle_max_bytes, settings.subtitle_min_cues)
-    ]
+    # Measured once, for the forced English track only, with the configured size limit. The
+    # minimum of cues for a usable subtitle does not apply to counting a track's cues.
+    assert density.calls == [(film, 3, 3600.0, settings.subtitle_max_bytes, 1)]
 
 
 def test_forced_english_track_with_few_cues_stays_wanted(tmp_path: Path) -> None:
@@ -219,6 +218,42 @@ def test_a_failed_density_measurement_is_logged_with_the_file_name(
     assert any(
         "Broken Track.mkv" in m and "cue density could not be measured" in m for m in messages
     )
+
+
+def test_a_forced_track_with_only_a_few_cues_is_measured_without_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from video_cleaner.subtitles import embedded
+    from video_cleaner.tools import ToolResult
+
+    signs = "".join(
+        f"{n}\n00:0{n}:00,000 --> 00:0{n}:02,000\nA sign on a door.\n\n" for n in range(1, 8)
+    )
+    monkeypatch.setattr(
+        embedded,
+        "run_tool",
+        lambda *args, **kwargs: ToolResult(returncode=0, stdout=signs, stderr_tail=""),
+    )
+    settings = _settings(tmp_path)
+    assert settings.subtitle_min_cues > 7
+    film = _touch(settings.library_root / "Signs.mkv")
+    state = State.open(settings.state_db)
+    try:
+        with caplog.at_level(logging.WARNING):
+            run_survey(
+                settings,
+                FAKE_TOOLS,
+                state,
+                RecordingReporter(),
+                probe_fn=_fake_probe({"Signs.mkv": lambda p: _with(p, _sub(3, forced=True))}),
+                hash_fn=lambda _p: None,
+                density_fn=embedded.measure_cue_density,
+            )
+        sub = _sub_row(state, film)
+        assert sub is not None and sub.status is SubtitleStatus.WANTED
+    finally:
+        state.close()
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_a_hung_density_extraction_does_not_hang_the_survey(
@@ -874,5 +909,27 @@ def test_redecide_found_leaves_a_record_a_run_has_decided_on(tmp_path: Path) -> 
             Status.LEFT_ALONE,
             "output not smaller",
         )
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize(
+    ("cues_per_hour", "status"),
+    [(186.0, SubtitleStatus.NOT_NEEDED), (92.0, SubtitleStatus.WANTED)],
+)
+def test_the_default_threshold_tells_intertitles_from_signs(
+    tmp_path: Path, cues_per_hour: float, status: SubtitleStatus
+) -> None:
+    settings = _settings(tmp_path)
+    film = _touch(settings.library_root / "Silent.mkv")
+
+    _result, state = _survey(
+        settings,
+        {"Silent.mkv": lambda p: _with(p, _sub(3, forced=True))},
+        FakeDensity({3: cues_per_hour}),
+    )
+    try:
+        sub = _sub_row(state, film)
+        assert sub is not None and sub.status is status
     finally:
         state.close()

@@ -13,7 +13,7 @@ import functools
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -30,8 +30,18 @@ MAX_NAME_CHARS = 256
 
 _MIN_YEAR = 1888  # the first film
 _MAX_YEAR = 2100
-# A library name: "Title (2010)", anything after the closing bracket is ignored.
-_LIBRARY_NAME = re.compile(r"(?P<title>.*?)\s*\((?P<year>(?:18|19|20)[0-9]{2})\)", re.DOTALL)
+# A name that writes its year in brackets, "Title (2010)": the title is everything before the
+# year, as written, and what follows the closing bracket is not part of it.
+_TITLE_YEAR_NAME = re.compile(r"(?P<title>.*?)\s*\((?P<year>(?:18|19|20)[0-9]{2})\)", re.DOTALL)
+# A leading tag that is not the title: a "[...]" naming a site ("[YTS.MX]") or a picture size
+# ("[1080p BluRay]", "[4K]"), or "www.site.com -". A bracket without either can be the film's
+# name ("[REC]"). Every repeat is bounded.
+_LEADING_TAG = re.compile(
+    r"\s*(?:\[[^\[\]]{0,64}?"
+    r"(?:\.[a-z]{2,6}|(?:[0-9]{3,4}[pi]|(?<![a-z0-9])4k)[^\[\]]{0,32})\]"
+    r"|www\.(?:[a-z0-9-]{1,63}\.){1,2}[a-z]{2,6}\s+-)\s*",
+    re.IGNORECASE,
+)
 # What a short extension looks like; "Dr. Mabuse the Gambler" has a dot but no extension.
 _EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,5}")
 # File names that say nothing about the film, so the folder's name is used instead.
@@ -53,8 +63,9 @@ _NUMBER_WORDS = {
     },
     "iiii": "4",  # the clock-face form of four, still used for historical titles
 }
-# guessit results that say nothing about where the title area ends.
-_STRUCTURAL_KEYS = frozenset({"title", "type"})
+# guessit results that say nothing about where the title area ends. "alternative_title" is what
+# it splits off after " - ", which is still part of the film's name.
+_STRUCTURAL_KEYS = frozenset({"title", "alternative_title", "type"})
 _PART_WORDS = frozenset({"part", "volume", "chapter", "episode"})
 _WORD_ALIASES = {"pt": "part", "vol": "volume"}
 # A trailing "pt1"/"cd2"/"part 3" marker, and a "(1922)" year closing the name before it.
@@ -64,9 +75,10 @@ _YEAR_AT_END = re.compile(r"\((?:18|19|20)[0-9]{2}\)\s*\Z")
 _NUMBER_MISMATCH_CAP = 0.5
 _LATIN_LIMIT = 0x250  # end of Latin Extended-B: accents are stripped from these letters only
 _ENGLISH_CODES = frozenset({"en", "eng"})
-# guessit reads the bare token "hi", the usual tag for hearing-impaired subtitles (Bazarr,
-# Subliminal, Jellyfin), as Hindi.
-_HEARING_IMPAIRED_CODE = "hi"
+# The usual tag for hearing-impaired subtitles (release names, Bazarr, Subliminal, Jellyfin),
+# which guessit reads as Hindi.
+_HEARING_IMPAIRED_TAG = "hi"
+_TAG_SEPARATORS = " ._-()[]"
 # guessit reports the language of a name as "language" and, for "VOSTFR"-style tags, as
 # "subtitle_language".
 _LANGUAGE_KEYS = ("language", "subtitle_language")
@@ -96,7 +108,13 @@ def _empty() -> TitleYear:
 
 
 def parse_release_name(name: str) -> TitleYear:
-    """Title, year and episode flag of a release-style name such as "Film.2020.1080p.en".
+    """Title, year and episode flag of a file name such as "Film.2020.1080p.en" or
+    "Film - Subtitle (2020)".
+
+    A name with its year in brackets gives the title exactly as written before the year (see
+    `_written_title`); every other name is read by `guessit`. Either way the languages and the
+    episode flag come from `guessit`. Subtitle names and library names are both read here, so
+    the same name always means the same film.
 
     The whole name is read, including a mangled "extension" like ".en.264-EVO", so callers pass
     the name without a real extension. The type is forced to "movie" because guessit otherwise
@@ -109,18 +127,23 @@ def parse_release_name(name: str) -> TitleYear:
     a release tag in general; see `_dropped_a_number`.
     """
     text = name[:MAX_NAME_CHARS]
+    written = _written_title(text)
     try:
         found = guessit(text, {"type": "movie", "advanced": True})
     except Exception:  # guessit's rule engine can fail on odd input; one name must not stop a run
         _log.debug("guessit failed on a name of %d characters", len(text), exc_info=True)
-        return _empty()
+        return written if written is not None else _empty()
     guess = {key: _matches(match) for key, match in found.items()}
+    is_episode = _value(guess, "season") is not None or _value(guess, "episode") is not None
+    languages = _language_codes(guess)
+    if written is not None:
+        return replace(written, is_episode=is_episode, languages=languages)
     raw_title = _value(guess, "title")
     title = raw_title.strip() if isinstance(raw_title, str) else ""
     raw_year = _value(guess, "year")
     year = raw_year if isinstance(raw_year, int) and _MIN_YEAR <= raw_year <= _MAX_YEAR else None
-    is_episode = _value(guess, "season") is not None or _value(guess, "episode") is not None
-    languages = _language_codes(guess)
+    if title:
+        title = " ".join([title, *_alternative_titles(guess, len(text))])
     if title and _dropped_a_number(text, title, guess):
         return TitleYear(title="", year=year, is_episode=is_episode, languages=languages)
     if title:
@@ -130,21 +153,60 @@ def parse_release_name(name: str) -> TitleYear:
     return TitleYear(title=title, year=year, is_episode=is_episode, languages=languages)
 
 
+def _written_title(text: str) -> TitleYear | None:
+    """The title and year of a "Title (2010)" name, or None for any other name."""
+    match = _TITLE_YEAR_NAME.match(text)
+    if match is None:
+        return None
+    title = match.group("title").strip()
+    while tag := _LEADING_TAG.match(title):
+        title = title[tag.end() :]
+    if not title:
+        return None
+    return TitleYear(title=title, year=int(match.group("year")))
+
+
+def _title_cutoff(guess: dict[str, list[Any]], title_end: int, length: int) -> int:
+    """Where the first tag after the title starts (the year, a resolution...), else *length*."""
+    starts = (
+        match.span[0]
+        for key, matches in guess.items()
+        if key not in _STRUCTURAL_KEYS
+        for match in matches
+        if match.span[1] > match.span[0] and match.span[0] >= title_end
+    )
+    return min(starts, default=length)
+
+
+def _alternative_titles(guess: dict[str, list[Any]], length: int) -> list[str]:
+    """The pieces guessit split off the title ("Film - Subtitle") of a name *length* long: those
+    between the title and the first other tag. Without them a sequel's subtitle would read as
+    the first film's."""
+    title_end = guess["title"][0].span[1]  # the caller has a title, so it exists
+    cutoff = _title_cutoff(guess, title_end, length)
+    return [
+        str(match.value).strip()
+        for match in guess.get("alternative_title", [])
+        if title_end <= match.span[0] and match.span[1] <= cutoff
+    ]
+
+
 def _language_codes(guess: dict[str, list[Any]]) -> tuple[str, ...]:
     """The languages guessit found in the name, as lower-case codes, in name order.
 
-    A "hi" code beside an English one is the hearing-impaired flag, not Hindi, and is dropped.
-    Without an English tag it stays: a bare ".hi" is ambiguous, so the file counts as non-English.
+    The tag "hi" is the hearing-impaired flag, not Hindi, and is not a language. Hindi written
+    any other way ("hin", "Hindi") is one. A subtitle's text is checked for English whatever
+    its name says, so a Hindi file tagged "hi" is still refused.
     """
     found = [match for key in _LANGUAGE_KEYS for match in guess.get(key, [])]
     found.sort(key=lambda match: match.span)
     codes: list[str] = []
     for match in found:
+        if str(match.raw).strip(_TAG_SEPARATORS).lower() == _HEARING_IMPAIRED_TAG:
+            continue
         code = str(match.value).strip().lower()
         if code and code not in codes:
             codes.append(code)
-    if _HEARING_IMPAIRED_CODE in codes and any(_primary_subtag(c) in _ENGLISH_CODES for c in codes):
-        codes.remove(_HEARING_IMPAIRED_CODE)
     return tuple(codes)
 
 
@@ -177,15 +239,14 @@ def _dropped_a_number(text: str, title: str, guess: dict[str, list[Any]]) -> boo
     if "date" in guess:
         return True
     title_start, title_end = guess["title"][0].span  # the caller has a title, so it exists
-    tags = [
+    cutoff = _title_cutoff(guess, title_end, len(text))
+    before_title = [
         match.span
         for key, matches in guess.items()
         if key not in _STRUCTURAL_KEYS
         for match in matches
-        if match.span[1] > match.span[0]
+        if match.span[0] < match.span[1] <= title_start
     ]
-    cutoff = min((start for start, _ in tags if start >= title_end), default=len(text))
-    before_title = [(start, end) for start, end in tags if end <= title_start]
     kept = set(re.findall(r"[0-9]+", title))
     for run in re.finditer(r"[0-9]+", text[:cutoff]):
         if any(start <= run.start() < end for start, end in before_title):
@@ -199,19 +260,6 @@ def _numbered(value: object, label: str) -> list[str]:
     """ "Part 2" for a guessit part/volume value (a number, or a list of them)."""
     numbers = value if isinstance(value, list) else [value]
     return [f"{label} {number}" for number in numbers if isinstance(number, int)]
-
-
-def _parse_stem(stem: str) -> TitleYear:
-    """A library name without its extension: "Title (2010)" first, else a release name."""
-    release = parse_release_name(stem)
-    match = _LIBRARY_NAME.match(stem[:MAX_NAME_CHARS])
-    if match is None or not match.group("title").strip():
-        return release
-    return TitleYear(
-        title=match.group("title").strip(),
-        year=int(match.group("year")),
-        is_episode=release.is_episode,
-    )
 
 
 def _without_extension(name: str) -> str:
@@ -243,13 +291,13 @@ def parse_library_name(path: Path) -> TitleYear:
     "Alien (1979)" is another film, and giving it 1979 would match it to the first film's subtitle.
     """
     stem = _without_split_marker(_without_extension(path.name[:MAX_NAME_CHARS]))
-    parsed = _parse_stem(stem)
+    parsed = parse_release_name(stem)
     if parsed.is_episode or parsed.year is not None:
         return parsed
     folder_name = path.parent.name
     if not folder_name:
         return parsed
-    folder = _parse_stem(folder_name)
+    folder = parse_release_name(folder_name)
     if folder.is_episode or folder.year is None or not folder.title:
         return parsed
     own = normalise_title(parsed.title)
